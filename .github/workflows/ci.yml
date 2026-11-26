@@ -67,9 +67,11 @@ jobs:
       - name: Run tests
         if: runner.os == 'Linux'
         working-directory: ling
+        # chopping_a_ling_voice_part... needs the Ling voice samples that are not public (it falls
+        # back to the sampler there).
         # ling-aac / ling-h264 / ling-mp4 / ling-mpa test against ~600 MB of reference media that is
         # not in the public repo; they are still built above.
-        run: cargo test --workspace --exclude ling-kernel --exclude ling-user --exclude ling-aac --exclude ling-h264 --exclude ling-mp4 --exclude ling-mpa
+        run: cargo test --workspace --exclude ling-kernel --exclude ling-user --exclude ling-aac --exclude ling-h264 --exclude ling-mp4 --exclude ling-mpa -- --skip chopping_a_ling_voice_part_makes_syllable_chops_with_builds
 
   lint:
     name: Format & Clippy (non-blocking)
