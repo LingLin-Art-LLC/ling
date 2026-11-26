@@ -36,6 +36,11 @@ jobs:
         with: { repository: "${{ env.ORG }}/horizon-browser", path: horizon-browser }
       - uses: actions/checkout@v4
         with: { repository: "${{ env.ORG }}/ling-messenger", path: ling-messenger }
+      # ling-daw's recipe and Slicer tests read LingStationX's assets/recipes and samples/
+      # from the sibling checkout (../../../LingStationX from the crate)
+      - uses: actions/checkout@v4
+        if: runner.os == 'Linux'
+        with: { repository: "${{ env.ORG }}/LingStationX", path: LingStationX }
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
