@@ -62,7 +62,9 @@ jobs:
       - name: Run tests
         if: runner.os == 'Linux'
         working-directory: ling
-        run: cargo test --workspace --exclude ling-kernel --exclude ling-user
+        # ling-aac / ling-h264 / ling-mp4 / ling-mpa test against ~600 MB of reference media that is
+        # not in the public repo; they are still built above.
+        run: cargo test --workspace --exclude ling-kernel --exclude ling-user --exclude ling-aac --exclude ling-h264 --exclude ling-mp4 --exclude ling-mpa
 
   lint:
     name: Format & Clippy (non-blocking)
