@@ -21,10 +21,17 @@ impl ling_sd::Source for FileSrc {
         self.len
     }
     fn read_at(&self, off: u64, buf: &mut [u8]) -> bool {
+        #[cfg(windows)]
         use std::os::windows::fs::FileExt;
+        #[cfg(unix)]
+        use std::os::unix::fs::FileExt;
         let mut done = 0;
         while done < buf.len() {
-            match self.f.seek_read(&mut buf[done..], off + done as u64) {
+            #[cfg(windows)]
+            let r = self.f.seek_read(&mut buf[done..], off + done as u64);
+            #[cfg(unix)]
+            let r = self.f.read_at(&mut buf[done..], off + done as u64);
+            match r {
                 Ok(0) | Err(_) => return false,
                 Ok(n) => done += n,
             }

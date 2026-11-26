@@ -19,10 +19,17 @@ impl Source for FileSrc {
         self.len
     }
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), Error> {
+        #[cfg(windows)]
         use std::os::windows::fs::FileExt;
+        #[cfg(unix)]
+        use std::os::unix::fs::FileExt;
         let mut done = 0;
         while done < buf.len() {
-            match self.f.seek_read(&mut buf[done..], offset + done as u64) {
+            #[cfg(windows)]
+            let r = self.f.seek_read(&mut buf[done..], offset + done as u64);
+            #[cfg(unix)]
+            let r = self.f.read_at(&mut buf[done..], offset + done as u64);
+            match r {
                 Ok(0) | Err(_) => return Err(Error::Io),
                 Ok(n) => done += n,
             }
