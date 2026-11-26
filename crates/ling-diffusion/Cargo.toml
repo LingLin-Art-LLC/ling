@@ -32,3 +32,8 @@ path = "src/lib.rs"
 
 [dev-dependencies]
 anyhow = "1"
+
+# lists the CUDA devices: only with the cuda feature
+[[example]]
+name = "gpus"
+required-features = ["cuda"]

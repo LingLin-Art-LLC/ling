@@ -47,6 +47,12 @@ mod tests_fuzz;
 mod tests_le;
 #[cfg(test)]
 mod tests_pads;
+/// tests_pads includes the kernel's gamepad.rs, which marks activity for the idle lock
+/// (`crate::startup::touch`); outside the kernel that is a no-op.
+#[cfg(test)]
+mod startup {
+    pub fn touch() {}
+}
 
 use alloc::string::String;
 
