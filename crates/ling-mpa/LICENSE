@@ -1,0 +1,35 @@
+ling-mpa is distributed under the Mozilla Public License, version 2.0
+(MPL-2.0): https://mozilla.org/MPL/2.0/
+
+Origin of the source files
+--------------------------
+
+Ported from Symphonia (symphonia-bundle-mp3 0.5.5, https://github.com/pdeljanov/Symphonia),
+Copyright (c) 2019-2022 The Project Symphonia Developers. These files keep their original
+MPL-2.0 headers and were modified for LingOS (no_std + alloc, libm maths, crate-local bit
+reader / Huffman codebooks / lazy tables / output buffer, boxed state for small kernel stacks,
+panics on corrupt input turned into errors; changes noted in the file headers):
+
+  src/common.rs
+  src/header.rs
+  src/layer1.rs            (src/layer1/mod.rs; also fixes mono streams reading two
+                            allocations per sub-band)
+  src/layer2.rs            (src/layer2/mod.rs)
+  src/layer12.rs
+  src/synthesis.rs
+  src/layer3/mod.rs
+  src/layer3/bitstream.rs
+  src/layer3/codebooks.rs
+  src/layer3/common.rs
+  src/layer3/hybrid_synthesis.rs
+  src/layer3/requantize.rs
+  src/layer3/stereo.rs
+
+Written for LingOS (also MPL-2.0, as part of this crate):
+
+  src/lib.rs               (byte-stream front end: frame sync, ID3v2 skip, Xing / Info /
+                            VBRI / LAME handling, partial-frame carry, decode_file)
+  src/bits.rs              (errors, bit reader, Huffman codebook, Lazy static)
+  src/tests.rs, examples/mpa_decode.rs
+  tests/data/*             (short test clips encoded with ffmpeg / libmp3lame, and ffmpeg's
+                            decodes of them as s16le references)

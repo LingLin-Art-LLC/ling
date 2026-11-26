@@ -1,0 +1,12 @@
+# Host-side tests for the kernel's USB pen decoder (src/drivers/hiddigi.rs is `core` + `alloc` + `libm`
+# only, so it builds here unchanged): `cargo test` in this folder. Not part of the ling workspace.
+[package]
+name = "hiddigi-test"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+libm = "0.2"
+
+[workspace]

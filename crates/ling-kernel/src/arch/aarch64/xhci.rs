@@ -1,0 +1,2147 @@
+//! xHCI host-controller driver for the RP1 DWC3 controllers on the Pi 5:
+//! enumerates USB keyboards and mice (boot protocol), keeps their interrupt
+//! endpoints polled, recovers endpoints the controller halts (a wireless
+//! keyboard whose dongle hiccups when it sleeps), and hot-plugs: devices can be
+//! unplugged and plugged back in — or drop off the bus and return on their own
+//! — and are set up again without a reboot.
+//!
+//! **DMA.** The controller lives on RP1 across PCIe, so every pointer we hand it
+//! (ring bases, contexts, data buffers) must be the address *RP1* uses to reach
+//! the Pi's RAM; on this hardware the firmware's inbound window is 1:1
+//! (`DMA_OFFSET` = 0, confirmed: events land in our ring). The pages come from
+//! `paging::dma_alloc_page`, the uncached pool, so CPU and controller stay
+//! coherent without cache maintenance — only a DSB before ringing a doorbell.
+//!
+//! **Events.** One event ring per controller carries transfer completions for
+//! every device, command completions and port changes. Everything funnels
+//! through [`Ctl::dispatch`], so a wait for one command's completion still
+//! delivers other devices' reports (nothing typed during a hot-plug is lost),
+//! and port changes seen mid-operation are queued for [`poll`] rather than
+//! handled re-entrantly.
+//!
+//! All waits are bounded and every step prints a status line, because this can
+//! only be tested on real hardware (no serial adapter → debugging by HDMI photo).
+
+use crate::arch::mmio::{read32, write32};
+use crate::arch::timer::{delay_us, now_ms};
+
+/// Offset added to a CPU-physical address to get the bus address RP1's DMA uses
+/// to reach system RAM: 1:1 on this hardware (see the module doc).
+const DMA_OFFSET: u64 = 0x0;
+
+// Operational / runtime / doorbell register offsets.
+const OP_USBCMD: usize = 0x00;
+const OP_USBSTS: usize = 0x04;
+const OP_CONFIG: usize = 0x38;
+const OP_DCBAAP: usize = 0x30;
+const OP_CRCR: usize = 0x18;
+const OP_PORTSC0: usize = 0x400;
+const OP_PORT_STRIDE: usize = 0x10;
+
+const CMD_RUN: u32 = 1 << 0;
+const CMD_HCRST: u32 = 1 << 1;
+const STS_HCH: u32 = 1 << 0;
+const STS_CNR: u32 = 1 << 11;
+const STS_HSE: u32 = 1 << 2; // host system error: the controller stopped on a bad DMA
+const STS_HCE: u32 = 1 << 12; // host controller error: internal fault, stopped
+const PLS_U0: u32 = 0;
+const PLS_U3: u32 = 3;
+
+const PORTSC_CCS: u32 = 1 << 0;
+const PORTSC_PED: u32 = 1 << 1; // RW1CS: writing 1 DISABLES the port -- never write it back
+const PORTSC_PR: u32 = 1 << 4;
+const PORTSC_PLS_MASK: u32 = 0xF << 5;
+const PORTSC_PP: u32 = 1 << 9;
+const PORTSC_LWS: u32 = 1 << 16; // link-state write strobe: PLS is only written with this set
+const PORTSC_CSC: u32 = 1 << 17;
+const PORTSC_PRC: u32 = 1 << 21;
+const PORTSC_PLC: u32 = 1 << 22;
+const PORTSC_WPR: u32 = 1 << 31;
+// Write-1-to-clear change bits live in PORTSC; preserve non-RW1C bits when writing.
+const PORTSC_RW1CS: u32 = 0x00FE_0000; // CSC,PEC,WRC,OCC,PRC,PLC,CEC (bits 17..23)
+const PLS_RESUME: u32 = 15;
+
+// TRB types.
+const TRB_NORMAL: u32 = 1;
+const TRB_SETUP: u32 = 2;
+const TRB_DATA: u32 = 3;
+const TRB_STATUS: u32 = 4;
+const TRB_LINK: u32 = 6;
+const TRB_ENABLE_SLOT: u32 = 9;
+const TRB_DISABLE_SLOT: u32 = 10;
+const TRB_ADDRESS_DEVICE: u32 = 11;
+const TRB_CONFIGURE_ENDPOINT: u32 = 12;
+const TRB_EVALUATE_CONTEXT: u32 = 13;
+const TRB_RESET_ENDPOINT: u32 = 14;
+const TRB_SET_TR_DEQUEUE: u32 = 16;
+const TRB_EV_TRANSFER: u32 = 32;
+const TRB_EV_CMD_COMPLETE: u32 = 33;
+const TRB_EV_PORT_STATUS: u32 = 34;
+
+const RING_TRBS: usize = 64; // TRBs per ring segment (64 * 16 = 1 KiB, fits a page)
+
+const MAX_DEVS: usize = 4; // devices per controller (it has 2-4 root ports)
+const MAX_HID: usize = 8; // keyboard/mouse endpoints per controller (combo dongles have two)
+
+#[inline]
+fn dma(phys: u64) -> u64 {
+    phys + DMA_OFFSET
+}
+
+#[inline]
+fn dsb() {
+    unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) };
+}
+
+fn out(s: &[u8]) {
+    crate::console_write(s);
+}
+
+unsafe fn wr64(addr: usize, val: u64) {
+    write32(addr, (val & 0xFFFF_FFFF) as u32);
+    write32(addr + 4, (val >> 32) as u32);
+}
+
+/// Allocate one zeroed 4 KiB page from the uncached DMA pool; returns its
+/// CPU-physical address (== virtual: identity map). Pages are frame-aligned,
+/// satisfying every xHCI alignment.
+fn alloc_page() -> Option<u64> {
+    let p = crate::arch::paging::dma_alloc_page()?;
+    for i in 0..512u64 {
+        unsafe { core::ptr::write_volatile((p + i * 8) as *mut u64, 0) };
+    }
+    Some(p)
+}
+
+/// Return a page once the controller can no longer touch it (slot disabled).
+fn free_page(p: u64) {
+    crate::arch::paging::dma_free_page(p);
+}
+
+fn trb_write(ring: u64, idx: usize, param: u64, status: u32, control: u32) {
+    let a = ring + (idx * 16) as u64;
+    unsafe {
+        core::ptr::write_volatile(a as *mut u64, param);
+        core::ptr::write_volatile((a + 8) as *mut u32, status);
+        core::ptr::write_volatile((a + 12) as *mut u32, control);
+    }
+}
+
+// ── Controller ───────────────────────────────────────────────────────────────
+
+struct Xhci {
+    cap: usize,
+    op: usize,
+    run: usize,
+    db: usize,
+    ctx_size: usize, // 32 or 64
+    max_ports: u32,
+    dcbaa: u64,
+    cmd_ring: u64,
+    cmd_enq: usize,
+    cmd_cycle: u32,
+    event_ring: u64,
+    event_deq: usize,
+    event_cycle: u32,
+    erst: u64,
+}
+
+impl Xhci {
+    fn op_rd(&self, off: usize) -> u32 {
+        unsafe { read32(self.op + off) }
+    }
+    fn op_wr(&self, off: usize, v: u32) {
+        unsafe { write32(self.op + off, v) };
+    }
+    fn portsc(&self, p: u32) -> usize {
+        self.op + OP_PORTSC0 + (p as usize - 1) * OP_PORT_STRIDE
+    }
+
+    /// Reset the controller and build the command ring, event ring and DCBAA,
+    /// then set it running. Returns None on any failure (after printing why).
+    fn init(cap: usize) -> Option<Xhci> {
+        let caplength = (unsafe { read32(cap) } & 0xFF) as usize;
+        let hcsparams1 = unsafe { read32(cap + 0x04) };
+        let hccparams1 = unsafe { read32(cap + 0x10) };
+        let dboff = (unsafe { read32(cap + 0x14) } & !0x3) as usize;
+        let rtsoff = (unsafe { read32(cap + 0x18) } & !0x1F) as usize;
+        let ctx_size = if hccparams1 & (1 << 2) != 0 { 64 } else { 32 };
+
+        let mut x = Xhci {
+            cap,
+            op: cap + caplength,
+            run: cap + rtsoff,
+            db: cap + dboff,
+            ctx_size,
+            max_ports: (hcsparams1 >> 24) & 0xFF,
+            dcbaa: 0,
+            cmd_ring: 0,
+            cmd_enq: 0,
+            cmd_cycle: 1,
+            event_ring: 0,
+            event_deq: 0,
+            event_cycle: 1,
+            erst: 0,
+        };
+
+        // Halt, then reset.
+        let cmd = x.op_rd(OP_USBCMD);
+        if cmd & CMD_RUN != 0 {
+            x.op_wr(OP_USBCMD, cmd & !CMD_RUN);
+            wait_set(x.op + OP_USBSTS, STS_HCH, 20_000);
+        }
+        x.op_wr(OP_USBCMD, CMD_HCRST);
+        if !wait_clear(x.op + OP_USBCMD, CMD_HCRST, 20_000)
+            || !wait_clear(x.op + OP_USBSTS, STS_CNR, 20_000)
+        {
+            out(b"  xhci: controller reset timeout\n");
+            return None;
+        }
+
+        // DCBAA, command ring, event ring + ERST.
+        x.dcbaa = alloc_page()?;
+        x.cmd_ring = alloc_page()?;
+        x.event_ring = alloc_page()?;
+        x.erst = alloc_page()?;
+
+        // Scratchpad buffers. If HCSPARAMS2 asks for any, DCBAA[0] MUST point to
+        // an array of page pointers the controller uses for internal state —
+        // without it the controller silently never completes a command.
+        // HCSPARAMS2: Max Scratchpad Bufs = (bits[31:27] << 5) | bits[25:21].
+        let hcs2 = unsafe { read32(cap + 0x08) };
+        let max_sp = (((hcs2 >> 27) & 0x1F) << 5) | ((hcs2 >> 21) & 0x1F);
+        hex(b"  max_scratchpad_bufs=", max_sp as u64, 2);
+        if max_sp > 0 {
+            let sp_array = alloc_page()?;
+            for i in 0..max_sp as u64 {
+                let buf = alloc_page()?;
+                unsafe { core::ptr::write_volatile((sp_array + i * 8) as *mut u64, dma(buf)) };
+            }
+            unsafe { core::ptr::write_volatile(x.dcbaa as *mut u64, dma(sp_array)) };
+        }
+
+        let max_slots = hcsparams1 & 0xFF;
+        x.op_wr(OP_CONFIG, max_slots); // MaxSlotsEn
+
+        unsafe { wr64(x.op + OP_DCBAAP, dma(x.dcbaa)) };
+
+        // Command ring: dequeue = base, cycle state 1.
+        unsafe { wr64(x.op + OP_CRCR, dma(x.cmd_ring) | 1) };
+
+        // Event ring: one segment described by ERST[0].
+        unsafe {
+            core::ptr::write_volatile(x.erst as *mut u64, dma(x.event_ring));
+            core::ptr::write_volatile((x.erst + 8) as *mut u32, RING_TRBS as u32);
+            core::ptr::write_volatile((x.erst + 12) as *mut u32, 0);
+        }
+        // Interrupter 0 runtime regs: IMAN@+0x20, ERSTSZ@+0x28, ERSTBA@+0x30,
+        // ERDP@+0x38. Spec order: ERSTSZ, ERDP, then ERSTBA LAST (writing ERSTBA
+        // arms the interrupter). Enable the interrupter (IMAN.IE) — some
+        // controllers won't advance/post events until it's enabled.
+        unsafe {
+            write32(x.run + 0x28, 1);
+            wr64(x.run + 0x38, dma(x.event_ring));
+            wr64(x.run + 0x30, dma(x.erst));
+            write32(x.run + 0x20, 0x2); // IMAN.IE
+        }
+
+        dsb();
+        // Run (RUN | INTE: enable the controller's interrupter system).
+        x.op_wr(OP_USBCMD, CMD_RUN | (1 << 2));
+        if !wait_clear(x.op + OP_USBSTS, STS_HCH, 20_000) {
+            out(b"  xhci: controller did not start (still halted)\n");
+            return None;
+        }
+        out(b"  xhci: running (rings up, DCBAA set)\n");
+        Some(x)
+    }
+
+    /// Enqueue a command TRB and ring the command doorbell. Returns the TRB's
+    /// bus address — its completion event carries it, which is how a waiter
+    /// recognises its own completion. The ring wraps with a Link TRB (toggle
+    /// cycle), so unlimited hot-plugs don't run off the end.
+    fn ring_command(&mut self, param: u64, control: u32) -> u64 {
+        let addr = self.cmd_ring + (self.cmd_enq * 16) as u64;
+        trb_write(self.cmd_ring, self.cmd_enq, param, 0, control | self.cmd_cycle);
+        self.cmd_enq += 1;
+        if self.cmd_enq == RING_TRBS - 1 {
+            trb_write(self.cmd_ring, self.cmd_enq, dma(self.cmd_ring), 0, (TRB_LINK << 10) | (1 << 1) | self.cmd_cycle);
+            self.cmd_enq = 0;
+            self.cmd_cycle ^= 1;
+        }
+        dsb();
+        unsafe { write32(self.db, 0) }; // doorbell 0 = command ring
+        dma(addr)
+    }
+
+    /// Non-blocking: dequeue one event if the controller has posted one.
+    fn poll_event(&mut self) -> Option<(u64, u32, u32)> {
+        let a = self.event_ring + (self.event_deq * 16) as u64;
+        let control = unsafe { core::ptr::read_volatile((a + 12) as *const u32) };
+        if (control & 1) != self.event_cycle {
+            return None;
+        }
+        let param = unsafe { core::ptr::read_volatile(a as *const u64) };
+        let status = unsafe { core::ptr::read_volatile((a + 8) as *const u32) };
+        self.event_deq += 1;
+        if self.event_deq >= RING_TRBS {
+            self.event_deq = 0;
+            self.event_cycle ^= 1;
+        }
+        let erdp = dma(self.event_ring + (self.event_deq * 16) as u64) | (1 << 3);
+        unsafe { wr64(self.run + 0x38, erdp) };
+        Some((param, status, control))
+    }
+
+    /// Dump controller state for diagnosis: USBSTS (decoded), CRCR, and the raw
+    /// first event-ring TRB — tells us whether the controller faulted on DMA
+    /// (HSE), wrote an event we missed (EINT), or did nothing at all.
+    fn dump_state(&self, tag: &[u8]) {
+        let sts = self.op_rd(OP_USBSTS);
+        out(tag);
+        hex(b" USBSTS=", sts as u64, 8);
+        if sts & (1 << 2) != 0 {
+            out(b"    HSE set: host system error -> bad DMA address\n");
+        }
+        if sts & (1 << 3) != 0 {
+            out(b"    EINT set: an event WAS written (poll/cycle bug)\n");
+        }
+        if sts & STS_HCH != 0 {
+            out(b"    HCH set: controller halted\n");
+        }
+        let crcr = unsafe { read32(self.op + OP_CRCR) };
+        hex(b"    CRCR.lo=", crcr as u64, 8);
+        hex(b"    USBCMD=", self.op_rd(OP_USBCMD) as u64, 8);
+        hex(b"    IMAN=", unsafe { read32(self.run + 0x20) } as u64, 8);
+        hex(b"    ERDP.lo=", unsafe { read32(self.run + 0x38) } as u64, 8);
+    }
+}
+
+fn wait_clear(addr: usize, mask: u32, tries: u32) -> bool {
+    for _ in 0..tries {
+        if unsafe { read32(addr) } & mask == 0 {
+            return true;
+        }
+        delay_us(50);
+    }
+    false
+}
+
+fn wait_set(addr: usize, mask: u32, tries: u32) -> bool {
+    for _ in 0..tries {
+        if unsafe { read32(addr) } & mask != 0 {
+            return true;
+        }
+        delay_us(50);
+    }
+    false
+}
+
+fn hex(label: &[u8], val: u64, nibbles: usize) {
+    out(label);
+    out(b"0x");
+    let mut buf = [0u8; 16];
+    let n = nibbles.min(16);
+    for i in 0..n {
+        let nib = (val >> ((n - 1 - i) * 4)) & 0xF;
+        buf[i] = if nib < 10 { b'0' + nib as u8 } else { b'a' + (nib - 10) as u8 };
+    }
+    out(&buf[..n]);
+    out(b"\n");
+}
+
+fn report_cc(cc: u32) {
+    match cc {
+        1 => out(b"success\n"),
+        4 => out(b"USB transaction error\n"),
+        5 => out(b"TRB error\n"),
+        6 => out(b"stall error\n"),
+        _ => hex(b"completion code=", cc as u64, 2),
+    }
+}
+
+fn dec(label: &[u8], v: u32) {
+    out(label);
+    let mut b = [0u8; 10];
+    let mut n = 0;
+    let mut v = v;
+    if v == 0 {
+        b[0] = b'0';
+        n = 1;
+    }
+    while v > 0 && n < b.len() {
+        b[n] = b'0' + (v % 10) as u8;
+        v /= 10;
+        n += 1;
+    }
+    b[..n].reverse();
+    out(&b[..n]);
+}
+
+/// Reset root-hub port `p` (1-based) if a device is connected; returns its
+/// PORTSC once the port is enabled. (The port isn't enabled yet, so writing
+/// PORTSC back with PED clear is harmless here.)
+fn reset_port(x: &Xhci, p: u32) -> Option<u32> {
+    let off = x.portsc(p);
+    let mut psc = unsafe { read32(off) };
+    if psc & PORTSC_PP == 0 {
+        unsafe { write32(off, (psc & !PORTSC_RW1CS) | PORTSC_PP) };
+        delay_us(20_000);
+        psc = unsafe { read32(off) };
+    }
+    if psc & PORTSC_CCS == 0 {
+        return None;
+    }
+    // Reset the port: write PR, keep PP, clear RW1C change bits.
+    let base = (psc & !PORTSC_RW1CS) | PORTSC_PP;
+    unsafe { write32(off, base | PORTSC_PR) };
+    if !wait_clear(off, PORTSC_PR, 20_000) {
+        out(b"  port reset timeout\n");
+        return None;
+    }
+    delay_us(20_000);
+    let psc2 = unsafe { read32(off) };
+    dec(b"  port ", p);
+    hex(b" after reset PORTSC=", psc2 as u64, 8);
+    if psc2 & PORTSC_PED == 0 {
+        out(b"  port did not enable after reset\n");
+        return None;
+    }
+    Some(psc2)
+}
+
+// ── Devices ──────────────────────────────────────────────────────────────────
+
+/// One addressed USB device: its slot, port and the pages the controller
+/// holds for it (freed again when it is unplugged).
+#[derive(Clone, Copy)]
+struct Dev {
+    slot: u8,
+    port: u32,
+    speed: u32,
+    ep0_ring: u64,
+    ep0_enq: usize,
+    ep0_cycle: u32,
+    input_ctx: u64,
+    dev_ctx: u64,
+    buf: u64,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum HidKind {
+    Kbd,
+    Mouse,
+    /// A gamepad / joystick: decoded with `pad` (drivers::hidpad).
+    Pad,
+}
+
+/// One boot-protocol HID interrupt-IN endpoint being polled.
+#[derive(Clone, Copy)]
+struct Hid {
+    kind: HidKind,
+    slot: u8,
+    port: u32,
+    dci: u32,
+    ep_addr: u32,
+    ring: u64,
+    enq: usize,
+    cycle: u32,
+    rbuf: u64,
+    mps: u32,
+    prev: [u8; 8],
+    /// Where a gamepad's sticks and buttons sit in its report.
+    pad: crate::drivers::hidpad::Layout,
+    /// The gamepad's handle in drivers::gamepad (u32::MAX: not a pad).
+    pad_h: u32,
+    /// Set by a transfer error: the controller halted the endpoint and it
+    /// must be reset (done by [`poll`], outside the event loop).
+    halted: bool,
+    last_cc: u32,
+    fails: u8,
+    /// Report requests queued / completed: HID_SLOTS stay in flight, each
+    /// with its own 64-byte slot of `rbuf`, so the controller keeps polling
+    /// the device at its interval and no state change is lost between two
+    /// slow frames (a lost "Shift held" report turns a capital lowercase).
+    fill: u32,
+    done: u32,
+}
+
+/// One HID interrupt-IN endpoint found in a configuration descriptor.
+#[derive(Clone, Copy)]
+struct HidEp {
+    iface: u32,
+    /// 1 keyboard, 2 mouse (boot protocol), 0 another HID device (a gamepad
+    /// if its report descriptor says so), 0xFF a wired Xbox 360 controller.
+    proto: u32,
+    addr: u32,
+    mps: u32,
+    interval: u32,
+    /// The HID report descriptor's length (proto 0).
+    report_len: u32,
+}
+
+/// One bulk endpoint of a mass-storage device (its ring state lives here).
+#[derive(Clone, Copy)]
+struct BulkEp {
+    dci: u32,
+    ep_addr: u32,
+    ring: u64,
+    enq: usize,
+    cycle: u32,
+}
+
+/// A USB mass-storage device (one per controller): its two bulk endpoints and
+/// the DMA page the class driver's transfers go through.
+#[derive(Clone, Copy)]
+struct Msd {
+    slot: u8,
+    di: usize,
+    iface: u32,
+    ep_in: BulkEp,
+    ep_out: BulkEp,
+    data: u64,
+}
+
+/// A FIDO security key (YubiKey, SoloKey, Titan...): a HID interface whose
+/// report descriptor uses usage page 0xF1D0, with an interrupt IN and an
+/// interrupt OUT endpoint carrying 64-byte CTAPHID reports (fs/seckey.rs).
+#[derive(Clone, Copy)]
+struct Fido {
+    slot: u8,
+    di: usize,
+    ep_in: BulkEp,
+    ep_out: BulkEp,
+    /// DMA page: bytes 0..64 the report going out, 2048..2112 the one coming in.
+    data: u64,
+    /// An IN request is queued and has not completed yet.
+    in_pending: bool,
+    /// Its completion status, when it arrived while nobody was waiting.
+    in_done: Option<u32>,
+}
+
+/// Bumped whenever a security key arrives or leaves (fs/seckey.rs reopens
+/// its CTAPHID channel when this changes).
+static mut FIDO_GEN: u32 = 0;
+
+struct Ctl {
+    x: Xhci,
+    name: &'static [u8],
+    devs: [Option<Dev>; MAX_DEVS],
+    hids: [Option<Hid>; MAX_HID],
+    /// Ports whose status-change events arrived; serviced by [`poll`].
+    port_pending: u32,
+    last_scan_ms: u64,
+    /// Per port: no enumeration attempt from the periodic scan before this
+    /// time (back-off after a failure or a watchdog re-enumeration).
+    port_retry: [u64; 32],
+    msd: Option<Msd>,
+    /// A FIDO security key (one per controller), see fs/seckey.rs.
+    fido: Option<Fido>,
+}
+
+static mut CTLS: [Option<Ctl>; 2] = [None, None];
+/// A drive arrived / left: handed to drivers::usbmsd by poll(), outside the
+/// controller borrow its transfers need.
+static mut MSD_ATTACH: bool = false;
+static mut MSD_DETACH: bool = false;
+
+/// What a waiter is looking for in the event stream.
+#[derive(Clone, Copy)]
+enum Want {
+    /// The completion of the command TRB at this bus address.
+    Cmd(u64),
+    /// A transfer event for (slot, endpoint DCI) — a control transfer's end.
+    Xfer(u8, u32),
+}
+
+impl Ctl {
+    /// Handle every event already posted; returns when the ring is empty.
+    fn drain(&mut self) {
+        while let Some(ev) = self.x.poll_event() {
+            self.dispatch(ev, None);
+        }
+    }
+
+    /// Handle events until the `want`ed one arrives (returned), or `tries`
+    /// idle polls of 50µs pass. Other devices' reports are delivered meanwhile.
+    fn wait(&mut self, want: Want, tries: u32) -> Option<(u64, u32, u32)> {
+        let mut idle = 0u32;
+        while idle < tries {
+            match self.x.poll_event() {
+                Some(ev) => {
+                    if let Some(hit) = self.dispatch(ev, Some(want)) {
+                        return Some(hit);
+                    }
+                },
+                None => {
+                    delay_us(50);
+                    idle += 1;
+                },
+            }
+        }
+        None
+    }
+
+    /// Route one event; `Some` when it is the one a waiter asked for.
+    fn dispatch(&mut self, ev: (u64, u32, u32), want: Option<Want>) -> Option<(u64, u32, u32)> {
+        let (param, status, control) = ev;
+        match (control >> 10) & 0x3F {
+            TRB_EV_CMD_COMPLETE => {
+                if let Some(Want::Cmd(addr)) = want {
+                    if param == addr {
+                        return Some(ev);
+                    }
+                }
+                hex(b"  xhci: stray command completion, TRB ", param, 16);
+                None
+            },
+            TRB_EV_TRANSFER => {
+                let slot = ((control >> 24) & 0xFF) as u8;
+                let dci = (control >> 16) & 0x1F;
+                if let Some(Want::Xfer(s, d)) = want {
+                    if s == slot && d == dci {
+                        return Some(ev);
+                    }
+                }
+                self.on_transfer(slot, dci, status);
+                None
+            },
+            TRB_EV_PORT_STATUS => {
+                let port = ((param >> 24) & 0xFF) as u32;
+                if (1..=31).contains(&port) {
+                    self.port_pending |= 1 << port;
+                }
+                None
+            },
+            _ => None,
+        }
+    }
+
+    /// A transfer completed on one of our polled endpoints: decode the report
+    /// and re-arm, or note that the controller halted the endpoint.
+    fn on_transfer(&mut self, slot: u8, dci: u32, status: u32) {
+        if let Some(f) = self.fido.as_mut() {
+            if f.slot == slot && dci == f.ep_in.dci {
+                f.in_done = Some(status);
+                f.in_pending = false;
+                return;
+            }
+            if f.slot == slot && dci == f.ep_out.dci {
+                return;
+            }
+        }
+        let Some(i) = self.hids.iter().position(|h| h.is_some_and(|h| h.slot == slot && h.dci == dci)) else {
+            return;
+        };
+        let x = &self.x;
+        let h = self.hids[i].as_mut().unwrap();
+        let cc = (status >> 24) & 0xFF;
+        if cc == 1 || cc == 13 {
+            // completions come back in the order the requests were queued
+            let buf = h.rbuf + (h.done % HID_SLOTS) as u64 * HID_SLOT_BYTES;
+            h.done = h.done.wrapping_add(1);
+            let mut cur = [0u8; 8];
+            let n = (h.mps as usize).min(8);
+            for (k, b) in cur.iter_mut().enumerate().take(n) {
+                *b = unsafe { core::ptr::read_volatile((buf + k as u64) as *const u8) };
+            }
+            match h.kind {
+                HidKind::Kbd => {
+                    decode_report(&h.prev, &cur);
+                    unsafe { HELD = cur };
+                },
+                HidKind::Mouse => mouse_report(&cur, n),
+                HidKind::Pad => {
+                    // The whole report (up to 64 bytes); the TRB's residual says how much came.
+                    let got = (h.mps as usize).saturating_sub((status & 0xFF_FFFF) as usize).min(64);
+                    let mut rep = [0u8; 64];
+                    for (k, b) in rep.iter_mut().enumerate().take(got) {
+                        *b = unsafe { core::ptr::read_volatile((buf + k as u64) as *const u8) };
+                    }
+                    crate::drivers::gamepad::report(h.pad_h, &rep[..got]);
+                },
+            }
+            h.prev = cur;
+            h.fails = 0;
+            hid_queue(x, h);
+        } else {
+            // Any other completion halts the endpoint (USB transaction error
+            // when a device drops the link, stall, babble...). Re-queuing on a
+            // halted endpoint would be ignored forever — exactly the "lights
+            // come back but nothing types" symptom — so recover it instead.
+            h.halted = true;
+            h.last_cc = cc;
+        }
+    }
+
+    /// Bring a halted endpoint back: Reset Endpoint, point its dequeue at our
+    /// next TRB, clear a stall on the device, and re-arm.
+    fn recover(&mut self, i: usize) {
+        let Some(mut h) = self.hids[i] else { return };
+        h.fails += 1;
+        out(self.name);
+        out(match h.kind {
+            HidKind::Kbd => b": keyboard endpoint halted (",
+            HidKind::Mouse => b": mouse endpoint halted (",
+            HidKind::Pad => b": gamepad endpoint halted (",
+        });
+        report_cc(h.last_cc);
+        if h.fails > 6 {
+            out(b"  resetting its port and enumerating the device again\n");
+            let port = h.port;
+            self.remove_port(port);
+            self.port_retry[port as usize & 31] = now_ms() + 2000;
+            return;
+        }
+        let sl = (h.slot as u32) << 24;
+        let a = self.x.ring_command(0, (TRB_RESET_ENDPOINT << 10) | (h.dci << 16) | sl);
+        match self.wait(Want::Cmd(a), 20_000) {
+            Some((_, s, _)) if matches!((s >> 24) & 0xFF, 1 | 19) => {}, // 19: wasn't halted after all
+            Some((_, s, _)) => {
+                out(b"  reset endpoint: ");
+                report_cc((s >> 24) & 0xFF);
+            },
+            None => out(b"  reset endpoint: no completion\n"),
+        }
+        let deq = dma(h.ring + (h.enq * 16) as u64) | h.cycle as u64;
+        let a = self.x.ring_command(deq, (TRB_SET_TR_DEQUEUE << 10) | (h.dci << 16) | sl);
+        match self.wait(Want::Cmd(a), 20_000) {
+            Some((_, s, _)) if (s >> 24) & 0xFF == 1 => {},
+            Some((_, s, _)) => {
+                out(b"  set dequeue pointer: ");
+                report_cc((s >> 24) & 0xFF);
+            },
+            None => out(b"  set dequeue pointer: no completion\n"),
+        }
+        if h.last_cc == 6 {
+            // CLEAR_FEATURE(ENDPOINT_HALT) so the device's data toggle resets too.
+            if let Some(di) = self.devs.iter().position(|d| d.is_some_and(|d| d.slot == h.slot)) {
+                let _ = self.control(di, 0x02, 1, 0, h.ep_addr as u16, 0, 0);
+            }
+        }
+        h.halted = false;
+        // the dequeue pointer skipped every request still queued: start over
+        h.done = h.fill;
+        hid_arm_all(&self.x, &mut h);
+        self.hids[i] = Some(h);
+        out(b"  endpoint re-armed\n");
+    }
+
+    /// A control transfer on EP0 (Setup/Data/Status) of device `di`. For an IN
+    /// request the data lands in `buf_dma`. Returns bytes transferred, or None
+    /// on failure.
+    fn control(&mut self, di: usize, bm_rt: u8, b_req: u8, w_val: u16, w_idx: u16, buf_dma: u64, len: u16) -> Option<u32> {
+        let mut d = self.devs[di]?;
+        let is_in = bm_rt & 0x80 != 0;
+        let setup = (bm_rt as u64)
+            | ((b_req as u64) << 8)
+            | ((w_val as u64) << 16)
+            | ((w_idx as u64) << 32)
+            | ((len as u64) << 48);
+        let trt = if len == 0 {
+            0u32
+        } else if is_in {
+            3
+        } else {
+            2
+        };
+        ep0_push(&mut d, setup, 8, (TRB_SETUP << 10) | (trt << 16) | (1 << 6));
+        if len > 0 {
+            let dir = if is_in { 1u32 } else { 0 };
+            ep0_push(&mut d, buf_dma, len as u32, (TRB_DATA << 10) | (dir << 16));
+        }
+        let status_dir = if len > 0 && is_in { 0u32 } else { 1 };
+        ep0_push(&mut d, 0, 0, (TRB_STATUS << 10) | (status_dir << 16) | (1 << 5));
+        self.devs[di] = Some(d);
+        dsb();
+        unsafe { write32(self.x.db + d.slot as usize * 4, 1) }; // EP0 doorbell, DCI 1
+        let (_p, status, _ctl) = self.wait(Want::Xfer(d.slot, 1), 40_000)?;
+        let code = (status >> 24) & 0xFF;
+        if code != 1 && code != 13 {
+            out(b"    control xfer ");
+            report_cc(code);
+            return None;
+        }
+        Some(len as u32 - (status & 0xFF_FFFF))
+    }
+
+    /// Update EP0's Max Packet Size in the device context via an Evaluate
+    /// Context command. Needed because Address Device sets a provisional MPS of 8
+    /// (safe for the first 8-byte descriptor read); the real value comes from
+    /// bMaxPacketSize0 and must be programmed before a larger control transfer,
+    /// or the device babbles. The input context is reused (only the EP0 add-flag set).
+    fn set_ep0_mps(&mut self, di: usize, mps: u32) -> bool {
+        let Some(d) = self.devs[di] else { return false };
+        let cs = self.x.ctx_size as u64;
+        unsafe {
+            core::ptr::write_volatile(d.input_ctx as *mut u32, 0); // drop flags
+            core::ptr::write_volatile((d.input_ctx + 0x04) as *mut u32, 0b10); // add A1 = EP0 only
+        }
+        let ep0 = d.input_ctx + 2 * cs;
+        unsafe {
+            core::ptr::write_volatile((ep0 + 4) as *mut u32, (mps << 16) | (4 << 3) | (3 << 1));
+            core::ptr::write_volatile((ep0 + 8) as *mut u64, dma(d.ep0_ring) | 1);
+            core::ptr::write_volatile((ep0 + 16) as *mut u32, mps.min(8));
+        }
+        dsb();
+        let a = self.x.ring_command(dma(d.input_ctx), (TRB_EVALUATE_CONTEXT << 10) | ((d.slot as u32) << 24));
+        matches!(self.wait(Want::Cmd(a), 40_000), Some((_, s, _)) if (s >> 24) & 0xFF == 1)
+    }
+
+    /// Forget device `di`: drop its endpoints, disable its slot, free its pages.
+    fn remove_dev(&mut self, di: usize) {
+        let Some(d) = self.devs[di] else { return };
+        if let Some(f) = self.fido {
+            if f.slot == d.slot {
+                free_page(f.ep_in.ring);
+                free_page(f.ep_out.ring);
+                free_page(f.data);
+                self.fido = None;
+                unsafe { FIDO_GEN = FIDO_GEN.wrapping_add(1) };
+                out(b"  security key removed\n");
+            }
+        }
+        if let Some(m) = self.msd {
+            if m.slot == d.slot {
+                free_page(m.ep_in.ring);
+                free_page(m.ep_out.ring);
+                free_page(m.data);
+                self.msd = None;
+                unsafe { MSD_DETACH = true };
+            }
+        }
+        for h in self.hids.iter_mut() {
+            if let Some(hh) = *h {
+                if hh.slot == d.slot {
+                    if hh.kind == HidKind::Kbd {
+                        unsafe { HELD = [0; 8] };
+                    }
+                    if hh.kind == HidKind::Pad {
+                        crate::drivers::gamepad::detach(hh.pad_h);
+                    }
+                    free_page(hh.ring);
+                    free_page(hh.rbuf);
+                    *h = None;
+                }
+            }
+        }
+        let a = self.x.ring_command(0, (TRB_DISABLE_SLOT << 10) | ((d.slot as u32) << 24));
+        let _ = self.wait(Want::Cmd(a), 20_000);
+        unsafe { core::ptr::write_volatile((self.x.dcbaa + d.slot as u64 * 8) as *mut u64, 0) };
+        free_page(d.input_ctx);
+        free_page(d.dev_ctx);
+        free_page(d.ep0_ring);
+        free_page(d.buf);
+        self.devs[di] = None;
+        out(self.name);
+        dec(b": device on port ", d.port);
+        out(b" removed\n");
+    }
+
+    fn remove_port(&mut self, port: u32) {
+        for di in 0..MAX_DEVS {
+            if self.devs[di].is_some_and(|d| d.port == port) {
+                self.remove_dev(di);
+            }
+        }
+    }
+
+    /// Clear the change bits of every port (after boot enumeration has dealt
+    /// with the connects/resets they describe), so hot-plug starts clean.
+    fn clear_port_changes(&mut self) {
+        for p in 1..=self.x.max_ports {
+            let off = self.x.portsc(p);
+            let psc = unsafe { read32(off) };
+            unsafe { write32(off, portsc_base(psc) | PORTSC_RW1CS) };
+        }
+        self.drain();
+        self.port_pending = 0;
+    }
+
+    /// Act on the ports that changed (or on all of them, for the periodic
+    /// scan): finish remote-wakeup resumes, drop unplugged devices, set up
+    /// newly plugged ones.
+    fn service_ports(&mut self, scan: bool) {
+        let pending = core::mem::take(&mut self.port_pending);
+        for p in 1..=self.x.max_ports {
+            if !scan && pending & (1 << p) == 0 {
+                continue;
+            }
+            let off = self.x.portsc(p);
+            let psc = unsafe { read32(off) };
+            let base = portsc_base(psc);
+            if psc & PORTSC_PLC != 0 {
+                if (psc & PORTSC_PLS_MASK) >> 5 == PLS_RESUME {
+                    // Remote wakeup (a key pressed on a suspended device): the
+                    // host must finish the resume by moving the port to U0.
+                    delay_us(20_000);
+                    unsafe { write32(off, (base & !PORTSC_PLS_MASK) | PORTSC_LWS | PORTSC_PLC) };
+                    out(self.name);
+                    dec(b": port ", p);
+                    out(b" resumed from suspend\n");
+                } else {
+                    unsafe { write32(off, base | PORTSC_PLC) };
+                }
+            }
+            if psc & PORTSC_PRC != 0 {
+                unsafe { write32(off, base | PORTSC_PRC) };
+            }
+            let connected = psc & PORTSC_CCS != 0;
+            let changed = psc & PORTSC_CSC != 0;
+            if changed {
+                unsafe { write32(off, base | PORTSC_CSC) };
+            }
+            let have = self.devs.iter().any(|d| d.is_some_and(|d| d.port == p));
+            if have && (!connected || changed) {
+                // Gone, or went away and came back (re-enumerate from scratch).
+                self.remove_port(p);
+            }
+            let now = now_ms();
+            let backoff = !changed && now < self.port_retry[p as usize & 31];
+            if connected && (!have || changed) && !backoff {
+                delay_us(100_000); // debounce
+                if unsafe { read32(off) } & PORTSC_CCS != 0 {
+                    out(self.name);
+                    dec(b": device plugged into port ", p);
+                    out(b"\n");
+                    if let Some(psc2) = reset_port(&self.x, p) {
+                        enumerate_device(self, p, psc2);
+                    }
+                    // The reset just raised PRC (and maybe CSC): clear them.
+                    let psc3 = unsafe { read32(off) };
+                    unsafe { write32(off, portsc_base(psc3) | PORTSC_PRC | PORTSC_CSC) };
+                    self.drain();
+                    self.port_pending &= !(1 << p);
+                    if !self.devs.iter().any(|d| d.is_some_and(|d| d.port == p)) {
+                        // Did not come up: try again in a while, not every second.
+                        self.port_retry[p as usize & 31] = now + 5000;
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl Ctl {
+    /// Once a second: catch what no event told us about. A controller that
+    /// halted or hit a host-system error gets re-initialised (returns true);
+    /// an endpoint the controller shows halted / in error is recovered, a
+    /// stopped one gets its doorbell rung, a disabled one has its port
+    /// enumerated again; a port left suspended is resumed; a port that went
+    /// disabled with a device still attached is enumerated again. Any of
+    /// those used to leave a keyboard or mouse silent until a reboot.
+    fn watchdog(&mut self, now: u64) -> bool {
+        let sts = self.x.op_rd(OP_USBSTS);
+        if sts & (STS_HCH | STS_HSE | STS_HCE) != 0 {
+            out(self.name);
+            hex(b": watchdog: controller stopped, USBSTS=", sts as u64, 8);
+            return true;
+        }
+        for i in 0..MAX_HID {
+            let Some(h) = self.hids[i] else { continue };
+            if h.halted {
+                continue;
+            }
+            let Some(d) = self.devs.iter().flatten().find(|d| d.slot == h.slot).copied() else { continue };
+            let epc = d.dev_ctx + h.dci as u64 * self.x.ctx_size as u64;
+            let state = unsafe { read32(epc as usize) } & 7;
+            match state {
+                2 | 4 => {
+                    out(self.name);
+                    out(b": watchdog: endpoint halted -> recovering\n");
+                    let hh = self.hids[i].as_mut().unwrap();
+                    hh.halted = true;
+                    hh.last_cc = 0;
+                },
+                3 => {
+                    out(self.name);
+                    out(b": watchdog: endpoint stopped -> ringing its doorbell\n");
+                    dsb();
+                    unsafe { write32(self.x.db + h.slot as usize * 4, h.dci) };
+                },
+                0 => {
+                    out(self.name);
+                    dec(b": watchdog: endpoint disabled -> enumerating port ", h.port);
+                    out(b" again\n");
+                    self.remove_port(h.port);
+                    self.port_retry[h.port as usize & 31] = now + 1000;
+                },
+                _ => {},
+            }
+        }
+        for p in 1..=self.x.max_ports {
+            let off = self.x.portsc(p);
+            let psc = unsafe { read32(off) };
+            if psc & PORTSC_CCS == 0 {
+                continue;
+            }
+            let base = portsc_base(psc);
+            let pls = (psc & PORTSC_PLS_MASK) >> 5;
+            let have = self.devs.iter().any(|d| d.is_some_and(|d| d.port == p));
+            if pls == PLS_U3 {
+                out(self.name);
+                dec(b": watchdog: port ", p);
+                out(b" is suspended -> resuming\n");
+                unsafe { write32(off, (base & !PORTSC_PLS_MASK) | (PLS_RESUME << 5) | PORTSC_LWS) };
+                delay_us(20_000);
+                unsafe { write32(off, (base & !PORTSC_PLS_MASK) | (PLS_U0 << 5) | PORTSC_LWS) };
+                delay_us(10_000);
+            } else if have && psc & PORTSC_PED == 0 && pls != PLS_RESUME {
+                out(self.name);
+                dec(b": watchdog: port ", p);
+                out(b" disabled with a device attached -> enumerating it again\n");
+                self.remove_port(p);
+                self.port_retry[p as usize & 31] = now + 1000;
+            }
+        }
+        false
+    }
+}
+
+/// Throw a stopped controller away and bring it up again from scratch (its
+/// devices get enumerated anew) -- the only way back from a halted controller.
+fn reinit_controller(idx: usize) {
+    let ctls = unsafe { &mut *(&raw mut CTLS) };
+    let Some(ctl) = ctls[idx].take() else { return };
+    let (cap, name) = (ctl.x.cap, ctl.name);
+    if ctl.msd.is_some() {
+        unsafe { MSD_DETACH = true };
+    }
+    unsafe { HELD = [0; 8] };
+    out(name);
+    out(b": re-initialising the controller\n");
+    // Init resets the controller first, so the old pages are safe to free after.
+    enumerate(cap, name);
+    for d in ctl.devs.iter().flatten() {
+        for p in [d.input_ctx, d.dev_ctx, d.ep0_ring, d.buf] {
+            free_page(p);
+        }
+    }
+    for h in ctl.hids.iter().flatten() {
+        if h.kind == HidKind::Pad {
+            crate::drivers::gamepad::detach(h.pad_h);
+        }
+        free_page(h.ring);
+        free_page(h.rbuf);
+    }
+    if let Some(m) = ctl.msd {
+        free_page(m.ep_in.ring);
+        free_page(m.ep_out.ring);
+        free_page(m.data);
+    }
+    for p in [ctl.x.dcbaa, ctl.x.cmd_ring, ctl.x.event_ring, ctl.x.erst] {
+        free_page(p);
+    }
+}
+
+/// PORTSC with everything that would act on a write masked out: the RW1C
+/// change bits, PED (writing 1 disables the port), PR/WPR (resets), LWS.
+fn portsc_base(psc: u32) -> u32 {
+    (psc & !(PORTSC_RW1CS | PORTSC_PED | PORTSC_PR | PORTSC_WPR | PORTSC_LWS)) | PORTSC_PP
+}
+
+/// Append a TRB to a device's EP0 ring (wrapping with a Link TRB).
+fn ep0_push(d: &mut Dev, param: u64, status: u32, control: u32) {
+    trb_write(d.ep0_ring, d.ep0_enq, param, status, control | d.ep0_cycle);
+    d.ep0_enq += 1;
+    if d.ep0_enq == RING_TRBS - 1 {
+        trb_write(d.ep0_ring, d.ep0_enq, dma(d.ep0_ring), 0, (TRB_LINK << 10) | (1 << 1) | d.ep0_cycle);
+        d.ep0_enq = 0;
+        d.ep0_cycle ^= 1;
+    }
+}
+
+/// Bring up controller `cap_base` (if not already running), enumerate what's
+/// plugged in now, and leave it watching its ports for hot-plug.
+pub fn enumerate(cap_base: usize, name: &'static [u8]) {
+    let ctls = unsafe { &mut *(&raw mut CTLS) };
+    if let Some(c) = ctls.iter().flatten().find(|c| c.x.cap == cap_base) {
+        // Already running (the `usb` console command after boot): just report.
+        out(name);
+        out(b": running; ");
+        dec(b"devices=", c.devs.iter().flatten().count() as u32);
+        dec(b" keyboard/mouse endpoints=", c.hids.iter().flatten().count() as u32);
+        out(b" (hot-plug active)\n");
+        return;
+    }
+    out(name);
+    out(b" xHCI init:\n");
+    let Some(x) = Xhci::init(cap_base) else { return };
+    let Some(slot) = ctls.iter_mut().find(|c| c.is_none()) else {
+        out(b"  no controller slot free\n");
+        return;
+    };
+    *slot = Some(Ctl { x, name, devs: [None; MAX_DEVS], hids: [None; MAX_HID], port_pending: 0, last_scan_ms: now_ms(), port_retry: [0; 32], msd: None, fido: None });
+    let ctl = slot.as_mut().unwrap();
+    // Power every port so later connects raise events even on empty ports.
+    for p in 1..=ctl.x.max_ports {
+        let off = ctl.x.portsc(p);
+        let psc = unsafe { read32(off) };
+        if psc & PORTSC_PP == 0 {
+            unsafe { write32(off, portsc_base(psc)) };
+        }
+    }
+    delay_us(20_000);
+    for p in 1..=ctl.x.max_ports {
+        if let Some(psc) = reset_port(&ctl.x, p) {
+            enumerate_device(ctl, p, psc);
+        }
+    }
+    ctl.clear_port_changes();
+    if ctl.devs.iter().all(|d| d.is_none()) {
+        out(name);
+        out(b": nothing connected -- plug a keyboard or mouse in any time\n");
+    }
+}
+
+fn abort_dev(ctl: &mut Ctl, di: usize, msg: &[u8]) {
+    out(msg);
+    ctl.remove_dev(di);
+}
+
+/// Address one device on root port `port`, read its descriptors, configure
+/// all its boot keyboard/mouse endpoints at once, and start polling them.
+fn enumerate_device(ctl: &mut Ctl, port: u32, psc: u32) {
+    let speed = (psc >> 10) & 0xF; // 1 FS, 2 LS, 3 HS, 4+ SS
+    let a = ctl.x.ring_command(0, TRB_ENABLE_SLOT << 10);
+    let slot = match ctl.wait(Want::Cmd(a), 40_000) {
+        Some((_, status, control)) if (status >> 24) & 0xFF == 1 => ((control >> 24) & 0xFF) as u8,
+        Some((_, status, _)) => {
+            out(b"  enable_slot: ");
+            report_cc((status >> 24) & 0xFF);
+            return;
+        },
+        None => {
+            out(b"  enable_slot: NO completion event (timeout)\n");
+            ctl.x.dump_state(b"  at timeout");
+            return;
+        },
+    };
+    dec(b"  slot assigned: ", slot as u32);
+    out(b"\n");
+
+    let (Some(input_ctx), Some(dev_ctx), Some(ep0_ring), Some(buf)) = (alloc_page(), alloc_page(), alloc_page(), alloc_page()) else {
+        out(b"  out of DMA pages\n");
+        return;
+    };
+    let Some(di) = ctl.devs.iter().position(|d| d.is_none()) else {
+        out(b"  too many devices on this controller\n");
+        return;
+    };
+    ctl.devs[di] = Some(Dev { slot, port, speed, ep0_ring, ep0_enq: 0, ep0_cycle: 1, input_ctx, dev_ctx, buf });
+    let cs = ctl.x.ctx_size as u64;
+    // Provisional EP0 max packet by speed (HS 64, SS 512, FS/LS 8 until read).
+    let mps_default: u32 = match speed {
+        3 => 64,
+        s if s >= 4 => 512,
+        _ => 8,
+    };
+
+    // --- Address Device -----------------------------------------------------
+    // Input Control Context: add slot (A0) + EP0 (A1).
+    unsafe { core::ptr::write_volatile((input_ctx + 0x04) as *mut u32, 0b11) };
+    let slot_ctx = input_ctx + cs;
+    unsafe {
+        core::ptr::write_volatile(slot_ctx as *mut u32, (1u32 << 27) | (speed << 20));
+        core::ptr::write_volatile((slot_ctx + 4) as *mut u32, port << 16);
+    }
+    let ep0 = input_ctx + 2 * cs;
+    unsafe {
+        core::ptr::write_volatile((ep0 + 4) as *mut u32, (mps_default << 16) | (4 << 3) | (3 << 1));
+        core::ptr::write_volatile((ep0 + 8) as *mut u64, dma(ep0_ring) | 1); // TR deq | DCS
+        core::ptr::write_volatile((ep0 + 16) as *mut u32, 8); // avg TRB length
+    }
+    unsafe { core::ptr::write_volatile((ctl.x.dcbaa + slot as u64 * 8) as *mut u64, dma(dev_ctx)) };
+    dsb();
+
+    let a = ctl.x.ring_command(dma(input_ctx), (TRB_ADDRESS_DEVICE << 10) | ((slot as u32) << 24));
+    match ctl.wait(Want::Cmd(a), 40_000) {
+        Some((_, status, _)) if (status >> 24) & 0xFF == 1 => {},
+        Some((_, status, _)) => {
+            out(b"  address_device: ");
+            report_cc((status >> 24) & 0xFF);
+            ctl.remove_dev(di);
+            return;
+        },
+        None => return abort_dev(ctl, di, b"  address_device: no completion event\n"),
+    }
+    out(b"  device addressed\n");
+
+    // --- GET_DESCRIPTOR(device): 8 bytes first to learn bMaxPacketSize0 ------
+    let rd = |o: usize| -> u32 { (unsafe { core::ptr::read_volatile((buf + o as u64) as *const u8) }) as u32 };
+    if ctl.control(di, 0x80, 6, 0x0100, 0, dma(buf), 8).is_none() {
+        return abort_dev(ctl, di, b"  get device descriptor (8) failed\n");
+    }
+    let mps0 = rd(7);
+    hex(b"  bMaxPacketSize0=", mps0 as u64, 2);
+    if speed < 3 && (mps0 == 16 || mps0 == 32 || mps0 == 64) && !ctl.set_ep0_mps(di, mps0) {
+        return abort_dev(ctl, di, b"  set EP0 max-packet failed\n");
+    }
+    if ctl.control(di, 0x80, 6, 0x0100, 0, dma(buf), 18).is_none() {
+        return abort_dev(ctl, di, b"  get device descriptor (18) failed\n");
+    }
+    hex(b"    idVendor=", (rd(8) | (rd(9) << 8)) as u64, 4);
+    hex(b"    idProduct=", (rd(10) | (rd(11) << 8)) as u64, 4);
+    // gamepads are told apart by them (drivers::hidpad::identify: Sony / Nintendo layouts)
+    let pad_ids = ((rd(8) | (rd(9) << 8)) as u16, (rd(10) | (rd(11) << 8)) as u16);
+
+    // --- GET_DESCRIPTOR(config): 9-byte header, then the full thing ---------
+    if ctl.control(di, 0x80, 6, 0x0200, 0, dma(buf), 9).is_none() {
+        return abort_dev(ctl, di, b"  get config header failed\n");
+    }
+    let total = (rd(2) | (rd(3) << 8)).min(4096) as u16;
+    let cfg_val = rd(5);
+    if ctl.control(di, 0x80, 6, 0x0200, 0, dma(buf), total).is_none() {
+        return abort_dev(ctl, di, b"  get full config failed\n");
+    }
+
+    // Walk the config: every boot-protocol HID interface (protocol 1 keyboard,
+    // 2 mouse) and its first interrupt-IN endpoint.
+    let total = total as usize;
+    let mut eps: [Option<HidEp>; MAX_HID] = [None; MAX_HID];
+    let mut n = 0usize;
+    let (mut cur_iface, mut cur_proto, mut cur_taken) = (0u32, 0u32, true);
+    let mut cur_report_len = 0u32;
+    // Bulk-only mass storage (class 8, SCSI transparent, protocol 0x50).
+    let (mut msd_iface, mut in_msd) = (0u32, false);
+    let (mut c_hid0, mut c_iface, mut c_rlen) = (false, 0u32, 0u32);
+    let (mut c_in, mut c_out): (Option<(u32, u32, u32)>, Option<(u32, u32)>) = (None, None);
+    let (mut fido_in, mut fido_out): (Option<(u32, u32, u32)>, Option<(u32, u32)>) = (None, None);
+    let (mut fido_iface, mut fido_rlen) = (0u32, 0u32);
+    let (mut msd_in, mut msd_out): (Option<(u32, u32)>, Option<(u32, u32)>) = (None, None);
+    let mut off = 0usize;
+    while off + 2 <= total {
+        let blen = rd(off) as usize;
+        let btype = rd(off + 1);
+        if blen == 0 {
+            break;
+        }
+        // FIDO candidates: a HID interface (protocol 0) with both an
+        // interrupt IN and an interrupt OUT endpoint.
+        if btype == 4 {
+            c_hid0 = rd(off + 5) == 3 && rd(off + 7) == 0;
+            c_iface = rd(off + 2);
+            (c_in, c_out, c_rlen) = (None, None, 0);
+        } else if btype == 0x21 && c_hid0 && blen >= 9 && rd(off + 6) == 0x22 {
+            c_rlen = rd(off + 7) | (rd(off + 8) << 8);
+        } else if btype == 5 && c_hid0 && fido_in.is_none() && rd(off + 3) & 0x3 == 3 {
+            let addr = rd(off + 2);
+            let mps = rd(off + 4) | (rd(off + 5) << 8);
+            if addr & 0x80 != 0 {
+                c_in = Some((addr, mps, rd(off + 6)));
+            } else {
+                c_out = Some((addr, mps));
+            }
+            if let (Some(i), Some(o)) = (c_in, c_out) {
+                (fido_in, fido_out, fido_iface, fido_rlen) = (Some(i), Some(o), c_iface, c_rlen);
+            }
+        }
+        if btype == 4 {
+            // HID interfaces: boot keyboard / mouse (protocol 1 / 2), or any
+            // other HID device (a gamepad, decided by its report descriptor
+            // later); a wired Xbox 360 controller is vendor class FF/5D/01.
+            let class = rd(off + 5);
+            let is_hid = class == 3 && matches!(rd(off + 7), 0 | 1 | 2);
+            let is_x360w = class == 0xFF && rd(off + 6) == 0x5D && rd(off + 7) == 0x81;
+            let is_xbox = (class == 0xFF && rd(off + 6) == 0x5D && rd(off + 7) == 0x01) || is_x360w;
+            cur_iface = rd(off + 2);
+            cur_proto = if is_x360w { 0xFD } else if is_xbox { 0xFF } else { rd(off + 7) };
+            cur_taken = !(is_hid || is_xbox);
+            cur_report_len = 0;
+            in_msd = rd(off + 5) == 8 && rd(off + 6) == 6 && rd(off + 7) == 0x50;
+            if in_msd {
+                msd_iface = cur_iface;
+            }
+        } else if btype == 5 && in_msd {
+            let addr = rd(off + 2);
+            if rd(off + 3) & 0x3 == 2 {
+                let mps = rd(off + 4) | (rd(off + 5) << 8);
+                if addr & 0x80 != 0 {
+                    if msd_in.is_none() {
+                        msd_in = Some((addr, mps));
+                    }
+                } else if msd_out.is_none() {
+                    msd_out = Some((addr, mps));
+                }
+            }
+        } else if btype == 0x21 && !cur_taken && blen >= 9 && rd(off + 6) == 0x22 {
+            // The HID descriptor: how long the report descriptor is.
+            cur_report_len = rd(off + 7) | (rd(off + 8) << 8);
+        } else if btype == 5 && !cur_taken && n < MAX_HID {
+            let addr = rd(off + 2);
+            if addr & 0x80 != 0 && rd(off + 3) & 0x3 == 3 {
+                let mps = rd(off + 4) | (rd(off + 5) << 8);
+                eps[n] = Some(HidEp { iface: cur_iface, proto: cur_proto, addr, mps, interval: rd(off + 6), report_len: cur_report_len });
+                n += 1;
+                cur_taken = true;
+            }
+        }
+        off += blen;
+    }
+    // A FIDO security key? Its report descriptor uses usage page 0xF1D0
+    // (short item 06 D0 F1). Read into a page of its own: `buf` still holds
+    // the configuration descriptor.
+    if let (Some(fi), Some(fo)) = (fido_in, fido_out) {
+        let mut is_fido = false;
+        if ctl.fido.is_none() && ctl.control(di, 0x00, 9, cfg_val as u16, 0, 0, 0).is_some() {
+            if let Some(tmp) = alloc_page() {
+                let rl = fido_rlen.clamp(3, 1024) as u16;
+                if ctl.control(di, 0x81, 6, 0x2200, fido_iface as u16, dma(tmp), rl).is_some() {
+                    let b = |k: usize| unsafe { core::ptr::read_volatile((tmp + k as u64) as *const u8) };
+                    is_fido = (0..rl as usize - 2).any(|k| b(k) == 0x06 && b(k + 1) == 0xD0 && b(k + 2) == 0xF1);
+                }
+                free_page(tmp);
+            }
+        }
+        if is_fido {
+            for e in eps.iter_mut() {
+                if e.is_some_and(|e| e.addr == fi.0) {
+                    *e = None;
+                }
+            }
+            n = eps.iter().flatten().count();
+            configure_fido(ctl, di, (fi.0, fi.1, fi.2), fo);
+            if n == 0 {
+                return;
+            }
+        }
+    }
+    if n == 0 {
+        if let (Some(i), Some(o)) = (msd_in, msd_out) {
+            if ctl.msd.is_some() {
+                out(b"  a second USB drive: one at a time is supported (left idle)\n");
+                return;
+            }
+            configure_msd(ctl, di, cfg_val as u16, msd_iface, i, o);
+            return;
+        }
+        // Not a keyboard/mouse/drive: leave it addressed but unused (a hub).
+        out(b"  no boot keyboard/mouse or storage interface (device left idle)\n");
+        return;
+    }
+
+    // --- SET_CONFIGURATION --------------------------------------------------
+    if ctl.control(di, 0x00, 9, cfg_val as u16, 0, 0, 0).is_none() {
+        return abort_dev(ctl, di, b"  SET_CONFIGURATION failed\n");
+    }
+
+    // --- Configure all the interrupt-IN endpoints in one command -----------
+    let mut add_flags = 1u32;
+    // a security key configured on this slot keeps its context entries
+    let mut max_dci = ctl.fido.filter(|f| f.slot == slot).map(|f| f.ep_in.dci.max(f.ep_out.dci)).unwrap_or(1);
+    let mut rings = [0u64; MAX_HID];
+    for (i, e) in eps.iter().flatten().enumerate() {
+        let dci = (e.addr & 0x0F) * 2 + 1;
+        add_flags |= 1 << dci;
+        max_dci = max_dci.max(dci);
+        let Some(ring) = alloc_page() else { return abort_dev(ctl, di, b"  out of DMA pages\n") };
+        rings[i] = ring;
+        let mps = if e.mps == 0 { 8 } else { e.mps & 0x7FF };
+        let interval_field = if speed >= 3 {
+            // HS/SS: bInterval is already an exponent (2^(b-1) microframes).
+            e.interval.max(1).saturating_sub(1).min(15)
+        } else {
+            // FS/LS: frames → 125us exponent = 3 + floor(log2(bInterval)).
+            let mut iv = 0u32;
+            let mut bi = e.interval.max(1);
+            while bi > 1 {
+                bi >>= 1;
+                iv += 1;
+            }
+            (iv + 3).clamp(3, 15)
+        };
+        // Input-context index 0 is the Input Control Context, 1 the slot, so the
+        // endpoint with DCI n sits at index n+1.
+        let epc = input_ctx + (dci as u64 + 1) * cs;
+        unsafe {
+            core::ptr::write_volatile(epc as *mut u32, interval_field << 16);
+            core::ptr::write_volatile((epc + 4) as *mut u32, (mps << 16) | (7 << 3) | (3 << 1)); // Int-IN, CErr 3
+            core::ptr::write_volatile((epc + 8) as *mut u64, dma(ring) | 1); // TR deq | DCS
+            core::ptr::write_volatile((epc + 16) as *mut u32, (mps << 16) | mps.min(8));
+        }
+    }
+    unsafe {
+        core::ptr::write_volatile(input_ctx as *mut u32, 0);
+        core::ptr::write_volatile((input_ctx + 0x04) as *mut u32, add_flags);
+        let sctx = input_ctx + cs;
+        core::ptr::write_volatile(sctx as *mut u32, (max_dci << 27) | (speed << 20));
+        core::ptr::write_volatile((sctx + 4) as *mut u32, port << 16);
+    }
+    dsb();
+    let a = ctl.x.ring_command(dma(input_ctx), (TRB_CONFIGURE_ENDPOINT << 10) | ((slot as u32) << 24));
+    match ctl.wait(Want::Cmd(a), 40_000) {
+        Some((_, s, _)) if (s >> 24) & 0xFF == 1 => out(b"  endpoints configured\n"),
+        Some((_, s, _)) => {
+            out(b"  configure endpoint: ");
+            report_cc((s >> 24) & 0xFF);
+            for r in rings.iter().take(n) {
+                free_page(*r);
+            }
+            ctl.remove_dev(di);
+            return;
+        },
+        None => {
+            for r in rings.iter().take(n) {
+                free_page(*r);
+            }
+            return abort_dev(ctl, di, b"  configure endpoint: no event\n");
+        },
+    }
+
+    for (i, e) in eps.iter().flatten().enumerate() {
+        let mut pad = crate::drivers::hidpad::Layout::EMPTY;
+        let kind = match e.proto {
+            1 => HidKind::Kbd,
+            2 => HidKind::Mouse,
+            0xFF | 0xFD => {
+                pad = if e.proto == 0xFD { crate::drivers::hidpad::Layout::XBOX360_WIRELESS } else { crate::drivers::hidpad::Layout::XBOX360 };
+                HidKind::Pad
+            },
+            _ => {
+                // Another HID device: a gamepad / joystick if its report
+                // descriptor says so (read with GET_DESCRIPTOR(Report)).
+                let rl = e.report_len.clamp(1, 2048) as u16;
+                let mut lay = None;
+                if ctl.control(di, 0x81, 6, 0x2200, e.iface as u16, dma(buf), rl).is_some() {
+                    let mut desc = alloc::vec![0u8; rl as usize];
+                    for (k, b) in desc.iter_mut().enumerate() {
+                        *b = unsafe { core::ptr::read_volatile((buf + k as u64) as *const u8) };
+                    }
+                    lay = crate::drivers::hidpad::identify(pad_ids.0, pad_ids.1, 3, 0, 0, &desc);
+                }
+                match lay {
+                    Some(l) => {
+                        pad = l;
+                        HidKind::Pad
+                    },
+                    None => {
+                        out(b"  a HID interface that is not a keyboard, mouse or gamepad (left idle)\n");
+                        continue;
+                    },
+                }
+            },
+        };
+        let boot = if kind == HidKind::Pad {
+            // Gamepads speak the report protocol; an Xbox 360 pad is not HID at all.
+            if !matches!(e.proto, 0xFF | 0xFD) {
+                let _ = ctl.control(di, 0x21, 0x0A, 0, e.iface as u16, 0, 0); // SET_IDLE(0)
+            }
+            false
+        } else {
+            // SET_PROTOCOL(boot) — fixed 8-byte keyboard / 3-4 byte mouse reports —
+            // and SET_IDLE(0) so reports only arrive on change. Best effort: some
+            // devices STALL these and still send boot-format reports.
+            let b = ctl.control(di, 0x21, 0x0B, 0, e.iface as u16, 0, 0).is_some();
+            let _ = ctl.control(di, 0x21, 0x0A, 0, e.iface as u16, 0, 0);
+            b
+        };
+        out(match kind {
+            HidKind::Kbd => b"  keyboard interface",
+            HidKind::Mouse => b"  mouse interface",
+            HidKind::Pad => {
+                out(b"  ");
+                out(pad.name().as_bytes());
+                b" interface"
+            },
+        });
+        if kind == HidKind::Pad {
+            dec(b": axes=", pad.n_axes as u32);
+            dec(b" buttons=", pad.n_buttons as u32);
+            out(if pad.hat.is_some() { b" hat\n" } else { b"\n" });
+        } else {
+            out(if boot { b" (boot protocol)\n" } else { b" (report protocol)\n" });
+        }
+        let Some(rbuf) = alloc_page() else { return abort_dev(ctl, di, b"  out of DMA pages\n") };
+        let mps = if e.mps == 0 { 8 } else { e.mps & 0x7FF };
+        let Some(hi) = ctl.hids.iter().position(|h| h.is_none()) else {
+            free_page(rbuf);
+            out(b"  too many keyboard/mouse endpoints\n");
+            break;
+        };
+        let mut h = Hid {
+            kind,
+            slot,
+            port,
+            dci: (e.addr & 0x0F) * 2 + 1,
+            ep_addr: e.addr,
+            ring: rings[i],
+            enq: 0,
+            cycle: 1,
+            rbuf,
+            mps,
+            prev: [0; 8],
+            pad,
+            pad_h: u32::MAX,
+            halted: false,
+            last_cc: 0,
+            fails: 0,
+            fill: 0,
+            done: 0,
+        };
+        if kind == HidKind::Pad {
+            match crate::drivers::gamepad::attach(pad, pad_ids.0, pad_ids.1) {
+                Some(ph) => h.pad_h = ph,
+                None => out(b"  (every gamepad slot is taken: this pad is ignored)\n"),
+            }
+        }
+        hid_arm_all(&ctl.x, &mut h); // queue the interrupt transfers
+        ctl.hids[hi] = Some(h);
+        out(match kind {
+            HidKind::Kbd => b"  -> USB KEYBOARD READY\n",
+            HidKind::Mouse => b"  -> USB MOUSE READY\n",
+            HidKind::Pad => b"  -> USB GAMEPAD READY\n",
+        });
+    }
+}
+
+// ── Polling: keyboards + mice, recovery, hot-plug ────────────────────────────
+
+// Decoded-byte queue (a key press can yield several bytes, e.g. an arrow).
+const KQ_LEN: usize = 64;
+static mut KQ: [u8; KQ_LEN] = [0; KQ_LEN];
+static mut KQ_HEAD: usize = 0;
+static mut KQ_TAIL: usize = 0;
+
+/// Keys currently held (the last keyboard report): modifiers + 6 usages.
+static mut HELD: [u8; 8] = [0; 8];
+/// Player 1's gamepad after draining pending reports (every pad: drivers::gamepad).
+pub fn pad_state() -> crate::drivers::hidpad::PadState {
+    poll();
+    crate::drivers::gamepad::state(0)
+}
+
+/// Deliver pending pad reports (the `pad_*` builtins call it once a frame). This driver sends the
+/// pads nothing (no interrupt OUT): no LEDs / rumble, and no Xbox One (GIP) pads on the Pi yet.
+pub fn pad_poll() {
+    poll();
+}
+/// Absolute pointer (in the framebuffer's safe-area coordinates), buttons,
+/// accumulated wheel clicks; `MOUSE_INIT` centres it on first use.
+static mut MOUSE: (i32, i32, u8) = (0, 0, 0);
+static mut MOUSE_WHEEL: i32 = 0;
+static mut MOUSE_INIT: bool = false;
+static mut IN_POLL: bool = false;
+
+fn kq_push(b: u8) {
+    unsafe {
+        let next = (KQ_HEAD + 1) % KQ_LEN;
+        if next != KQ_TAIL {
+            KQ[KQ_HEAD] = b;
+            KQ_HEAD = next;
+        }
+    }
+}
+
+fn kq_pop() -> Option<u8> {
+    unsafe {
+        if KQ_HEAD == KQ_TAIL {
+            return None;
+        }
+        let b = KQ[KQ_TAIL];
+        KQ_TAIL = (KQ_TAIL + 1) % KQ_LEN;
+        Some(b)
+    }
+}
+
+fn any_hid(kind: HidKind) -> bool {
+    let ctls = unsafe { &*(&raw const CTLS) };
+    ctls.iter().flatten().any(|c| c.hids.iter().flatten().any(|h| h.kind == kind))
+}
+
+/// True while a USB keyboard is plugged in and being polled.
+pub fn keyboard_ready() -> bool {
+    any_hid(HidKind::Kbd)
+}
+
+/// True while a USB mouse is plugged in and being polled.
+pub fn mouse_ready() -> bool {
+    any_hid(HidKind::Mouse)
+}
+
+/// Queue the next interrupt-IN transfer and ring the endpoint doorbell. The ring
+/// is circular: when the producer reaches the last slot it writes a Link TRB
+/// (Toggle Cycle) back to the start and flips its cycle bit.
+/// Bulk-only mass storage: SET_CONFIGURATION, both bulk endpoints in one
+/// Configure Endpoint command, then the device is handed to drivers::usbmsd
+/// (from poll(), outside this controller borrow).
+fn configure_msd(ctl: &mut Ctl, di: usize, cfg_val: u16, iface: u32, ep_in: (u32, u32), ep_out: (u32, u32)) {
+    let Some(d) = ctl.devs[di] else { return };
+    let (slot, port, speed, input_ctx) = (d.slot, d.port, d.speed, d.input_ctx);
+    if ctl.control(di, 0x00, 9, cfg_val, 0, 0, 0).is_none() {
+        return abort_dev(ctl, di, b"  SET_CONFIGURATION failed\n");
+    }
+    let cs = ctl.x.ctx_size as u64;
+    let (Some(ring_in), Some(ring_out), Some(data)) = (alloc_page(), alloc_page(), alloc_page()) else {
+        return abort_dev(ctl, di, b"  out of DMA pages\n");
+    };
+    let mut add_flags = 1u32;
+    let mut max_dci = 1u32;
+    for (addr, mps, ring, is_in) in [(ep_in.0, ep_in.1, ring_in, true), (ep_out.0, ep_out.1, ring_out, false)] {
+        let dci = (addr & 0x0F) * 2 + if is_in { 1 } else { 0 };
+        add_flags |= 1 << dci;
+        max_dci = max_dci.max(dci);
+        let mps = if mps == 0 { 512 } else { mps & 0x7FF };
+        let ep_type = if is_in { 6u32 } else { 2 }; // bulk IN / bulk OUT
+        let epc = input_ctx + (dci as u64 + 1) * cs;
+        unsafe {
+            core::ptr::write_volatile(epc as *mut u32, 0);
+            core::ptr::write_volatile((epc + 4) as *mut u32, (mps << 16) | (ep_type << 3) | (3 << 1));
+            core::ptr::write_volatile((epc + 8) as *mut u64, dma(ring) | 1);
+            core::ptr::write_volatile((epc + 16) as *mut u32, 3072);
+        }
+    }
+    unsafe {
+        core::ptr::write_volatile(input_ctx as *mut u32, 0);
+        core::ptr::write_volatile((input_ctx + 0x04) as *mut u32, add_flags);
+        let sctx = input_ctx + cs;
+        core::ptr::write_volatile(sctx as *mut u32, (max_dci << 27) | (speed << 20));
+        core::ptr::write_volatile((sctx + 4) as *mut u32, port << 16);
+    }
+    dsb();
+    let a = ctl.x.ring_command(dma(input_ctx), (TRB_CONFIGURE_ENDPOINT << 10) | ((slot as u32) << 24));
+    match ctl.wait(Want::Cmd(a), 40_000) {
+        Some((_, s, _)) if (s >> 24) & 0xFF == 1 => {},
+        Some((_, s, _)) => {
+            out(b"  configure bulk endpoints: ");
+            report_cc((s >> 24) & 0xFF);
+            free_page(ring_in);
+            free_page(ring_out);
+            free_page(data);
+            ctl.remove_dev(di);
+            return;
+        },
+        None => {
+            free_page(ring_in);
+            free_page(ring_out);
+            free_page(data);
+            return abort_dev(ctl, di, b"  configure bulk endpoints: no event\n");
+        },
+    }
+    let mk = |addr: u32, ring: u64, is_in: bool| BulkEp { dci: (addr & 0x0F) * 2 + if is_in { 1 } else { 0 }, ep_addr: addr, ring, enq: 0, cycle: 1 };
+    ctl.msd = Some(Msd { slot, di, iface, ep_in: mk(ep_in.0, ring_in, true), ep_out: mk(ep_out.0, ring_out, false), data });
+    unsafe { MSD_ATTACH = true };
+    out(b"  -> USB STORAGE (bulk endpoints ready)\n");
+}
+
+impl Ctl {
+    /// One bulk transfer of `len` bytes at `data` on `ep`; the completion code
+    /// and residual, or None without an event (10 s).
+    fn bulk(&mut self, slot: u8, ep: &mut BulkEp, data: u64, len: u32) -> Option<(u32, u32)> {
+        trb_write(ep.ring, ep.enq, data, len, (TRB_NORMAL << 10) | (1 << 5) | (1 << 2) | ep.cycle);
+        ep.enq += 1;
+        if ep.enq == RING_TRBS - 1 {
+            trb_write(ep.ring, ep.enq, dma(ep.ring), 0, (TRB_LINK << 10) | (1 << 1) | ep.cycle);
+            ep.enq = 0;
+            ep.cycle ^= 1;
+        }
+        dsb();
+        unsafe { write32(self.x.db + slot as usize * 4, ep.dci) };
+        let (_, status, _) = self.wait(Want::Xfer(slot, ep.dci), 200_000)?;
+        Some(((status >> 24) & 0xFF, status & 0xFF_FFFF))
+    }
+
+    /// A stalled / halted bulk endpoint back to running: Reset Endpoint, the
+    /// dequeue pointer at our enqueue, CLEAR_FEATURE(ENDPOINT_HALT).
+    fn bulk_clear(&mut self, slot: u8, di: usize, ep: &mut BulkEp) {
+        let sl = (slot as u32) << 24;
+        let a = self.x.ring_command(0, (TRB_RESET_ENDPOINT << 10) | (ep.dci << 16) | sl);
+        let _ = self.wait(Want::Cmd(a), 20_000);
+        let deq = dma(ep.ring + (ep.enq * 16) as u64) | ep.cycle as u64;
+        let a = self.x.ring_command(deq, (TRB_SET_TR_DEQUEUE << 10) | (ep.dci << 16) | sl);
+        let _ = self.wait(Want::Cmd(a), 20_000);
+        let _ = self.control(di, 0x02, 1, 0, ep.ep_addr as u16, 0, 0);
+    }
+}
+
+fn with_msd<R>(f: impl FnOnce(&mut Ctl, &mut Msd) -> R) -> Option<R> {
+    let ctls = unsafe { &mut *(&raw mut CTLS) };
+    for ctl in ctls.iter_mut().flatten() {
+        if let Some(mut m) = ctl.msd.take() {
+            let r = f(ctl, &mut m);
+            ctl.msd = Some(m);
+            return Some(r);
+        }
+    }
+    None
+}
+
+/// Is a mass-storage device attached (bulk endpoints configured)?
+pub fn msd_present() -> bool {
+    let ctls = unsafe { &*(&raw const CTLS) };
+    ctls.iter().flatten().any(|c| c.msd.is_some())
+}
+
+/// Send `buf` (up to a page) on the drive's bulk-OUT endpoint: bytes sent, or
+/// the completion code (6 = stall; 0 = no device / no event).
+pub fn msd_bulk_out(buf: &[u8]) -> Result<usize, u32> {
+    with_msd(|ctl, m| {
+        let n = buf.len().min(4096);
+        unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), m.data as *mut u8, n) };
+        dsb();
+        let mut ep = m.ep_out;
+        let r = ctl.bulk(m.slot, &mut ep, dma(m.data), n as u32);
+        m.ep_out = ep;
+        match r {
+            Some((1 | 13, resid)) => Ok(n - (resid as usize).min(n)),
+            Some((cc, _)) => Err(cc),
+            None => Err(0),
+        }
+    })
+    .unwrap_or(Err(0))
+}
+
+/// Receive into `buf` (up to a page) from the drive's bulk-IN endpoint.
+pub fn msd_bulk_in(buf: &mut [u8]) -> Result<usize, u32> {
+    with_msd(|ctl, m| {
+        let n = buf.len().min(4096);
+        let mut ep = m.ep_in;
+        let r = ctl.bulk(m.slot, &mut ep, dma(m.data), n as u32);
+        m.ep_in = ep;
+        match r {
+            Some((1 | 13, resid)) => {
+                let got = n - (resid as usize).min(n);
+                dsb();
+                unsafe { core::ptr::copy_nonoverlapping(m.data as *const u8, buf.as_mut_ptr(), got) };
+                Ok(got)
+            },
+            Some((cc, _)) => Err(cc),
+            None => Err(0),
+        }
+    })
+    .unwrap_or(Err(0))
+}
+
+pub fn msd_clear_stall(dir_in: bool) -> bool {
+    with_msd(|ctl, m| {
+        let mut ep = if dir_in { m.ep_in } else { m.ep_out };
+        ctl.bulk_clear(m.slot, m.di, &mut ep);
+        if dir_in {
+            m.ep_in = ep;
+        } else {
+            m.ep_out = ep;
+        }
+    })
+    .is_some()
+}
+
+/// Bulk-Only Mass Storage Reset (class request) after a phase error.
+pub fn msd_reset() -> bool {
+    with_msd(|ctl, m| ctl.control(m.di, 0x21, 0xFF, 0, m.iface as u16, 0, 0).is_some()).unwrap_or(false)
+}
+
+const HID_SLOTS: u32 = 8;
+const HID_SLOT_BYTES: u64 = 64;
+
+/// Queue report requests until HID_SLOTS are in flight.
+fn hid_arm_all(x: &Xhci, h: &mut Hid) {
+    while h.fill.wrapping_sub(h.done) < HID_SLOTS {
+        hid_queue(x, h);
+    }
+}
+
+/// Queue one report request into the next slot of `rbuf`.
+fn hid_queue(x: &Xhci, h: &mut Hid) {
+    let buf = h.rbuf + (h.fill % HID_SLOTS) as u64 * HID_SLOT_BYTES;
+    h.fill = h.fill.wrapping_add(1);
+    let len = h.mps.min(HID_SLOT_BYTES as u32);
+    trb_write(h.ring, h.enq, dma(buf), len, (TRB_NORMAL << 10) | (1 << 5) | h.cycle);
+    h.enq += 1;
+    if h.enq == RING_TRBS - 1 {
+        trb_write(h.ring, h.enq, dma(h.ring), 0, (TRB_LINK << 10) | (1 << 1) | h.cycle);
+        h.enq = 0;
+        h.cycle ^= 1;
+    }
+    dsb();
+    unsafe { write32(x.db + h.slot as usize * 4, h.dci) };
+}
+
+/// The scheduler's hook: deliver whatever the keyboard / mouse reported
+/// since the last frame (each HID endpoint has one request in flight, so a
+/// key tapped between two slow frames would otherwise be missed).
+pub fn service() {
+    poll();
+}
+
+/// x86 delivers USB input from inside long operations (see its `pump_input`);
+/// the Pi's frames stay on `service`.
+pub fn pump_input() {}
+
+/// Service every controller: deliver pending reports, recover halted
+/// endpoints, and handle port changes (plus a 1 s scan as a safety net for a
+/// missed event). Cheap when nothing happened.
+fn poll() {
+    unsafe {
+        if IN_POLL {
+            return; // console output during a hot-plug must not re-enter
+        }
+        IN_POLL = true;
+    }
+    let ctls = unsafe { &mut *(&raw mut CTLS) };
+    let now = now_ms();
+    let mut reinit = [false; 2];
+    for (idx, slot) in ctls.iter_mut().enumerate() {
+        let Some(ctl) = slot.as_mut() else { continue };
+        ctl.drain();
+        for i in 0..MAX_HID {
+            if ctl.hids[i].is_some_and(|h| h.halted) {
+                ctl.recover(i);
+            }
+        }
+        let scan = now.saturating_sub(ctl.last_scan_ms) >= 1000;
+        if scan {
+            ctl.last_scan_ms = now;
+            reinit[idx] = ctl.watchdog(now);
+        }
+        if ctl.port_pending != 0 || scan {
+            ctl.service_ports(scan);
+        }
+    }
+    for (idx, r) in reinit.iter().enumerate() {
+        if *r {
+            reinit_controller(idx);
+        }
+    }
+    let (attach, detach) = unsafe { (core::mem::replace(&mut MSD_ATTACH, false), core::mem::replace(&mut MSD_DETACH, false)) };
+    unsafe { IN_POLL = false };
+    if detach {
+        crate::drivers::usbmsd::detach();
+    }
+    if attach {
+        crate::drivers::usbmsd::attach();
+    }
+}
+
+/// Boot mouse report: buttons, dx, dy (signed), then wheel if the endpoint
+/// sends a fourth byte. Moves the absolute pointer, clamped to the screen.
+fn mouse_report(r: &[u8; 8], n: usize) {
+    let (w, h) = (
+        crate::drivers::framebuffer::width().max(1) as i32,
+        crate::drivers::framebuffer::height().max(1) as i32,
+    );
+    unsafe {
+        if !MOUSE_INIT {
+            MOUSE = (w / 2, h / 2, 0);
+            MOUSE_INIT = true;
+        }
+        let dx = r[1] as i8 as i32;
+        let dy = r[2] as i8 as i32;
+        MOUSE.0 = (MOUSE.0 + dx).clamp(0, w - 1);
+        MOUSE.1 = (MOUSE.1 + dy).clamp(0, h - 1);
+        MOUSE.2 = r[0] & 0x07;
+        if n >= 4 {
+            MOUSE_WHEEL += r[3] as i8 as i32;
+        }
+    }
+}
+
+/// Pointer state after draining pending reports: (x, y, buttons bit0 L / bit1 R
+/// / bit2 M). None until a USB mouse is plugged in.
+pub fn mouse_state() -> Option<(i32, i32, u8)> {
+    poll();
+    if !mouse_ready() {
+        return None;
+    }
+    unsafe {
+        if !MOUSE_INIT {
+            let (w, h) = (
+                crate::drivers::framebuffer::width() as i32,
+                crate::drivers::framebuffer::height() as i32,
+            );
+            MOUSE = (w / 2, h / 2, 0);
+            MOUSE_INIT = true;
+        }
+        Some(MOUSE)
+    }
+}
+
+/// Wheel clicks since the last call (positive = away from the user).
+pub fn mouse_take_wheel() -> i32 {
+    poll();
+    unsafe { core::mem::take(&mut *(&raw mut MOUSE_WHEEL)) }
+}
+
+/// Is the key with HID usage `usage` held right now? Modifier usages 0xE0..0xE7
+/// (LCtrl, LShift, LAlt, LGUI, RCtrl, RShift, RAlt, RGUI) read the modifier byte.
+pub fn key_held(usage: u8) -> bool {
+    poll();
+    let held = unsafe { HELD };
+    if (0xE0..=0xE7).contains(&usage) {
+        return held[0] & (1 << (usage - 0xE0)) != 0;
+    }
+    held[2..8].contains(&usage)
+}
+
+/// US-layout HID usage → ASCII (None for keys with no single-byte meaning).
+fn usage_to_ascii(u: u8, shift: bool) -> Option<u8> {
+    // the chosen keyboard layout first (Settings > System), US below
+    if let Some(b) = crate::drivers::kbdlayout::override_for_hid(u, shift) {
+        return Some(b);
+    }
+    const DIGITS: &[u8; 10] = b"1234567890";
+    const SHIFTED: &[u8; 10] = b"!@#$%^&*()";
+    let pick = |plain: u8, shifted: u8| if shift { shifted } else { plain };
+    Some(match u {
+        0x04..=0x1d => {
+            let c = b'a' + (u - 0x04);
+            if shift {
+                c - 32
+            } else {
+                c
+            }
+        },
+        0x1e..=0x27 => {
+            let i = (u - 0x1e) as usize;
+            if shift {
+                SHIFTED[i]
+            } else {
+                DIGITS[i]
+            }
+        },
+        0x28 => b'\r',
+        0x29 => 0x1b,
+        0x2a => 0x08,
+        0x2b => b'\t',
+        0x2c => b' ',
+        0x2d => pick(b'-', b'_'),
+        0x2e => pick(b'=', b'+'),
+        0x2f => pick(b'[', b'{'),
+        0x30 => pick(b']', b'}'),
+        0x31 => pick(b'\\', b'|'),
+        0x33 => pick(b';', b':'),
+        0x34 => pick(b'\'', b'"'),
+        0x35 => pick(b'`', b'~'),
+        0x36 => pick(b',', b'<'),
+        0x37 => pick(b'.', b'>'),
+        0x38 => pick(b'/', b'?'),
+        _ => return None,
+    })
+}
+
+/// Turn a boot keyboard report into bytes: every key code present now but not in
+/// the previous report is a fresh press.
+fn decode_report(prev: &[u8; 8], cur: &[u8; 8]) {
+    let shift = cur[0] & 0x22 != 0; // LShift | RShift
+    let ctrl = cur[0] & 0x11 != 0; // LCtrl | RCtrl
+    for &u in &cur[2..8] {
+        if u < 4 || prev[2..8].contains(&u) {
+            continue; // 0 = none, 1..3 = error/rollover codes
+        }
+        let seq: &[u8] = match u {
+            0x4f => b"\x1b[C", // Right
+            0x50 => b"\x1b[D", // Left
+            0x51 => b"\x1b[B", // Down
+            0x52 => b"\x1b[A", // Up
+            _ => {
+                if let Some(a) = usage_to_ascii(u, shift) {
+                    // Ctrl+letter → its control code (Ctrl+Q = 0x11), like a terminal;
+                    // Ctrl+Space → NUL, as terminals send it (the input-mode switch).
+                    kq_push(if ctrl && a.is_ascii_alphabetic() {
+                        a & 0x1F
+                    } else if ctrl && a == b' ' {
+                        0
+                    } else {
+                        a
+                    });
+                }
+                continue;
+            },
+        };
+        for &b in seq {
+            kq_push(b);
+        }
+    }
+}
+
+/// Non-blocking: the next byte typed on any USB keyboard, if any.
+pub fn kbd_poll_byte() -> Option<u8> {
+    if let Some(b) = kq_pop() {
+        return Some(b);
+    }
+    poll();
+    kq_pop()
+}
+
+/// The last keyboard report (modifiers, reserved, 6 usages), after draining
+/// pending reports — all zero with no USB keyboard.
+pub fn held_report() -> [u8; 8] {
+    poll();
+    unsafe { HELD }
+}
+
+/// Forget all keyboard state at a session boundary (sign-in / run app / log
+/// out): empty the decoded-byte queue, zero the held report, and reset every
+/// keyboard endpoint's edge-detection `prev` to a cleared report. Without
+/// this a key-down whose key-up was lost during a teardown window stays
+/// "held" and its character repeats into the next field; and leftover decoded
+/// bytes replay into it. The next real report re-establishes the true state.
+pub fn reset_key_state() {
+    unsafe {
+        KQ_HEAD = 0;
+        KQ_TAIL = 0;
+        HELD = [0; 8];
+        let ctls = &mut *(&raw mut CTLS);
+        for ctl in ctls.iter_mut().flatten() {
+            for h in ctl.hids.iter_mut().flatten() {
+                if h.kind == HidKind::Kbd {
+                    h.prev = [0; 8];
+                }
+            }
+        }
+    }
+}
+
+/// A security key's two interrupt endpoints in one Configure Endpoint command
+/// (SET_CONFIGURATION already done); then fs/seckey.rs can talk CTAPHID.
+fn configure_fido(ctl: &mut Ctl, di: usize, ep_in: (u32, u32, u32), ep_out: (u32, u32)) {
+    let Some(d) = ctl.devs[di] else { return };
+    let (slot, port, speed, input_ctx) = (d.slot, d.port, d.speed, d.input_ctx);
+    let cs = ctl.x.ctx_size as u64;
+    let (Some(ring_in), Some(ring_out), Some(data)) = (alloc_page(), alloc_page(), alloc_page()) else {
+        out(b"  security key: out of DMA pages\n");
+        return;
+    };
+    let interval = ep_in.2;
+    let interval_field = if speed >= 3 {
+        interval.max(1).saturating_sub(1).min(15)
+    } else {
+        let (mut iv, mut bi) = (0u32, interval.max(1));
+        while bi > 1 {
+            bi >>= 1;
+            iv += 1;
+        }
+        (iv + 3).clamp(3, 15)
+    };
+    // keep every endpoint already configured on this slot in the context
+    let existing = unsafe { core::ptr::read_volatile(d.dev_ctx as *const u32) } >> 27;
+    let mut add_flags = 1u32;
+    let mut max_dci = existing.max(1);
+    for (addr, mps, ring, is_in) in [(ep_in.0, ep_in.1, ring_in, true), (ep_out.0, ep_out.1, ring_out, false)] {
+        let dci = (addr & 0x0F) * 2 + if is_in { 1 } else { 0 };
+        add_flags |= 1 << dci;
+        max_dci = max_dci.max(dci);
+        let mps = if mps == 0 { 64 } else { mps & 0x7FF };
+        let ep_type = if is_in { 7u32 } else { 3 }; // interrupt IN / interrupt OUT
+        let epc = input_ctx + (dci as u64 + 1) * cs;
+        unsafe {
+            core::ptr::write_volatile(epc as *mut u32, interval_field << 16);
+            core::ptr::write_volatile((epc + 4) as *mut u32, (mps << 16) | (ep_type << 3) | (3 << 1));
+            core::ptr::write_volatile((epc + 8) as *mut u64, dma(ring) | 1);
+            core::ptr::write_volatile((epc + 16) as *mut u32, (mps << 16) | mps);
+        }
+    }
+    unsafe {
+        core::ptr::write_volatile(input_ctx as *mut u32, 0);
+        core::ptr::write_volatile((input_ctx + 0x04) as *mut u32, add_flags);
+        let sctx = input_ctx + cs;
+        core::ptr::write_volatile(sctx as *mut u32, (max_dci << 27) | (speed << 20));
+        core::ptr::write_volatile((sctx + 4) as *mut u32, port << 16);
+    }
+    dsb();
+    let a = ctl.x.ring_command(dma(input_ctx), (TRB_CONFIGURE_ENDPOINT << 10) | ((slot as u32) << 24));
+    match ctl.wait(Want::Cmd(a), 40_000) {
+        Some((_, s, _)) if (s >> 24) & 0xFF == 1 => {},
+        other => {
+            out(b"  configure security key endpoints: ");
+            match other {
+                Some((_, s, _)) => report_cc((s >> 24) & 0xFF),
+                None => out(b"no event\n"),
+            }
+            free_page(ring_in);
+            free_page(ring_out);
+            free_page(data);
+            return;
+        },
+    }
+    let mk = |addr: u32, ring: u64, is_in: bool| BulkEp { dci: (addr & 0x0F) * 2 + if is_in { 1 } else { 0 }, ep_addr: addr, ring, enq: 0, cycle: 1 };
+    ctl.fido = Some(Fido { slot, di, ep_in: mk(ep_in.0, ring_in, true), ep_out: mk(ep_out.0, ring_out, false), data, in_pending: false, in_done: None });
+    unsafe { FIDO_GEN = FIDO_GEN.wrapping_add(1) };
+    out(b"  -> SECURITY KEY (FIDO / CTAPHID ready)\n");
+}
+
+fn with_fido<R>(f: impl FnOnce(&mut Ctl, &mut Fido) -> R) -> Option<R> {
+    let ctls = unsafe { &mut *(&raw mut CTLS) };
+    for ctl in ctls.iter_mut().flatten() {
+        if let Some(mut k) = ctl.fido.take() {
+            let r = f(ctl, &mut k);
+            ctl.fido = Some(k);
+            return Some(r);
+        }
+    }
+    None
+}
+
+/// Is a FIDO security key plugged in?
+pub fn fido_present() -> bool {
+    poll();
+    let ctls = unsafe { &*(&raw const CTLS) };
+    ctls.iter().flatten().any(|c| c.fido.is_some())
+}
+
+/// Changes whenever a security key is plugged in or pulled out.
+pub fn fido_generation() -> u32 {
+    unsafe { FIDO_GEN }
+}
+
+/// One 64-byte CTAPHID report to the key.
+pub fn fido_send(pkt: &[u8; 64]) -> bool {
+    with_fido(|ctl, f| {
+        unsafe { core::ptr::copy_nonoverlapping(pkt.as_ptr(), f.data as *mut u8, 64) };
+        dsb();
+        let mut ep = f.ep_out;
+        let r = ctl.bulk(f.slot, &mut ep, dma(f.data), 64);
+        f.ep_out = ep;
+        match r {
+            Some((1 | 13, _)) => true,
+            Some(_) => {
+                let mut ep = f.ep_out;
+                ctl.bulk_clear(f.slot, f.di, &mut ep);
+                f.ep_out = ep;
+                false
+            },
+            None => false,
+        }
+    })
+    .unwrap_or(false)
+}
+
+/// The key's next 64-byte report, waiting up to `timeout_ms`. A request left
+/// queued by a timeout stays queued: its answer is the next one read.
+pub fn fido_recv(pkt: &mut [u8; 64], timeout_ms: u32) -> bool {
+    with_fido(|ctl, f| {
+        let buf = f.data + 2048;
+        if f.in_done.is_none() && !f.in_pending {
+            let ep = &mut f.ep_in;
+            trb_write(ep.ring, ep.enq, dma(buf), 64, (TRB_NORMAL << 10) | (1 << 5) | (1 << 2) | ep.cycle);
+            ep.enq += 1;
+            if ep.enq == RING_TRBS - 1 {
+                trb_write(ep.ring, ep.enq, dma(ep.ring), 0, (TRB_LINK << 10) | (1 << 1) | ep.cycle);
+                ep.enq = 0;
+                ep.cycle ^= 1;
+            }
+            dsb();
+            unsafe { write32(ctl.x.db + f.slot as usize * 4, f.ep_in.dci) };
+            f.in_pending = true;
+        }
+        if f.in_done.is_none() {
+            match ctl.wait(Want::Xfer(f.slot, f.ep_in.dci), timeout_ms.max(1) * 20) {
+                Some((_, st, _)) => {
+                    f.in_done = Some(st);
+                    f.in_pending = false;
+                },
+                None => return false,
+            }
+        }
+        let st = f.in_done.take().unwrap_or(0);
+        if matches!((st >> 24) & 0xFF, 1 | 13) {
+            dsb();
+            unsafe { core::ptr::copy_nonoverlapping(buf as *const u8, pkt.as_mut_ptr(), 64) };
+            true
+        } else {
+            let mut ep = f.ep_in;
+            ctl.bulk_clear(f.slot, f.di, &mut ep);
+            f.ep_in = ep;
+            false
+        }
+    })
+    .unwrap_or(false)
+}

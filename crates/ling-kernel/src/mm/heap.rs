@@ -30,6 +30,39 @@ const LARGE_FLAG: u64 = 1 << 63;
 
 static mut FREE_HEAD: [u64; CLASS_SIZES.len()] = [0; CLASS_SIZES.len()];
 
+/// One bit per 4 KiB page of everything the frame allocator can hand out
+/// (8 GiB): set while the page is heap memory (a slab frame, or part of a
+/// large allocation). `lingrt`'s garbage collector scans stacks
+/// conservatively and only dereferences a candidate pointer that lands in
+/// such a page -- anything else is a stale or forged word that must not be
+/// touched. It must cover every heap page: an object in a page it misses is
+/// never marked, so the collector frees it while it is still in use (an
+/// 8 GB Pi 5 crashed that way once the heap grew past 4 GiB).
+pub const HEAP_PAGE_LIMIT: usize = 1 << 21;
+static mut HEAP_PAGES: [u64; HEAP_PAGE_LIMIT / 64] = [0; HEAP_PAGE_LIMIT / 64];
+
+unsafe fn note_pages(addr: u64, order: usize, on: bool) {
+    let first = (addr >> 12) as usize;
+    for i in 0..(1usize << order) {
+        let page = first + i;
+        if page >= HEAP_PAGE_LIMIT {
+            break;
+        }
+        let (w, b) = (page / 64, page % 64);
+        if on {
+            HEAP_PAGES[w] |= 1 << b;
+        } else {
+            HEAP_PAGES[w] &= !(1 << b);
+        }
+    }
+}
+
+/// Whether `addr` lies in a page the heap owns right now (see `HEAP_PAGES`).
+pub fn is_heap_page(addr: u64) -> bool {
+    let page = (addr >> 12) as usize;
+    page < HEAP_PAGE_LIMIT && unsafe { (HEAP_PAGES[page / 64] >> (page % 64)) & 1 == 1 }
+}
+
 fn class_for(needed: usize) -> Option<usize> {
     CLASS_SIZES.iter().position(|&sz| sz >= needed)
 }
@@ -49,6 +82,7 @@ unsafe fn refill(class: usize) -> bool {
     let Some(frame_addr) = super::frame::alloc_frames(0) else {
         return false;
     };
+    note_pages(frame_addr, 0, true);
     let slot_size = CLASS_SIZES[class] as u64;
     let count = FRAME_SIZE as u64 / slot_size;
     for i in (0..count).rev() {
@@ -83,6 +117,7 @@ pub fn alloc(size: usize) -> *mut u8 {
         let order = order_for(needed);
         match super::frame::alloc_frames(order) {
             Some(addr) => {
+                note_pages(addr, order, true);
                 write_header(addr, LARGE_FLAG | order as u64);
                 (addr + 8) as *mut u8
             },
@@ -148,10 +183,18 @@ pub struct KernelHeap;
 
 unsafe impl GlobalAlloc for KernelHeap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // a worker core's background job (video decoding) has its own arena
+        if super::aparena::routes_here() {
+            return super::aparena::alloc(layout.size(), layout.align());
+        }
         let _guard = super::IrqLock::acquire();
         galloc(layout)
     }
     unsafe fn dealloc(&self, user_ptr: *mut u8, layout: Layout) {
+        if super::aparena::contains(user_ptr) {
+            let _guard = super::IrqLock::acquire();
+            return super::aparena::free(user_ptr);
+        }
         let _guard = super::IrqLock::acquire();
         gdealloc(user_ptr, layout)
     }
@@ -168,6 +211,7 @@ pub fn free(user_ptr: *mut u8) {
         let header = read_header(user_ptr);
         let addr = user_ptr as u64 - 8;
         if header & LARGE_FLAG != 0 {
+            note_pages(addr, (header & !LARGE_FLAG) as usize, false);
             super::frame::free_frames(addr, (header & !LARGE_FLAG) as usize);
         } else {
             let class = header as usize;

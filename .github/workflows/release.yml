@@ -1,0 +1,93 @@
+name: Release
+
+# On a version tag (v*): build the Ling toolchain binaries -- ling (compiler/runner), lingc and
+# lingfu (package manager) -- for Linux and Windows, attach them to a GitHub Release, then
+# publish the `ling-lang` package (Ling.toml) to fu.ling-lang.org with the LINGFU_TOKEN secret.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  ORG: LingLin-Art-LLC
+
+jobs:
+  build:
+    name: Build ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,  label: linux-x86_64,   ext: "" }
+          - { os: windows-latest, label: windows-x86_64, ext: ".exe" }
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: ling }
+      - uses: actions/checkout@v4
+        with: { repository: "${{ env.ORG }}/bring-browser", path: bring-browser }
+      - uses: actions/checkout@v4
+        with: { repository: "${{ env.ORG }}/horizon-browser", path: horizon-browser }
+      - uses: actions/checkout@v4
+        with: { repository: "${{ env.ORG }}/ling-messenger", path: ling-messenger }
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: "ling -> target" }
+      - name: Linux packages
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libasound2-dev libudev-dev libxkbcommon-dev libwayland-dev xorg-dev pkg-config
+      - uses: ilammy/setup-nasm@v1
+        if: runner.os != 'Linux'
+      - name: Build ling, lingc, lingfu
+        working-directory: ling
+        run: |
+          cargo build --release --bin ling --bin lingc
+          cargo build --release -p lingfu --bin lingfu
+      - name: Package
+        shell: bash
+        run: |
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then v="${GITHUB_REF_NAME#v}"; else v="${GITHUB_SHA::8}"; fi
+          name="ling-$v-${{ matrix.label }}"
+          mkdir -p "stage/$name" out
+          for b in ling lingc lingfu; do cp "ling/target/release/$b${{ matrix.ext }}" "stage/$name/"; done
+          cp ling/LICENSE ling/README.md "stage/$name/"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            (cd stage && 7z a -tzip "../out/$name.zip" "$name" >/dev/null)
+          else
+            tar -C stage -czf "out/$name.tar.gz" "$name"
+          fi
+      - uses: actions/upload-artifact@v4
+        with: { name: "ling-${{ matrix.label }}", path: out/*, if-no-files-found: error }
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: artifacts, merge-multiple: true }
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
+
+  lingfu:
+    name: Publish ling-lang to lingfu
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [release]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: ling }
+      - uses: ./ling/.github/actions/setup-ling
+        with: { checkout-ling: "false", lingfu: "true" }
+      - uses: ./ling/.github/actions/lingfu-publish
+        with:
+          project-dir: ling
+          version: ${{ github.ref_name }}
+          token: ${{ secrets.LINGFU_TOKEN }}

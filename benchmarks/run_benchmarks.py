@@ -99,6 +99,17 @@ def parse(output):
     return res
 
 
+def _ling_version():
+    """First line of `ling --version`, e.g. 'ling 2030.1.53'."""
+    exe = os.path.join(REPO, "target", "release", "ling" + EXE)
+    try:
+        out = subprocess.run([exe, "--version"], capture_output=True, text=True,
+                             encoding="utf-8", errors="replace", timeout=20).stdout
+        return out.splitlines()[0].split(" —")[0].strip()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def main():
     reps = int(sys.argv[1]) if len(sys.argv) > 1 else 3
     os.makedirs(BIN, exist_ok=True)
@@ -181,6 +192,7 @@ def main():
 
     # ── write json + svg ────────────────────────────────────────────────────
     meta = {
+        "ling": _ling_version(),
         "date": time.strftime("%Y-%m-%d %H:%M"),
         "cpu": platform.processor() or platform.machine(),
         "os": platform.platform(),

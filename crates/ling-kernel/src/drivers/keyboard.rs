@@ -40,6 +40,11 @@ const EXT_PGDN: u8 = 0x51;
 /// Applications-menu launcher — the keyboard path to opening apps that the
 /// mouse-only dock/menu never had.
 const EXT_SUPER: u8 = 0x5B;
+/// Print Screen: `E0 2A E0 37` on a PS/2 keyboard (the `E0 2A` fake-shift half
+/// falls through the extended branch as an unknown key, so it never reads as
+/// Shift), plain `E0 37` from QEMU's `sendkey print` and from xhci.rs (HID
+/// usage 0x46). Its release (`E0 B7 E0 AA`) is ignored like every release.
+const EXT_PRTSC: u8 = 0x37;
 pub const UP_ARROW: u8 = 0x11;
 pub const DOWN_ARROW: u8 = 0x12;
 pub const LEFT_ARROW: u8 = 0x13;
@@ -53,6 +58,18 @@ pub const PGDN_KEY: u8 = 0x18;
 /// The Super/GUI key, reported as the next free DC-range control code. The
 /// desktop treats it as "open the Applications menu".
 pub const SUPER_KEY: u8 = 0x19;
+/// Print Screen, the next free DC-range code: the desktop opens the screenshot
+/// overlay (drivers/screenshot.rs) on it.
+pub const PRTSC_KEY: u8 = 0x1A;
+/// F11, the next free code after Esc (0x1B): the desktop's full-screen toggle
+/// (maximize the focused window). Set-1 make code 0x57; xhci.rs maps a USB
+/// keyboard's F11 to the same scancode.
+pub const F11_KEY: u8 = 0x1C;
+const F11_MAKE: u8 = 0x57;
+/// Delete (`E0 53`), the next free code: Files' Delete (to the Trash) / Shift+Delete on a PS/2
+/// keyboard (a USB keyboard's Delete reaches apps as its HID usage).
+pub const DELETE_KEY: u8 = 0x1E;
+const EXT_DELETE: u8 = 0x53;
 
 // Ctrl-chords, reported in a dedicated 0x80+ range: raw ASCII control
 // codes (letter & 0x1F) would collide with the arrows above (Ctrl+Q/R/S/T
@@ -72,6 +89,89 @@ pub const CTRL_Z: u8 = 0x80 | 26; // undo
 pub const CTRL_ZOOM_IN: u8 = 0xE0; // Ctrl + '='/'+'
 pub const CTRL_ZOOM_OUT: u8 = 0xE1; // Ctrl + '-'
 pub const CTRL_ZOOM_RESET: u8 = 0xE2; // Ctrl + '0'
+/// Ctrl + Space: the next input mode (drivers/ime.rs: accents, Русский, Ελληνικά, 한국어, かな, U+).
+pub const CTRL_SPACE: u8 = 0xE3;
+/// Super+Space (the input-method shortcut, drivers/ime.rs). Super on its own is reported as
+/// `SUPER_KEY` when it is let go with no other key pressed meanwhile, so the chord does not
+/// also open the Applications menu.
+pub const IME_SUPER_SPACE: u8 = 0xE4;
+/// Ctrl+Shift pressed together and let go with no other key (the other input-method shortcut).
+pub const IME_CTRL_SHIFT: u8 = 0xE5;
+/// F5..F10 and F12 (F6 / F7 are the Japanese input method's hiragana / katakana keys; one of
+/// them can be the input-method switch key). F1..F4 switch terminals, F11 is `F11_KEY`.
+pub const F5_KEY: u8 = 0xE6;
+pub const F10_KEY: u8 = 0xEB;
+pub const F12_KEY: u8 = 0xEC;
+
+static mut SUPER_DOWN: bool = false;
+static mut SUPER_USED: bool = false;
+static mut CS_ARMED: bool = false;
+
+/// The input-method chords, ahead of the ordinary decoding: Super (reported on release, as a
+/// tap), Super+Space, Ctrl+Shift alone, and the F5..F12 keys. `Some(byte)` when it took `code`.
+fn chord_filter(code: u8) -> Option<u8> {
+    unsafe {
+        let ext = PENDING_EXTENDED;
+        let make = code & 0x80 == 0;
+        let base = code & 0x7F;
+        if ext && base == EXT_SUPER {
+            PENDING_EXTENDED = false;
+            if make {
+                if !SUPER_DOWN {
+                    SUPER_DOWN = true;
+                    SUPER_USED = false;
+                }
+                CS_ARMED = false;
+                return Some(0);
+            }
+            let tap = SUPER_DOWN && !SUPER_USED;
+            SUPER_DOWN = false;
+            return Some(if tap { SUPER_KEY } else { 0 });
+        }
+        let is_ctrl = !ext && base == LCTRL;
+        let is_shift = !ext && (base == LSHIFT || base == RSHIFT);
+        // Alt (left 0x38, right E0 38) only tracked here -- it sends nothing, but the desktop asks
+        // key_down("alt") (Files: Alt+arrows, Alt+Enter = Properties); decoding goes on as before
+        if base == 0x38 {
+            ALT_DOWN = make;
+        }
+        if make {
+            if is_ctrl {
+                if !CTRL_DOWN && SHIFT_DOWN {
+                    CS_ARMED = true;
+                }
+            } else if is_shift {
+                if !SHIFT_DOWN && CTRL_DOWN {
+                    CS_ARMED = true;
+                }
+            } else {
+                CS_ARMED = false;
+                if SUPER_DOWN {
+                    SUPER_USED = true;
+                    if !ext && base == 0x39 {
+                        return Some(IME_SUPER_SPACE);
+                    }
+                }
+            }
+            if !ext {
+                match code {
+                    0x3F..=0x44 => return Some(F5_KEY + (code - 0x3F)),
+                    0x58 => return Some(F12_KEY),
+                    _ => {},
+                }
+            }
+        } else if (is_ctrl || is_shift) && CS_ARMED {
+            CS_ARMED = false;
+            if is_ctrl {
+                CTRL_DOWN = false;
+            } else {
+                SHIFT_DOWN = false;
+            }
+            return Some(IME_CTRL_SHIFT);
+        }
+        None
+    }
+}
 
 /// Map a scancode pressed while Ctrl is held to its chord byte, or 0 if it
 /// isn't a chord we route (a bare modifier, or a key with no Ctrl meaning).
@@ -87,6 +187,7 @@ fn ctrl_chord(code: u8) -> u8 {
         b'=' | b'+' => CTRL_ZOOM_IN,
         b'-' | b'_' => CTRL_ZOOM_OUT,
         b'0' | b')' => CTRL_ZOOM_RESET,
+        b' ' => CTRL_SPACE,
         _ => 0,
     }
 }
@@ -113,7 +214,35 @@ static mut IDLE_FIRED: bool = false;
 /// to self-recover. Needs real VirtualBox confirmation, not just QEMU --
 /// this is the best fix available without reproducing the exact PS/2
 /// resync behavior VirtualBox's host-focus handling triggers.
-const FOCUS_LOSS_GAP_MS: u64 = 2_000;
+const FOCUS_LOSS_GAP_MS: u64 = 10_000;
+
+/// Arrival time (IRQ side) of the newest scancode and of the one before it.
+/// The stale check compares these, not the time the consumer got around to
+/// reading them: a slow frame (VirtualBox on Hyper-V draws far slower than
+/// QEMU/KVM) used to look like a 2 s focus-loss gap between Shift and the
+/// letter, cleared Shift, and typed lowercase.
+static mut ARRIVED_MS: [u64; RING_CAPACITY] = [0; RING_CAPACITY];
+static mut PREV_ARRIVAL_MS: u64 = 0;
+
+/// Drop every unread scancode and clear modifier/sequence state. Called at a
+/// session boundary (the sign-in field gaining focus, log out) so a buffered
+/// typematic burst or a half-read extended sequence from before can't replay
+/// into the password box. Unlike `reset_stale_modifier_state`, this is
+/// unconditional -- the caller knows a boundary was crossed.
+pub fn drain() {
+    unsafe {
+        RING_TAIL = RING_HEAD;
+        PENDING_EXTENDED = false;
+        CTRL_DOWN = false;
+        ALT_DOWN = false;
+        SHIFT_DOWN = false;
+        SUPER_DOWN = false;
+        CS_ARMED = false;
+        SC_HELD = [0; 4];
+        SC_EXT = false;
+    }
+    crate::arch::xhci::reset_key_state();
+}
 
 /// Reset modifier/sequence state if it's been stale long enough that
 /// trusting it would misinterpret the next scancode. Call before processing
@@ -121,14 +250,19 @@ const FOCUS_LOSS_GAP_MS: u64 = 2_000;
 /// `note_activity()` updates it).
 fn reset_stale_modifier_state() {
     unsafe {
-        if LAST_ACTIVITY_MS == 0 {
+        let at = ARRIVED_MS[RING_TAIL.wrapping_sub(1) as usize];
+        let prev = PREV_ARRIVAL_MS;
+        PREV_ARRIVAL_MS = at;
+        if prev == 0 {
             return; // first keypress ever -- nothing to have gotten stuck
         }
-        let now = crate::arch::timer::now_ms();
-        if now.saturating_sub(LAST_ACTIVITY_MS) > FOCUS_LOSS_GAP_MS {
+        if at.saturating_sub(prev) > FOCUS_LOSS_GAP_MS {
+            // Shift is left alone: a stuck Shift shows at once and one tap
+            // clears it, while a wrongly-cleared one silently lowercased text.
             PENDING_EXTENDED = false;
             CTRL_DOWN = false;
-            SHIFT_DOWN = false;
+            ALT_DOWN = false;
+            CS_ARMED = false;
         }
     }
 }
@@ -157,6 +291,7 @@ pub(crate) fn irq_scancode(code: u8) {
         let next = RING_HEAD.wrapping_add(1);
         if next != RING_TAIL {
             RING[RING_HEAD as usize] = code;
+            ARRIVED_MS[RING_HEAD as usize] = crate::arch::timer::now_ms();
             RING_HEAD = next;
         }
     }
@@ -203,6 +338,18 @@ pub fn shift_down() -> bool {
     unsafe { SHIFT_DOWN }
 }
 
+/// Whether (left) Ctrl is held -- the desktop's Ctrl+click in Files.
+pub fn ctrl_down() -> bool {
+    unsafe { CTRL_DOWN }
+}
+
+static mut ALT_DOWN: bool = false;
+
+/// Is an Alt key held (PS/2)?
+pub fn alt_down() -> bool {
+    unsafe { ALT_DOWN }
+}
+
 fn lookup_ascii(code: u8) -> u8 {
     let shifted = unsafe { SHIFT_DOWN };
     if let Some(c) = crate::drivers::kbdlayout::override_for(code, shifted) {
@@ -215,14 +362,50 @@ fn lookup_ascii(code: u8) -> u8 {
 /// Non-blocking scancode read from the IRQ-fed ring buffer. Returns `None`
 /// if nothing is waiting.
 fn read_scancode() -> Option<u8> {
+    // USB keyboards/mice (polled xHCI): their reports land in this ring as scancodes
+    crate::arch::xhci::service();
     unsafe {
         if RING_HEAD == RING_TAIL {
             return None;
         }
         let byte = RING[RING_TAIL as usize];
         RING_TAIL = RING_TAIL.wrapping_add(1);
+        track_held(byte);
         Some(byte)
     }
+}
+
+/// Which keys are down, from the make / break codes read so far (bit = code & 0x7F, +128 for
+/// 0xE0-prefixed keys). A USB keyboard has its own report (`xhci::held_report`); a PS/2 keyboard
+/// (QEMU, VirtualBox, a BIOS's USB legacy emulation) only has this, so an app's `key_down("w")`
+/// stays true while the key is held, not just on its typematic repeats.
+static mut SC_HELD: [u64; 4] = [0; 4];
+static mut SC_EXT: bool = false;
+
+fn track_held(byte: u8) {
+    unsafe {
+        if byte == EXT_PREFIX {
+            SC_EXT = true;
+            return;
+        }
+        if byte == 0xE1 {
+            return; // Pause's sequence: not a key anyone holds
+        }
+        let idx = ((byte & 0x7F) as usize) | if SC_EXT { 0x80 } else { 0 };
+        SC_EXT = false;
+        let (w, b) = (idx / 64, 1u64 << (idx % 64));
+        if byte & 0x80 != 0 {
+            SC_HELD[w] &= !b;
+        } else {
+            SC_HELD[w] |= b;
+        }
+    }
+}
+
+/// Is the key with this set-1 make code (`extended` = 0xE0-prefixed) held down?
+pub fn scancode_held(extended: bool, code: u8) -> bool {
+    let idx = ((code & 0x7F) as usize) | if extended { 0x80 } else { 0 };
+    unsafe { SC_HELD[idx / 64] & (1u64 << (idx % 64)) != 0 }
 }
 
 /// Any real key event (or, via the IRQ12 mouse handler, mouse movement/
@@ -306,6 +489,9 @@ pub fn read_char() -> u8 {
                 if code == EXT_PGDN {
                     return PGDN_KEY;
                 }
+                if code == EXT_DELETE {
+                    return DELETE_KEY;
+                }
                 continue;
             }
             if code == LCTRL {
@@ -382,7 +568,14 @@ pub fn poll_char() -> u8 {
                 unsafe {
                     PENDING_EXTENDED = true;
                 }
-                return 0;
+                // Read its second byte in the same call: loops that take one
+                // key per frame otherwise split the pair across a frame, and a
+                // frame slower than FOCUS_LOSS_GAP_MS (a first-frame disk
+                // seed) dropped the prefix -- PrtSc then typed a keypad '*'.
+                return poll_char();
+            }
+            if let Some(r) = chord_filter(code) {
+                return r;
             }
             if unsafe { PENDING_EXTENDED } {
                 unsafe {
@@ -412,8 +605,14 @@ pub fn poll_char() -> u8 {
                 if code == EXT_PGDN {
                     return PGDN_KEY;
                 }
+                if code == EXT_DELETE {
+                    return DELETE_KEY;
+                }
                 if code == EXT_SUPER {
                     return SUPER_KEY;
+                }
+                if code == EXT_PRTSC {
+                    return PRTSC_KEY;
                 }
                 return 0;
             }
@@ -443,6 +642,9 @@ pub fn poll_char() -> u8 {
             }
             if code & 0x80 != 0 || try_switch_term(code) {
                 return 0;
+            }
+            if code == F11_MAKE {
+                return F11_KEY;
             }
             if unsafe { CTRL_DOWN } {
                 let chord = ctrl_chord(code);

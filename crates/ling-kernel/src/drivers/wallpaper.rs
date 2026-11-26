@@ -15,7 +15,14 @@
 use crate::drivers::framebuffer;
 use crate::fs::lingfs;
 
+/// The cache covers the largest screen (framebuffer's back buffer).
+#[cfg(target_arch = "x86_64")]
+const MAX_W: usize = 2560;
+#[cfg(target_arch = "x86_64")]
+const MAX_H: usize = 1600;
+#[cfg(not(target_arch = "x86_64"))]
 const MAX_W: usize = 1920;
+#[cfg(not(target_arch = "x86_64"))]
 const MAX_H: usize = 1080;
 /// Cache of the wallpaper scaled to the live framebuffer size (0xRRGGBB).
 static mut CACHE: [u32; MAX_W * MAX_H] = [0; MAX_W * MAX_H];

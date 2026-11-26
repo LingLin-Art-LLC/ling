@@ -1,0 +1,14 @@
+[package]
+name = "ling-mpa"
+version = "2030.0.1"
+edition = "2021"
+authors = ["Ling Lin <taellinglin@gmail.com>"]
+description = "MPEG-1/2 audio Layer I/II/III decoder for LingOS, freestanding (no_std + alloc + libm); ported from symphonia-bundle-mp3"
+license = "MPL-2.0"
+
+[dependencies]
+libm = { version = "0.2", default-features = false }
+
+[lib]
+name = "ling_mpa"
+path = "src/lib.rs"

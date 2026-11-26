@@ -52,7 +52,7 @@ examples/ling_map.ling
 /lexicons/generated
 
 # ── Cargo ─────────────────────────────────────────────────────────────────────
-Cargo.lock
+# Cargo.lock is committed: ling is a binary (and CI builds must be reproducible)
 
 # ── Website (published separately, not part of crate) ─────────────────────────
 ling-lang.org/
@@ -86,3 +86,10 @@ docs/book/
 benchmarks/bin/
 # Python bytecode cache
 __pycache__/
+
+# Apple SDK inputs for the build farm (not redistributable) — see docker/macos-sdk/README.md
+docker/macos-sdk/*.xip
+docker/macos-sdk/*.sdk.tar.*
+
+# extra cargo target dirs (CARGO_TARGET_DIR experiments)
+/target-*/

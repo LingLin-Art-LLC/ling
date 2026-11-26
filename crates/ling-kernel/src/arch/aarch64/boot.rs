@@ -9,6 +9,10 @@ global_asm!(
     ".section .text.boot",
     ".global _start",
     "_start:",
+    // The firmware's device tree address arrives in x0: keep it (in .data, so
+    // `zero_bss` cannot wipe it) before the register is reused.
+    "    ldr x1, =DTB_PTR",
+    "    str x0, [x1]",
     "    mrs x0, mpidr_el1",
     "    and x0, x0, #0xFF",
     "    cbz x0, primary",
@@ -66,6 +70,33 @@ extern "C" {
     static mut __bss_start: u8;
     static mut __bss_end: u8;
     static _kernel_end: u8;
+    static _stack_top: u8;
+}
+
+/// The device tree address the firmware passed in `x0` (1 = never set; a
+/// non-zero initial value keeps this in .data rather than .bss).
+#[no_mangle]
+pub static mut DTB_PTR: u64 = 1;
+
+/// Repoint the tree (at a copy that survives memory init).
+pub fn set_dtb_ptr(p: u64) {
+    unsafe { core::ptr::write_volatile(&raw mut DTB_PTR, p) }
+}
+
+/// The device tree's address, or 0 when the boot did not provide one.
+pub fn dtb_ptr() -> u64 {
+    let v = unsafe { core::ptr::read_volatile(&raw const DTB_PTR) };
+    if v <= 1 || v & 3 != 0 {
+        0
+    } else {
+        v
+    }
+}
+
+/// Top of the boot stack `el1_entry` switched onto -- the one stack every
+/// Ling program on this target runs on, which `lingrt`'s collector scans.
+pub fn boot_stack_top() -> u64 {
+    (&raw const _stack_top) as u64
 }
 
 /// First physical address past the kernel's own image + boot stack
@@ -81,6 +112,27 @@ pub fn kernel_end() -> u64 {
 pub unsafe fn zero_bss() {
     let start = &raw mut __bss_start as usize;
     let end = &raw mut __bss_end as usize;
+    // The firmware puts the device tree right after the end of kernel8.img
+    // -- i.e. inside our .bss / boot stack once the image is big enough
+    // (seen on a Pi 5 at ~180 MB: memory init then ran on guesses and hung).
+    // Move it past the kernel first; fdt::preserve copies it from there.
+    let dtb = core::ptr::read_volatile(&raw const DTB_PTR) as usize;
+    let kend = (&raw const _kernel_end) as usize;
+    if dtb > 1 && dtb >= start && dtb < kend {
+        let src = dtb as *const u8;
+        let be = |o: usize| u32::from_be_bytes([core::ptr::read_volatile(src.add(o)), core::ptr::read_volatile(src.add(o + 1)), core::ptr::read_volatile(src.add(o + 2)), core::ptr::read_volatile(src.add(o + 3))]);
+        if be(0) == 0xD00D_FEED {
+            let total = (be(4) as usize).min(1 << 20);
+            let dst = ((kend + 0xFFFF) & !0xFFFF) as *mut u8;
+            // dst is above src and the two may overlap: copy from the top down
+            let mut i = total;
+            while i > 0 {
+                i -= 1;
+                core::ptr::write_volatile(dst.add(i), core::ptr::read_volatile(src.add(i)));
+            }
+            core::ptr::write_volatile(&raw mut DTB_PTR, dst as u64);
+        }
+    }
     let mut p = start as *mut u8;
     while (p as usize) < end {
         core::ptr::write_volatile(p, 0);

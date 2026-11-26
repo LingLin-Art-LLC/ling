@@ -29,14 +29,27 @@ fn paeth(a: i32, b: i32, c: i32) -> i32 {
     }
 }
 
-/// Decode a PNG (8-bit, color type 0/2/4/6, non-interlaced).
+/// Decode a PNG: every colour type (grey, RGB, palette, grey+alpha, RGBA), bit
+/// depths 1-16, tRNS transparency, Adam7 interlacing.
 pub fn decode_png(data: &[u8]) -> Option<Image> {
+    decode_png_impl(data, false)
+}
+
+/// `decode_png` keeping the alpha channel in the top byte (`0xAARRGGBB`;
+/// opaque colour types read as 0xFF). For textures.
+pub fn decode_png_rgba(data: &[u8]) -> Option<Image> {
+    decode_png_impl(data, true)
+}
+
+fn decode_png_impl(data: &[u8], keep_alpha: bool) -> Option<Image> {
     if data.len() < 8 || data[..8] != [137, 80, 78, 71, 13, 10, 26, 10] {
         return None;
     }
     let mut pos = 8;
-    let (mut w, mut h, mut depth, mut color) = (0u32, 0u32, 0u8, 0u8);
+    let (mut w, mut h, mut depth, mut color, mut interlace) = (0u32, 0u32, 0u8, 0u8, 0u8);
     let mut idat: Vec<u8> = Vec::new();
+    let mut plte: &[u8] = &[];
+    let mut trns: &[u8] = &[];
     while pos + 8 <= data.len() {
         let len = be32(data, pos) as usize;
         let ctype = &data[pos + 4..pos + 8];
@@ -46,67 +59,134 @@ pub fn decode_png(data: &[u8]) -> Option<Image> {
         }
         let cdata = &data[cstart..cstart + len];
         match ctype {
-            b"IHDR" => {
+            b"IHDR" if len >= 13 => {
                 w = be32(cdata, 0);
                 h = be32(cdata, 4);
                 depth = cdata[8];
                 color = cdata[9];
-                if cdata[12] != 0 {
-                    return None; // interlaced not supported
-                }
+                interlace = cdata[12];
             },
+            b"PLTE" => plte = cdata,
+            b"tRNS" => trns = cdata,
             b"IDAT" => idat.extend_from_slice(cdata),
             b"IEND" => break,
             _ => {},
         }
         pos = cstart + len + 4;
     }
-    if w == 0 || h == 0 || depth != 8 {
-        return None;
-    }
-    let bpp: usize = match color {
-        0 => 1,
-        2 => 3,
-        4 => 2,
-        6 => 4,
+    // every colour type / bit depth pair PNG allows
+    let channels: usize = match (color, depth) {
+        (0, 1 | 2 | 4 | 8 | 16) => 1,
+        (3, 1 | 2 | 4 | 8) => 1,
+        (2, 8 | 16) => 3,
+        (4, 8 | 16) => 2,
+        (6, 8 | 16) => 4,
         _ => return None,
     };
-    let raw = miniz_oxide::inflate::decompress_to_vec_zlib(&idat).ok()?;
-    let stride = w as usize * bpp;
-    if raw.len() < (stride + 1) * h as usize {
+    if w == 0 || h == 0 || interlace > 1 || (color == 3 && plte.len() < 3) {
         return None;
     }
-    let mut out: Vec<u32> = Vec::with_capacity((w * h) as usize);
-    let mut prev = vec![0u8; stride];
-    let mut cur = vec![0u8; stride];
+    let bits = channels * depth as usize;
+    let fbpp = bits.div_ceil(8).max(1); // the filters' "bytes per pixel"
+    let raw = miniz_oxide::inflate::decompress_to_vec_zlib(&idat).ok()?;
+    let (wu, hu) = (w as usize, h as usize);
+    let mut out: Vec<u32> = vec![0; wu * hu];
+    let maxv = ((1u32 << depth.min(8)) - 1).max(1);
+    // tRNS for grey / RGB: the one colour that is transparent (raw sample values)
+    let t_grey = if color == 0 && trns.len() >= 2 { Some(((trns[0] as u32) << 8) | trns[1] as u32) } else { None };
+    let t_rgb = if color == 2 && trns.len() >= 6 {
+        Some([((trns[0] as u32) << 8) | trns[1] as u32, ((trns[2] as u32) << 8) | trns[3] as u32, ((trns[4] as u32) << 8) | trns[5] as u32])
+    } else {
+        None
+    };
+    // passes: (x0, y0, dx, dy); Adam7 when interlaced
+    const ADAM7: [(usize, usize, usize, usize); 7] = [(0, 0, 8, 8), (4, 0, 8, 8), (0, 4, 4, 8), (2, 0, 4, 4), (0, 2, 2, 4), (1, 0, 2, 2), (0, 1, 1, 2)];
+    let single = [(0usize, 0usize, 1usize, 1usize)];
+    let passes: &[(usize, usize, usize, usize)] = if interlace == 1 { &ADAM7 } else { &single };
     let mut ri = 0usize;
-    for _y in 0..h as usize {
-        let filter = raw[ri];
-        ri += 1;
-        for x in 0..stride {
-            let rb = raw[ri + x] as i32;
-            let a = if x >= bpp { cur[x - bpp] as i32 } else { 0 };
-            let b = prev[x] as i32;
-            let c = if x >= bpp { prev[x - bpp] as i32 } else { 0 };
-            let v = match filter {
-                1 => rb + a,
-                2 => rb + b,
-                3 => rb + (a + b) / 2,
-                4 => rb + paeth(a, b, c),
-                _ => rb,
-            } & 0xff;
-            cur[x] = v as u8;
+    for &(x0, y0, dx, dy) in passes {
+        if wu <= x0 || hu <= y0 {
+            continue;
         }
-        ri += stride;
-        for x in 0..w as usize {
-            let o = x * bpp;
-            let (r, g, b) = match color {
-                0 | 4 => (cur[o], cur[o], cur[o]),
-                _ => (cur[o], cur[o + 1], cur[o + 2]),
+        let pw = (wu - x0).div_ceil(dx);
+        let ph = (hu - y0).div_ceil(dy);
+        let stride = (pw * bits).div_ceil(8);
+        let mut prev = vec![0u8; stride];
+        let mut cur = vec![0u8; stride];
+        for row in 0..ph {
+            if ri + 1 + stride > raw.len() {
+                return Some(Image { w, h, px: out }); // truncated: what arrived
+            }
+            let filter = raw[ri];
+            ri += 1;
+            for x in 0..stride {
+                let rb = raw[ri + x] as i32;
+                let a = if x >= fbpp { cur[x - fbpp] as i32 } else { 0 };
+                let b = prev[x] as i32;
+                let c = if x >= fbpp { prev[x - fbpp] as i32 } else { 0 };
+                let v = match filter {
+                    1 => rb + a,
+                    2 => rb + b,
+                    3 => rb + (a + b) / 2,
+                    4 => rb + paeth(a, b, c),
+                    _ => rb,
+                } & 0xff;
+                cur[x] = v as u8;
+            }
+            ri += stride;
+            // sample k of pixel i, as the raw value (16-bit samples whole)
+            let sample = |i: usize, k: usize| -> u32 {
+                match depth {
+                    16 => {
+                        let o = (i * channels + k) * 2;
+                        ((cur[o] as u32) << 8) | cur[o + 1] as u32
+                    },
+                    8 => cur[i * channels + k] as u32,
+                    d => {
+                        let bit = i * d as usize;
+                        ((cur[bit / 8] >> (8 - d as usize - bit % 8)) as u32) & ((1u32 << d) - 1)
+                    },
+                }
             };
-            out.push(((r as u32) << 16) | ((g as u32) << 8) | b as u32);
+            let to8 = |v: u32| -> u32 {
+                if depth == 16 {
+                    v >> 8
+                } else if depth == 8 {
+                    v
+                } else {
+                    v * 255 / maxv
+                }
+            };
+            let y = y0 + row * dy;
+            for i in 0..pw {
+                let (r, g, b, a) = match color {
+                    0 => {
+                        let v = sample(i, 0);
+                        let g = to8(v);
+                        (g, g, g, if t_grey == Some(v) { 0 } else { 255 })
+                    },
+                    2 => {
+                        let (r, g, b) = (sample(i, 0), sample(i, 1), sample(i, 2));
+                        let a = if t_rgb == Some([r, g, b]) { 0 } else { 255 };
+                        (to8(r), to8(g), to8(b), a)
+                    },
+                    3 => {
+                        let idx = sample(i, 0) as usize;
+                        let p = idx * 3;
+                        let (r, g, b) = if p + 2 < plte.len() { (plte[p] as u32, plte[p + 1] as u32, plte[p + 2] as u32) } else { (0, 0, 0) };
+                        (r, g, b, trns.get(idx).map(|&t| t as u32).unwrap_or(255))
+                    },
+                    4 => {
+                        let g = to8(sample(i, 0));
+                        (g, g, g, to8(sample(i, 1)))
+                    },
+                    _ => (to8(sample(i, 0)), to8(sample(i, 1)), to8(sample(i, 2)), to8(sample(i, 3))),
+                };
+                let a = if keep_alpha { a } else { 0 };
+                out[y * wu + x0 + i * dx] = (a << 24) | (r << 16) | (g << 8) | b;
+            }
+            core::mem::swap(&mut prev, &mut cur);
         }
-        core::mem::swap(&mut prev, &mut cur);
     }
     Some(Image { w, h, px: out })
 }
@@ -160,7 +240,8 @@ fn attr<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
     let key = name.as_bytes();
     let mut i = 0;
     while i + key.len() + 1 < bytes.len() {
-        if &bytes[i..i + key.len()] == key {
+        let boundary = i == 0 || matches!(bytes[i - 1], b' ' | b'\t' | b'\n' | b'\r');
+        if boundary && &bytes[i..i + key.len()] == key {
             let mut j = i + key.len();
             while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
                 j += 1;
@@ -180,6 +261,69 @@ fn attr<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
         i += 1;
     }
     None
+}
+
+/// An attribute, or the same property inside `style="..."` (what Inkscape
+/// and most editors write for fill, stroke, opacity and stroke-width).
+fn prop<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
+    if let Some(v) = attr(tag, name) {
+        return Some(v);
+    }
+    let style = attr(tag, "style")?;
+    for decl in style.split(';') {
+        let mut kv = decl.splitn(2, ':');
+        let k = kv.next()?.trim();
+        if k == name {
+            return kv.next().map(|v| v.trim());
+        }
+    }
+    None
+}
+
+/// gzip (an .svgz) -> the bytes inside; None when it is not gzip or is broken.
+pub fn gunzip(d: &[u8]) -> Option<Vec<u8>> {
+    if d.len() < 18 || d[0] != 0x1f || d[1] != 0x8b || d[2] != 8 {
+        return None;
+    }
+    let flg = d[3];
+    let mut p = 10usize;
+    if flg & 4 != 0 {
+        let xl = u16::from_le_bytes([*d.get(p)?, *d.get(p + 1)?]) as usize;
+        p += 2 + xl;
+    }
+    if flg & 8 != 0 {
+        while *d.get(p)? != 0 {
+            p += 1;
+        }
+        p += 1;
+    }
+    if flg & 16 != 0 {
+        while *d.get(p)? != 0 {
+            p += 1;
+        }
+        p += 1;
+    }
+    if flg & 2 != 0 {
+        p += 2;
+    }
+    if p + 8 >= d.len() {
+        return None;
+    }
+    miniz_oxide::inflate::decompress_to_vec(&d[p..d.len() - 8]).ok()
+}
+
+/// `src` over `dst` with coverage `a` (0..1), per channel.
+fn blend(dst: u32, src: u32, a: f32) -> u32 {
+    if a >= 1.0 {
+        return src;
+    }
+    let a = a.clamp(0.0, 1.0);
+    let ch = |shift: u32| -> u32 {
+        let d = ((dst >> shift) & 0xFF) as f32;
+        let s = ((src >> shift) & 0xFF) as f32;
+        ((d + (s - d) * a) as u32).min(255) << shift
+    };
+    ch(16) | ch(8) | ch(0)
 }
 
 fn hex1(c: u8) -> Option<u32> {
@@ -244,7 +388,11 @@ fn parse_color(s: &str) -> Option<u32> {
 
 /// Scanline even-odd fill of a polygon into the pixel buffer.
 fn fill_poly(px: &mut [u32], w: u32, h: u32, verts: &[(f64, f64)], color: u32) {
-    if verts.len() < 3 {
+    fill_poly_a(px, w, h, verts, color, 1.0)
+}
+
+fn fill_poly_a(px: &mut [u32], w: u32, h: u32, verts: &[(f64, f64)], color: u32, alpha: f32) {
+    if verts.len() < 3 || alpha <= 0.0 {
         return;
     }
     let mut ys = h as i32;
@@ -287,7 +435,8 @@ fn fill_poly(px: &mut [u32], w: u32, h: u32, verts: &[(f64, f64)], color: u32) {
             let x1 = (xs[k + 1] as i32).min(w as i32) as u32;
             let mut x = x0;
             while x < x1 {
-                px[(y as u32 * w + x) as usize] = color;
+                let idx = (y as u32 * w + x) as usize;
+                px[idx] = if alpha >= 1.0 { color } else { blend(px[idx], color, alpha) };
                 x += 1;
             }
             k += 2;
@@ -461,6 +610,9 @@ fn path_polys(d: &str, out: &mut Vec<Vec<(f64, f64)>>) {
     let (mut sx, mut sy) = (0f64, 0f64);
     let mut cur: Vec<(f64, f64)> = Vec::new();
     let mut nums = [0f64; 8];
+    // The last curve's control point (for S / T reflection) and the last command.
+    let (mut lcx, mut lcy) = (0f64, 0f64);
+    let mut last_cmd = 0u8;
     let read_nums = |b: &[u8], i: &mut usize, nums: &mut [f64], count: usize| -> bool {
         let mut got = 0;
         while got < count {
@@ -491,6 +643,8 @@ fn path_polys(d: &str, out: &mut Vec<Vec<(f64, f64)>>) {
         let rel = c.is_ascii_lowercase();
         let cmd = c.to_ascii_uppercase();
         i += 1;
+        let prev_cmd = last_cmd;
+        last_cmd = cmd;
         match cmd {
             b'M' => {
                 if !read_nums(b, &mut i, &mut nums, 2) {
@@ -545,6 +699,56 @@ fn path_polys(d: &str, out: &mut Vec<Vec<(f64, f64)>>) {
                     cur.push((x, y));
                     t += 1;
                 }
+                lcx = x2;
+                lcy = y2;
+                cx = ex;
+                cy = ey;
+            },
+            b'S' => {
+                if !read_nums(b, &mut i, &mut nums, 4) {
+                    break;
+                }
+                let (x1, y1) = if prev_cmd == b'C' || prev_cmd == b'S' { (2.0 * cx - lcx, 2.0 * cy - lcy) } else { (cx, cy) };
+                let (x2, y2) = (if rel { cx + nums[0] } else { nums[0] }, if rel { cy + nums[1] } else { nums[1] });
+                let (ex, ey) = (if rel { cx + nums[2] } else { nums[2] }, if rel { cy + nums[3] } else { nums[3] });
+                let mut t = 1;
+                while t <= 8 {
+                    let u = t as f64 / 8.0;
+                    let mv = 1.0 - u;
+                    let x = mv * mv * mv * cx + 3.0 * mv * mv * u * x1 + 3.0 * mv * u * u * x2 + u * u * u * ex;
+                    let y = mv * mv * mv * cy + 3.0 * mv * mv * u * y1 + 3.0 * mv * u * u * y2 + u * u * u * ey;
+                    cur.push((x, y));
+                    t += 1;
+                }
+                lcx = x2;
+                lcy = y2;
+                cx = ex;
+                cy = ey;
+            },
+            b'T' => {
+                if !read_nums(b, &mut i, &mut nums, 2) {
+                    break;
+                }
+                let (x1, y1) = if prev_cmd == b'Q' || prev_cmd == b'T' { (2.0 * cx - lcx, 2.0 * cy - lcy) } else { (cx, cy) };
+                let (ex, ey) = (if rel { cx + nums[0] } else { nums[0] }, if rel { cy + nums[1] } else { nums[1] });
+                let mut t = 1;
+                while t <= 8 {
+                    let u = t as f64 / 8.0;
+                    let mv = 1.0 - u;
+                    cur.push((mv * mv * cx + 2.0 * mv * u * x1 + u * u * ex, mv * mv * cy + 2.0 * mv * u * y1 + u * u * ey));
+                    t += 1;
+                }
+                lcx = x1;
+                lcy = y1;
+                cx = ex;
+                cy = ey;
+            },
+            b'A' => {
+                if !read_nums(b, &mut i, &mut nums, 7) {
+                    break;
+                }
+                let (ex, ey) = (if rel { cx + nums[5] } else { nums[5] }, if rel { cy + nums[6] } else { nums[6] });
+                arc_points(cx, cy, nums[0], nums[1], nums[2], nums[3] != 0.0, nums[4] != 0.0, ex, ey, &mut cur);
                 cx = ex;
                 cy = ey;
             },
@@ -563,6 +767,8 @@ fn path_polys(d: &str, out: &mut Vec<Vec<(f64, f64)>>) {
                     cur.push((x, y));
                     t += 1;
                 }
+                lcx = x1;
+                lcy = y1;
                 cx = ex;
                 cy = ey;
             },
@@ -576,13 +782,69 @@ fn path_polys(d: &str, out: &mut Vec<Vec<(f64, f64)>>) {
                 }
             },
             _ => {
-                // Unknown command (S/T/A, etc.) -- bail out of this path.
+                // Not a path command we know -- stop reading this path.
                 break;
             },
         }
     }
     if cur.len() >= 3 {
         out.push(cur);
+    }
+}
+
+/// An SVG elliptical arc (F.6.5 of the spec: endpoint to centre form), sampled
+/// into `out` as 16 points ending at (ex, ey).
+#[allow(clippy::too_many_arguments)]
+fn arc_points(x1: f64, y1: f64, rx: f64, ry: f64, rot_deg: f64, large: bool, sweep: bool, x2: f64, y2: f64, out: &mut Vec<(f64, f64)>) {
+    let (mut rx, mut ry) = (libm::fabs(rx), libm::fabs(ry));
+    if rx < 1e-9 || ry < 1e-9 || (x1 == x2 && y1 == y2) {
+        out.push((x2, y2));
+        return;
+    }
+    let phi = rot_deg * core::f64::consts::PI / 180.0;
+    let (cp, sp) = (libm::cos(phi), libm::sin(phi));
+    let (dx, dy) = ((x1 - x2) / 2.0, (y1 - y2) / 2.0);
+    let x1p = cp * dx + sp * dy;
+    let y1p = -sp * dx + cp * dy;
+    let lambda = x1p * x1p / (rx * rx) + y1p * y1p / (ry * ry);
+    if lambda > 1.0 {
+        let s = libm::sqrt(lambda);
+        rx *= s;
+        ry *= s;
+    }
+    let num = rx * rx * ry * ry - rx * rx * y1p * y1p - ry * ry * x1p * x1p;
+    let den = rx * rx * y1p * y1p + ry * ry * x1p * x1p;
+    let mut coef = if den > 0.0 { libm::sqrt((num / den).max(0.0)) } else { 0.0 };
+    if large == sweep {
+        coef = -coef;
+    }
+    let cxp = coef * rx * y1p / ry;
+    let cyp = -coef * ry * x1p / rx;
+    let ccx = cp * cxp - sp * cyp + (x1 + x2) / 2.0;
+    let ccy = sp * cxp + cp * cyp + (y1 + y2) / 2.0;
+    let ang = |ux: f64, uy: f64, vx: f64, vy: f64| -> f64 {
+        let dot = ux * vx + uy * vy;
+        let len = libm::sqrt((ux * ux + uy * uy) * (vx * vx + vy * vy));
+        let mut a = libm::acos((dot / len.max(1e-12)).clamp(-1.0, 1.0));
+        if ux * vy - uy * vx < 0.0 {
+            a = -a;
+        }
+        a
+    };
+    let (ux, uy) = ((x1p - cxp) / rx, (y1p - cyp) / ry);
+    let (vx, vy) = ((-x1p - cxp) / rx, (-y1p - cyp) / ry);
+    let theta1 = ang(1.0, 0.0, ux, uy);
+    let mut dtheta = ang(ux, uy, vx, vy);
+    if !sweep && dtheta > 0.0 {
+        dtheta -= 2.0 * core::f64::consts::PI;
+    } else if sweep && dtheta < 0.0 {
+        dtheta += 2.0 * core::f64::consts::PI;
+    }
+    let steps = 16;
+    for k in 1..=steps {
+        let th = theta1 + dtheta * k as f64 / steps as f64;
+        let (ct, st) = (libm::cos(th), libm::sin(th));
+        out.push((ccx + rx * ct * cp - ry * st * sp, ccy + rx * ct * sp + ry * st * cp));
     }
 }
 
@@ -596,6 +858,75 @@ pub fn decode_svg(data: &[u8]) -> Option<Image> {
 /// coat-of-arms doesn't rasterize at full resolution (scanline fill is
 /// O(canvas x paths) -- a 1024px canvas can take seconds).
 pub fn decode_svg_capped(data: &[u8], cap: u32) -> Option<Image> {
+    decode_svg_bg(data, cap, 0xff_ffff)
+}
+
+/// An SVG as a texture: `0xAARRGGBB` with the drawing's coverage as alpha.
+/// The rasterizer composites onto a solid canvas, so the picture is rendered
+/// over black and over white and the difference gives the alpha (exact for
+/// normal source-over blending); a small probe render first tells whether the
+/// picture is opaque, in which case one render on black is enough.
+pub fn decode_svg_alpha(data: &[u8], cap: u32) -> Option<Image> {
+    let probe = 48.min(cap);
+    let (pb, pw) = (decode_svg_bg(data, probe, 0)?, decode_svg_bg(data, probe, 0xff_ffff)?);
+    let opaque = pb.px.iter().zip(pw.px.iter()).all(|(&b, &w)| {
+        let d = |s: u32| ((w >> s) & 255).abs_diff((b >> s) & 255);
+        d(16) + d(8) + d(0) < 6
+    });
+    let mut black = decode_svg_bg(data, cap, 0)?;
+    if opaque {
+        for p in &mut black.px {
+            *p |= 0xff00_0000;
+        }
+        return Some(black);
+    }
+    let white = decode_svg_bg(data, cap, 0xff_ffff)?;
+    for (p, &w) in black.px.iter_mut().zip(white.px.iter()) {
+        let b = *p;
+        let ch = |s: u32| (((w >> s) & 255) as i32 - ((b >> s) & 255) as i32).clamp(0, 255);
+        let a = (255 - (ch(16) + ch(8) + ch(0)) / 3).clamp(0, 255) as u32;
+        let un = |s: u32| -> u32 {
+            if a == 0 {
+                0
+            } else {
+                ((((b >> s) & 255) * 255 + a / 2) / a).min(255)
+            }
+        };
+        *p = (a << 24) | (un(16) << 16) | (un(8) << 8) | un(0);
+    }
+    Some(black)
+}
+
+/// A BMP (24 / 32 bpp) keeping the 32-bpp alpha byte (`0xAARRGGBB`).
+pub fn decode_bmp_rgba(b: &[u8]) -> Option<Image> {
+    let rd32 = |o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+    if b.len() < 54 || &b[0..2] != b"BM" {
+        return None;
+    }
+    let off = rd32(10) as usize;
+    let sw = rd32(18) as i32;
+    let sh_raw = rd32(22) as i32;
+    let bpp = u16::from_le_bytes([b[28], b[29]]) as usize;
+    if sw <= 0 || sh_raw == 0 || (bpp != 24 && bpp != 32) {
+        return None;
+    }
+    let (sw, sh) = (sw as usize, sh_raw.unsigned_abs() as usize);
+    let stride = (sw * bpp / 8 + 3) & !3;
+    let mut px = vec![0u32; sw * sh];
+    for y in 0..sh {
+        let row = if sh_raw < 0 { y } else { sh - 1 - y };
+        for x in 0..sw {
+            let p = off + row * stride + x * bpp / 8;
+            if p + 2 < b.len() {
+                let a = if bpp == 32 && p + 3 < b.len() { b[p + 3] as u32 } else { 255 };
+                px[y * sw + x] = (a << 24) | ((b[p + 2] as u32) << 16) | ((b[p + 1] as u32) << 8) | b[p] as u32;
+            }
+        }
+    }
+    Some(Image { w: sw as u32, h: sh as u32, px })
+}
+
+fn decode_svg_bg(data: &[u8], cap: u32, bg: u32) -> Option<Image> {
     let text = core::str::from_utf8(data).ok()?;
     let svg_pos = text.find("<svg")?;
     let svg_tag_end = text[svg_pos..].find('>')? + svg_pos;
@@ -639,18 +970,15 @@ pub fn decode_svg_capped(data: &[u8], cap: u32) -> Option<Image> {
     // rather than re-scaled per shape.
     const SS: u32 = 2;
     let (cw, ch) = (w * SS, h * SS);
-    let mut buf = vec![0xffffffu32; (cw * ch) as usize];
+    let mut buf = vec![bg; (cw * ch) as usize];
     let sx = cw as f64 / vw;
     let sy = ch as f64 / vh;
     let root: Mat = [sx, 0.0, 0.0, sy, -vx * sx, -vy * sy];
 
     // Wall-clock budget: a complex real-world SVG can accumulate enough
     // rasterization work to stall the UI. Bail out with a partial render
-    // rather than hang. x86_64 only (the SVG path isn't exercised on rpi).
-    #[cfg(target_arch = "x86_64")]
+    // rather than hang.
     let deadline = crate::arch::timer::now_us() + 1_500_000;
-    #[cfg(not(target_arch = "x86_64"))]
-    let deadline = 0u64;
 
     let content = &text[svg_tag_end + 1..];
     svg_render(content, text, root, &mut buf, cw, ch, 0, deadline);
@@ -799,8 +1127,12 @@ fn svg_render(text: &str, full: &str, base: Mat, buf: &mut [u32], w: u32, h: u32
         }
         let own = attr(tag, "transform").map(parse_transform).unwrap_or(MAT_ID);
         let ctm = mat_mul(gstack[gtop], own);
-        let fill = shape_fill(full, attr(tag, "fill"));
-        let stroke = attr(tag, "stroke").and_then(parse_color);
+        let fill = shape_fill(full, prop(tag, "fill"));
+        let stroke = prop(tag, "stroke").and_then(parse_color);
+        let op = prop(tag, "opacity").map(svg_num).unwrap_or(1.0);
+        let alpha = (op * prop(tag, "fill-opacity").map(svg_num).unwrap_or(1.0)).clamp(0.0, 1.0) as f32;
+        let salpha = (op * prop(tag, "stroke-opacity").map(svg_num).unwrap_or(1.0)).clamp(0.0, 1.0) as f32;
+        let sw = prop(tag, "stroke-width").map(svg_num).unwrap_or(1.0) * libm::sqrt(libm::fabs(ctm[0] * ctm[3] - ctm[1] * ctm[2]));
         match name {
             "use" => {
                 let href = attr(tag, "href").or_else(|| attr(tag, "xlink:href"));
@@ -828,7 +1160,7 @@ fn svg_render(text: &str, full: &str, base: Mat, buf: &mut [u32], w: u32, h: u32
                     for p in v.iter_mut() {
                         *p = mat_apply(&ctm, p.0, p.1);
                     }
-                    fill_poly(buf, w, h, &v, col);
+                    fill_poly_a(buf, w, h, &v, col, alpha);
                 }
             },
             "circle" | "ellipse" => {
@@ -848,7 +1180,7 @@ fn svg_render(text: &str, full: &str, base: Mat, buf: &mut [u32], w: u32, h: u32
                         verts.push(mat_apply(&ctm, cx + rx * cos(t), cy + ry * sin(t)));
                         a += 1;
                     }
-                    fill_poly(buf, w, h, &verts, col);
+                    fill_poly_a(buf, w, h, &verts, col, alpha);
                 }
             },
             "polygon" | "polyline" => {
@@ -859,9 +1191,10 @@ fn svg_render(text: &str, full: &str, base: Mat, buf: &mut [u32], w: u32, h: u32
                         verts.push(mat_apply(&ctm, svg_num(a), svg_num(b)));
                     }
                     if let Some(col) = fill {
-                        fill_poly(buf, w, h, &verts, col);
-                    } else if let Some(col) = stroke {
-                        stroke_path(buf, w, h, &verts, col);
+                        fill_poly_a(buf, w, h, &verts, col, alpha);
+                    }
+                    if let Some(col) = stroke {
+                        stroke_a(buf, w, h, &verts, col, sw, salpha);
                     }
                 }
             },
@@ -871,7 +1204,7 @@ fn svg_render(text: &str, full: &str, base: Mat, buf: &mut [u32], w: u32, h: u32
                         mat_apply(&ctm, attr(tag, "x1").map(svg_num).unwrap_or(0.0), attr(tag, "y1").map(svg_num).unwrap_or(0.0)),
                         mat_apply(&ctm, attr(tag, "x2").map(svg_num).unwrap_or(0.0), attr(tag, "y2").map(svg_num).unwrap_or(0.0)),
                     ];
-                    stroke_path(buf, w, h, &verts, col);
+                    stroke_a(buf, w, h, &verts, col, sw, salpha);
                 }
             },
             "path" => {
@@ -883,9 +1216,10 @@ fn svg_render(text: &str, full: &str, base: Mat, buf: &mut [u32], w: u32, h: u32
                             *pt = mat_apply(&ctm, pt.0, pt.1);
                         }
                         if let Some(col) = fill {
-                            fill_poly(buf, w, h, p, col);
-                        } else if let Some(col) = stroke {
-                            stroke_path(buf, w, h, p, col);
+                            fill_poly_a(buf, w, h, p, col, alpha);
+                        }
+                        if let Some(col) = stroke {
+                            stroke_a(buf, w, h, p, col, sw, salpha);
                         }
                     }
                 }
@@ -920,12 +1254,47 @@ fn container_inner(el: &str) -> Option<&str> {
 }
 
 fn stroke_path(px: &mut [u32], w: u32, h: u32, verts: &[(f64, f64)], color: u32) {
+    stroke_a(px, w, h, verts, color, 1.0, 1.0)
+}
+
+/// A stroke `width` pixels wide: hairlines for thin ones, a filled quad per
+/// segment with round joins otherwise.
+fn stroke_a(px: &mut [u32], w: u32, h: u32, verts: &[(f64, f64)], color: u32, width: f64, alpha: f32) {
+    if width <= 1.5 {
+        for seg in verts.windows(2) {
+            draw_line_a(px, w, h, seg[0], seg[1], color, alpha);
+        }
+        return;
+    }
+    let hw = width / 2.0;
     for seg in verts.windows(2) {
-        draw_line(px, w, h, seg[0], seg[1], color);
+        let (ax, ay) = seg[0];
+        let (bx, by) = seg[1];
+        let (dx, dy) = (bx - ax, by - ay);
+        let len = libm::sqrt(dx * dx + dy * dy);
+        if len < 1e-6 {
+            continue;
+        }
+        let (nx, ny) = (-dy / len * hw, dx / len * hw);
+        fill_poly_a(px, w, h, &[(ax + nx, ay + ny), (bx + nx, by + ny), (bx - nx, by - ny), (ax - nx, ay - ny)], color, alpha);
+    }
+    if width >= 3.0 {
+        for &(x, y) in verts {
+            let mut ring: Vec<(f64, f64)> = Vec::with_capacity(12);
+            for k in 0..12 {
+                let a = k as f64 / 12.0 * 6.2831853;
+                ring.push((x + hw * cos(a), y + hw * sin(a)));
+            }
+            fill_poly_a(px, w, h, &ring, color, alpha);
+        }
     }
 }
 
 fn draw_line(px: &mut [u32], w: u32, h: u32, a: (f64, f64), b: (f64, f64), color: u32) {
+    draw_line_a(px, w, h, a, b, color, 1.0)
+}
+
+fn draw_line_a(px: &mut [u32], w: u32, h: u32, a: (f64, f64), b: (f64, f64), color: u32, alpha: f32) {
     let dx = (b.0 - a.0).abs();
     let dy = (b.1 - a.1).abs();
     // Cap steps: a stroke coordinate far outside the (already small) canvas
@@ -938,7 +1307,8 @@ fn draw_line(px: &mut [u32], w: u32, h: u32, a: (f64, f64), b: (f64, f64), color
         let x = (a.0 + (b.0 - a.0) * u) as i32;
         let y = (a.1 + (b.1 - a.1) * u) as i32;
         if x >= 0 && y >= 0 && (x as u32) < w && (y as u32) < h {
-            px[(y as u32 * w + x as u32) as usize] = color;
+            let idx = (y as u32 * w + x as u32) as usize;
+            px[idx] = if alpha >= 1.0 { color } else { blend(px[idx], color, alpha) };
         }
         t += 1;
     }
@@ -989,4 +1359,102 @@ pub fn show_fullscreen(img: &Image) {
         }
         dy += 1;
     }
+}
+
+/// A JPEG (baseline or progressive, grey / YCbCr / CMYK) as opaque `0xFFRRGGBB`
+/// (zune-jpeg, no_std). Pictures over `max_side` px on a side are refused
+/// before decoding (a 2560 px photo is already ~26 MB of pixels here).
+pub fn decode_jpeg(data: &[u8], max_side: usize) -> Option<Image> {
+    use zune_core::colorspace::ColorSpace;
+    use zune_core::options::DecoderOptions;
+    if data.len() < 4 || data[0] != 0xFF || data[1] != 0xD8 {
+        return None;
+    }
+    let opts = DecoderOptions::default()
+        .set_max_width(max_side)
+        .set_max_height(max_side)
+        .set_strict_mode(false)
+        .jpeg_set_out_colorspace(ColorSpace::RGB);
+    let mut dec = zune_jpeg::JpegDecoder::new_with_options(data, opts);
+    let rgb = dec.decode().ok()?;
+    let info = dec.info()?;
+    let (w, h) = (info.width as usize, info.height as usize);
+    // grey pictures stay one byte a pixel whatever colour space is asked for
+    let comps = if w == 0 || h == 0 { 0 } else { rgb.len() / (w * h) };
+    if comps == 0 {
+        return None;
+    }
+    let mut px = Vec::with_capacity(w * h);
+    for p in rgb.chunks_exact(comps).take(w * h) {
+        px.push(if comps >= 3 {
+            0xFF00_0000 | (p[0] as u32) << 16 | (p[1] as u32) << 8 | p[2] as u32
+        } else {
+            0xFF00_0000 | (p[0] as u32) * 0x01_0101
+        });
+    }
+    Some(Image { w: w as u32, h: h as u32, px })
+}
+
+/// A picture from the web by its bytes (PNG, JPEG, SVG, BMP), `0xAARRGGBB`.
+pub fn decode_web(data: &[u8]) -> Option<Image> {
+    // a web picture of tens of megapixels would not fit the heap's largest block: refused unread
+    let fits = |w: u32, h: u32| w > 0 && h > 0 && (w as u64) * (h as u64) <= 8_000_000;
+    if data.len() >= 8 && data[..8] == [137, 80, 78, 71, 13, 10, 26, 10] {
+        if data.len() < 24 || !fits(be32(data, 16), be32(data, 20)) {
+            return None;
+        }
+        decode_png_rgba(data)
+    } else if data.len() >= 3 && data[0] == 0xFF && data[1] == 0xD8 {
+        decode_jpeg(data, 2800)
+    } else if data.len() >= 2 && &data[..2] == b"BM" {
+        let le = |o: usize| i32::from_le_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]]).unsigned_abs();
+        if data.len() < 26 || !fits(le(18), le(22)) {
+            return None;
+        }
+        decode_bmp_rgba(data)
+    } else if looks_svg(data) {
+        decode_svg_alpha(data, 1024)
+    } else {
+        None
+    }
+}
+
+/// A smoothly scaled copy (box filter when shrinking, nearest when growing),
+/// alpha kept.
+pub fn resize_rgba(src: &Image, w: u32, h: u32) -> Image {
+    let (w, h) = (w.max(1), h.max(1));
+    if src.w == 0 || src.h == 0 {
+        return Image { w, h, px: vec![0; (w * h) as usize] };
+    }
+    // Output rows are independent (each reads its own source box): bands of
+    // them over the cores. The buffer is allocated here, before the jobs.
+    let mut px = vec![0u32; (w * h) as usize];
+    let out = crate::par::Shared(px.as_mut_ptr());
+    let (chunks, per) = crate::par::row_chunks(h as usize, 8);
+    crate::par::for_each(chunks, &|c: usize| {
+        for y in (c * per) as u32..(((c + 1) * per) as u32).min(h) {
+            let y0 = (y as u64 * src.h as u64 / h as u64) as u32;
+            let y1 = (((y as u64 + 1) * src.h as u64 / h as u64) as u32).max(y0 + 1).min(src.h);
+            let dst = unsafe { core::slice::from_raw_parts_mut(out.get().add((y * w) as usize), w as usize) };
+            for x in 0..w {
+                let x0 = (x as u64 * src.w as u64 / w as u64) as u32;
+                let x1 = (((x as u64 + 1) * src.w as u64 / w as u64) as u32).max(x0 + 1).min(src.w);
+                let (mut a, mut r, mut g, mut b, mut n) = (0u32, 0u32, 0u32, 0u32, 0u32);
+                for sy in y0..y1 {
+                    let row = (sy * src.w) as usize;
+                    for sx in x0..x1 {
+                        let p = src.px[row + sx as usize];
+                        a += p >> 24;
+                        r += (p >> 16) & 255;
+                        g += (p >> 8) & 255;
+                        b += p & 255;
+                        n += 1;
+                    }
+                }
+                let n = n.max(1);
+                dst[x as usize] = (a / n) << 24 | (r / n) << 16 | (g / n) << 8 | b / n;
+            }
+        }
+    });
+    Image { w, h, px }
 }

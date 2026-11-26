@@ -1,0 +1,111 @@
+# Shared setup for every LingLin-Art-LLC repo that builds with the Ling toolchain.
+#
+#   - uses: LingLin-Art-LLC/ling/.github/actions/setup-ling@master
+#     with: { kernel: "true", lingfu: "true" }
+#
+# Lays the workspace out the way the projects expect on a developer machine, with every repo
+# side by side under $GITHUB_WORKSPACE:
+#   ling/                 the compiler + runtime (this repo)
+#   bring-browser/        \
+#   horizon-browser/       > path dependencies of ling/crates/ling-kernel (../../../<name>); cargo
+#   ling-messenger/       /  needs them on disk just to load the ling workspace, even for `--bin ling`
+# then builds `ling` (stable) and, when asked, `lingfu` and the pinned nightly that
+# `ling build --platform kernel|rpi` runs (`cargo +nightly ... -Z build-std`).
+#
+# Outputs: LING (path of the ling binary) and LINGFU (path of the lingfu binary, when built) are
+# exported to the environment of the steps that follow.
+name: Set up the Ling toolchain
+description: Check out ling + its sibling crates, build ling (and optionally lingfu / the kernel toolchain)
+inputs:
+  org:
+    description: GitHub owner of the Ling repos
+    default: LingLin-Art-LLC
+  ling-ref:
+    description: Branch / tag of the ling repo to build with
+    default: master
+  checkout-ling:
+    description: "false when the calling workflow IS the ling repo (already checked out at ./ling)"
+    default: "true"
+  kernel:
+    description: "true: install the pinned nightly (+rust-src, bare-metal targets) and the image tools (nasm, grub, xorriso, mtools, llvm)"
+    default: "false"
+  lingfu:
+    description: "true: also build the lingfu package manager (for `lingfu publish`)"
+    default: "false"
+  nightly:
+    description: >-
+      Nightly used for the kernels. Pinned because `ling build --platform kernel` hands cargo a custom
+      JSON target (x86_64-lingos.json) with only `-Z unstable-options`; newer nightlies want
+      `-Zjson-target-spec` as well. Bump together with ling/src/main.rs.
+    default: nightly-2026-08-24
+runs:
+  using: composite
+  steps:
+    - name: Check out ling
+      if: inputs.checkout-ling == 'true'
+      uses: actions/checkout@v4
+      with: { repository: "${{ inputs.org }}/ling", ref: "${{ inputs.ling-ref }}", path: ling }
+    - name: Check out bring-browser (ling-kernel path dependency)
+      uses: actions/checkout@v4
+      with: { repository: "${{ inputs.org }}/bring-browser", path: bring-browser }
+    - name: Check out horizon-browser (ling-kernel path dependency)
+      if: hashFiles('horizon-browser/Cargo.toml') == ''
+      uses: actions/checkout@v4
+      with: { repository: "${{ inputs.org }}/horizon-browser", path: horizon-browser }
+    - name: Check out ling-messenger (ling-kernel path dependency)
+      if: hashFiles('ling-messenger/Cargo.toml') == ''
+      uses: actions/checkout@v4
+      with: { repository: "${{ inputs.org }}/ling-messenger", path: ling-messenger }
+
+    - name: Linux packages (minifb X11/Wayland, cpal ALSA, udev)
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          libasound2-dev libudev-dev libxkbcommon-dev libwayland-dev xorg-dev pkg-config
+    - name: Image tools (kernel builds)
+      if: runner.os == 'Linux' && inputs.kernel == 'true'
+      shell: bash
+      run: |
+        sudo apt-get install -y --no-install-recommends \
+          nasm grub-pc-bin grub-efi-amd64-bin grub-common xorriso mtools dosfstools llvm \
+          binutils-aarch64-linux-gnu qemu-system-x86 qemu-system-arm python3
+    - name: "NASM (Windows, macOS: openh264 behind the web feature)"
+      if: runner.os != 'Linux'
+      uses: ilammy/setup-nasm@v1
+
+    - name: Rust stable
+      uses: dtolnay/rust-toolchain@stable
+    - name: Pinned nightly, installed as `nightly` (what ling build calls)
+      if: inputs.kernel == 'true'
+      shell: bash
+      run: |
+        rustup toolchain install "${{ inputs.nightly }}" --profile minimal --component rust-src \
+          --target x86_64-unknown-none,aarch64-unknown-none,x86_64-unknown-uefi
+        host=$(rustc -vV | sed -n 's/^host: //p')
+        tc="$HOME/.rustup/toolchains"
+        rm -rf "$tc/nightly-$host"
+        ln -s "$tc/${{ inputs.nightly }}-$host" "$tc/nightly-$host"
+        cargo +nightly -V
+    - uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: "ling -> target"
+        key: ${{ inputs.kernel }}-${{ inputs.lingfu }}
+
+    - name: Build ling (+ lingc)
+      shell: bash
+      working-directory: ling
+      run: cargo +stable build --release --bin ling --bin lingc
+    - name: Build lingfu
+      if: inputs.lingfu == 'true'
+      shell: bash
+      working-directory: ling
+      run: cargo +stable build --release -p lingfu --bin lingfu
+    - name: Export LING / LINGFU / LING_HOME
+      shell: bash
+      run: |
+        ext=""; [ "$RUNNER_OS" = "Windows" ] && ext=".exe"
+        echo "LING=$GITHUB_WORKSPACE/ling/target/release/ling$ext" >> "$GITHUB_ENV"
+        echo "LINGFU=$GITHUB_WORKSPACE/ling/target/release/lingfu$ext" >> "$GITHUB_ENV"
+        echo "LING_HOME=$GITHUB_WORKSPACE/ling" >> "$GITHUB_ENV"

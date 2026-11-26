@@ -29,7 +29,7 @@ features land.
 ### ling-audio
 - Per-source filters / EQ (only a master low-pass exists)
 - Doppler shift for moving sources; velocity-aware panning
-- True HRTF / binaural spatialization (currently equal-power pan + distance only)
+- Measured-HRIR (SOFA) convolution: `audio_hrtf(1)` uses a parametric spherical-head model (ITD, head shadow, pinna, rear, air)
 - Sidechain / ducking (e.g. duck music under SFX)
 - Convolution reverb (IR-based); per-send reverb/delay buses (currently master-only)
 - Pitch/rate control on sample voices (samples play at native pitch only)

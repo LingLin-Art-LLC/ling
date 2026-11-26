@@ -1,0 +1,14 @@
+[package]
+name = "ling-js"
+version = "0.1.0"
+edition = "2021"
+authors = ["Ling Lin <taellinglin@gmail.com>"]
+description = "LingJS: a JavaScript engine for Horizon and LingOS. Freestanding (no_std + alloc); bytecode VM, mark-sweep GC, resumable host calls (a script touching the page suspends the VM, the host answers, the VM resumes), so the same engine runs on the PC runtime and in the LingOS kernel."
+license = "MIT"
+
+[dependencies]
+# the only dependency: math functions without std (the kernel uses it already)
+libm = "0.2"
+
+[features]
+default = []

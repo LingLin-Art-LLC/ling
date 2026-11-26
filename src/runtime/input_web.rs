@@ -20,13 +20,65 @@ pub struct WasmPad {
 
 thread_local! {
     static PADS: RefCell<Vec<WasmPad>> = const { RefCell::new(Vec::new()) };
+    /// last frame's button flags per pad (for one-frame "pressed" edges)
+    static PREV: RefCell<Vec<[bool; 17]>> = const { RefCell::new(Vec::new()) };
+    /// pads forwarded by the page (`set_pad`): the game runs in a Web Worker, which
+    /// has no Gamepad API, so the page polls navigator.getGamepads() and posts them
+    static FORWARDED: RefCell<Vec<Option<WasmPad>>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Poll `navigator.getGamepads()` and update the thread-local snapshot.
+/// The page's latest state for pad `i` (`connected = false` when unplugged).
+pub fn set_pad(i: usize, connected: bool, values: &[f32], axes: &[f32]) {
+    FORWARDED.with(|f| {
+        let mut f = f.borrow_mut();
+        if f.len() <= i {
+            f.resize_with(i + 1, || None);
+        }
+        let mut p = WasmPad { connected, ..Default::default() };
+        for (k, v) in values.iter().take(17).enumerate() {
+            p.button_values[k] = *v;
+            p.buttons[k] = *v > 0.5;
+        }
+        for (k, v) in axes.iter().take(4).enumerate() {
+            p.axes[k] = *v;
+        }
+        f[i] = Some(p);
+    });
+}
+
+/// Advance one frame: remember last frame's buttons (for `pressed`), then take the
+/// pads the page forwarded (worker) or poll navigator.getGamepads() (main thread).
 /// Returns the number of connected gamepads.
 pub fn poll() -> usize {
-    let result = try_poll();
-    result.unwrap_or(0)
+    PADS.with(|c| {
+        let pads = c.borrow();
+        PREV.with(|p| {
+            let mut p = p.borrow_mut();
+            p.clear();
+            p.extend(pads.iter().map(|x| x.buttons));
+        });
+    });
+    let forwarded = FORWARDED.with(|f| f.borrow().iter().any(|x| x.is_some()));
+    if forwarded {
+        return FORWARDED.with(|f| {
+            let f = f.borrow();
+            PADS.with(|c| {
+                let mut pads = c.borrow_mut();
+                pads.clear();
+                pads.extend(f.iter().map(|x| x.clone().unwrap_or_default()));
+                pads.iter().filter(|p| p.connected).count()
+            })
+        });
+    }
+    try_poll().unwrap_or(0)
+}
+
+/// Button `name` went down this frame (held now, not last frame).
+pub fn pressed(pad: usize, name: &str) -> bool {
+    let Some(idx) = button_index(name) else { return false };
+    let now = button_down(pad, name);
+    let before = PREV.with(|p| p.borrow().get(pad).is_some_and(|b| b[idx]));
+    now && !before
 }
 
 fn try_poll() -> Option<usize> {

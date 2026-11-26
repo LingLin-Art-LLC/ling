@@ -51,6 +51,10 @@ pub fn delay_us(us: u64) {
     let target = unsafe { cntpct() } + us * unsafe { CNTFRQ } / 1_000_000;
     while unsafe { cntpct() } < target {
         unsafe { super::cpu::pause() };
+        // long waits (resets, link settling) keep the boot screen moving
+        if us >= 1000 {
+            crate::drivers::bootscreen::tick();
+        }
     }
 }
 
@@ -60,7 +64,32 @@ pub fn delay_us(us: u64) {
 /// in this kernel goes through this instead of an unbounded spin.
 pub fn poll_until(timeout_us: u64, mut cond: impl FnMut() -> bool) -> bool {
     let deadline = now_us() + timeout_us;
+    let mut idle_from = now_us();
     loop {
+        // Hand the CPU to another cooperative task at most every ~16 ms (the
+        // x86 backend's cadence): a blocked SSH read or chat accept in a
+        // background task must not stall the desktop's frame.
+        let t = now_us();
+        // A background task (the SSH server's or the chat listener's accept
+        // window) that has waited IDLE_YIELD_US with nothing arriving gives the
+        // CPU straight back: spinning out the whole cadence cost the desktop up
+        // to 16 ms per idle task per frame (two of them halved the frame rate).
+        // A busy transfer still gets the full cadence (its data keeps arriving
+        // within the window, so `idle_from` keeps resetting).
+        let bg_idle = t.wrapping_sub(idle_from) >= IDLE_YIELD_US && !crate::proc::sched::is_main();
+        if bg_idle || t.wrapping_sub(unsafe { LAST_YIELD_US }) >= YIELD_EVERY_US {
+            crate::proc::sched::yield_now();
+            idle_from = now_us();
+            // Coroutine-aware, gated on the green thread's own net
+            // transaction (see the x86 backend's comment): an isolate blocked
+            // in a fetch yields back to main so the desktop keeps drawing.
+            if crate::coro::in_coro() && crate::drivers::netstack::net_owned_by_me() {
+                crate::coro::yield_now();
+            }
+            // the boot screen animates from boot's waits
+            crate::drivers::bootscreen::tick();
+            unsafe { LAST_YIELD_US = now_us() };
+        }
         if cond() {
             return true;
         }
@@ -70,6 +99,11 @@ pub fn poll_until(timeout_us: u64, mut cond: impl FnMut() -> bool) -> bool {
         unsafe { super::cpu::pause() };
     }
 }
+
+const YIELD_EVERY_US: u64 = 4_000;
+/// How long a background task may wait for nothing before it yields (see `poll_until`).
+const IDLE_YIELD_US: u64 = 250;
+static mut LAST_YIELD_US: u64 = 0;
 
 /// Arm the physical timer (`CNTP_*_EL0`) to fire an IRQ `hz` times per
 /// second via the ARM-local per-core timer line (`intc::init` routes
@@ -82,6 +116,13 @@ pub fn start_periodic(hz: u32) {
         asm!("msr cntp_tval_el0, {}", in(reg) interval, options(nomem, nostack));
         asm!("msr cntp_ctl_el0, {}", in(reg) 1u64, options(nomem, nostack)); // ENABLE, unmasked
     }
+}
+
+/// Whether the physical timer has fired and not been re-armed (`CNTP_CTL_EL0.ISTATUS`).
+pub fn phys_pending() -> bool {
+    let ctl: u64;
+    unsafe { asm!("mrs {}, cntp_ctl_el0", out(reg) ctl, options(nomem, nostack)) };
+    ctl & 0b100 != 0
 }
 
 /// Re-arm the next tick — called from the IRQ handler after each fire.

@@ -16,6 +16,26 @@ pub unsafe fn wfe() {
     asm!("wfe", options(nomem, nostack));
 }
 
+/// Mask IRQs, returning the previous DAIF (for `irq_restore`).
+pub unsafe fn irq_save() -> u64 {
+    let flags: u64;
+    asm!("mrs {}, daif", out(reg) flags, options(nomem, nostack));
+    asm!("msr daifset, #2", options(nomem, nostack));
+    flags
+}
+
+/// Are IRQs unmasked? False inside an interrupt handler (the CPU masks them on entry).
+pub fn irqs_enabled() -> bool {
+    let daif: u64;
+    unsafe { asm!("mrs {}, daif", out(reg) daif, options(nomem, nostack)) };
+    daif & (1 << 7) == 0
+}
+
+/// Put DAIF back as `irq_save` found it.
+pub unsafe fn irq_restore(flags: u64) {
+    asm!("msr daif, {}", in(reg) flags, options(nomem, nostack));
+}
+
 /// Mask IRQs and FIQs (aarch64 equivalent of x86 `cli`).
 pub unsafe fn cli() {
     asm!("msr daifset, #3", options(nomem, nostack));

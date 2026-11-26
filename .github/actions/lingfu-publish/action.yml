@@ -1,0 +1,59 @@
+# Publish a Ling project to the lingfu registry (fu.ling-lang.org) from CI.
+#
+#   - uses: LingLin-Art-LLC/ling/.github/actions/lingfu-publish@master
+#     with: { project-dir: LingDev, version: "${{ github.ref_name }}", token: "${{ secrets.LINGFU_TOKEN }}" }
+#
+# Needs $LINGFU (setup-ling with lingfu: "true"). What it does is exactly `lingfu login` +
+# `lingfu publish`: a multipart POST to <registry>/api/v1/packages/publish with
+# `Authorization: Bearer lfu_...`, carrying a .tar.gz of the project folder minus ling.ignore and
+# .gitignore (and refusing key-looking files). Run it on a FRESH checkout, never in a folder that
+# holds build output. A version that already exists (HTTP 409) counts as done, so a re-run of a
+# release workflow does not fail.
+name: lingfu publish
+description: Publish the project to fu.ling-lang.org
+inputs:
+  project-dir:
+    description: Folder that holds the Ling manifest (Ling.toml / 灵符.toml / ...)
+    required: true
+  version:
+    description: Version to publish (a leading "v" is stripped); empty = the manifest's version
+    default: ""
+  token:
+    description: lingfu API key (create one at https://fu.ling-lang.org/me/keys); pass a secret
+    required: true
+  registry:
+    description: Registry base URL
+    default: https://fu.ling-lang.org
+runs:
+  using: composite
+  steps:
+    - name: lingfu publish
+      shell: bash
+      working-directory: ${{ inputs.project-dir }}
+      env:
+        LINGFU_TOKEN: ${{ inputs.token }}
+        LINGFU_REGISTRY: ${{ inputs.registry }}
+        VERSION_IN: ${{ inputs.version }}
+      run: |
+        if [ -z "$LINGFU_TOKEN" ]; then
+          echo "::warning::LINGFU_TOKEN is not set: skipping the lingfu publish"; exit 0
+        fi
+        # the key goes in on stdin, never on the command line (it would show in the process list).
+        # No --registry here: `lingfu login` takes its first non-flag argument as the key, so the URL
+        # would be saved as the key; LINGFU_REGISTRY (env, above) picks the registry instead.
+        printf '%s\n' "$LINGFU_TOKEN" | "$LINGFU" login >/dev/null
+        args=(publish)
+        v="${VERSION_IN#v}"
+        [ -n "$v" ] && args+=(--version "$v")
+        set +e
+        out=$("$LINGFU" "${args[@]}" 2>&1); rc=$?
+        set -e
+        echo "$out"
+        rm -f "$HOME/.lingfu/credentials.toml"
+        if [ $rc -ne 0 ]; then
+          if echo "$out" | grep -q '(409)'; then
+            echo "::notice::this version is already on lingfu"
+          else
+            exit $rc
+          fi
+        fi

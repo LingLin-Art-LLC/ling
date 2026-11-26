@@ -1,0 +1,13 @@
+[package]
+name = "ling-mpeg2"
+version = "2030.0.1"
+edition = "2021"
+authors = ["Ling Lin <taellinglin@gmail.com>"]
+description = "MPEG-1 / MPEG-2 video decoder for LingOS (Main profile, frame and field pictures, deinterlacing), freestanding (no_std + alloc)"
+license = "Apache-2.0 OR MIT"
+
+[dependencies]
+
+[lib]
+name = "ling_mpeg2"
+path = "src/lib.rs"

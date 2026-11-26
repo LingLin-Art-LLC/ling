@@ -95,6 +95,38 @@ fn fault_dump(vector: u8, name: &str, frame: &InterruptFrame, error_code: Option
         print_hex64("  cr2=", unsafe { cpu::read_cr2() });
     }
     print_hex64("  cr3=", unsafe { cpu::read_cr3() });
+    // who was running, and the code addresses on its stack (a backtrace without frame
+    // pointers: every qword in the kernel's .text range; symbolize with addr2line on an
+    // unstripped build -- the first few are the real callers)
+    crate::console_write(b"  task: ");
+    crate::console_write(crate::coro::current_name());
+    if let Some((lo, hi)) = crate::lingapp::app_stack() {
+        print_hex64("\n  app stack bottom=", lo);
+        print_hex64("  app stack top=", hi);
+    }
+    crate::console_write(b"\n  stack code addresses:");
+    let rsp = frame.rsp & !7;
+    let mut shown = 0;
+    if rsp > 0x10_0000 && rsp < 0x1_0000_0000 {
+        for k in 0..2048u64 {
+            let v = unsafe { core::ptr::read_volatile((rsp + k * 8) as *const u64) };
+            if v > 0x100_1000 && v < 0x800_0000 {
+                let mut buf = [b' '; 11];
+                for i in 0..8 {
+                    let nib = (v >> ((7 - i) * 4)) & 0xF;
+                    buf[3 + i] = if nib < 10 { b'0' + nib as u8 } else { b'a' + (nib - 10) as u8 };
+                }
+                buf[1] = b'0';
+                buf[2] = b'x';
+                crate::console_write(&buf);
+                shown += 1;
+                if shown >= 40 {
+                    break;
+                }
+            }
+        }
+    }
+    crate::console_write(b"\n");
 }
 
 fn fault_halt(vector: u8, name: &str, frame: &InterruptFrame, error_code: Option<u64>) -> ! {
@@ -199,7 +231,9 @@ fn drain_8042() {
         let byte = unsafe { io::inb(0x60) };
         if status & 0x20 != 0 {
             crate::drivers::mouse::irq_byte(byte);
-        } else {
+        } else if !crate::arch::xhci::usb_keyboard_live() {
+            // (with a live USB keyboard, bytes here are the firmware's PS/2
+            // emulation of that same keyboard: typing them too doubled keys)
             crate::drivers::keyboard::irq_scancode(byte);
         }
     }
@@ -213,13 +247,12 @@ fn drain_8042() {
 /// raising IRQ12 at all (see `drain_8042`'s doc) -- with a per-frame poll,
 /// input keeps flowing on any 8042, IRQ-generous or not.
 pub(crate) fn poll_drain_8042() {
-    unsafe {
-        core::arch::asm!("cli");
-    }
+    // restore the caller's IF rather than a blanket `sti`: a caller that
+    // already had interrupts off (an IrqLock section) must keep them off
+    let flags = unsafe { super::cpu::read_flags() };
+    unsafe { super::cpu::cli() };
     drain_8042();
-    unsafe {
-        core::arch::asm!("sti");
-    }
+    unsafe { super::cpu::write_flags(flags) };
 }
 
 extern "x86-interrupt" fn isr_keyboard(_frame: InterruptFrame) {
@@ -237,6 +270,11 @@ extern "x86-interrupt" fn isr_spurious(_frame: InterruptFrame) {
     // a legitimately spurious IRQ7/IRQ15, or a device never masked). EOI
     // unconditionally so the controller doesn't wedge; there is nothing
     // useful to dump since no specific device claims this vector.
+}
+
+/// The SMP "work is ready" IPI: waking the core from `hlt` is all it is for.
+extern "x86-interrupt" fn isr_smp_wake(_frame: InterruptFrame) {
+    super::smp::eoi();
 }
 
 pub fn init() {
@@ -287,7 +325,12 @@ pub fn init() {
     set_gate(pic::IRQ0_VECTOR, super::trap::timer_trap_entry as *const () as u64, gdt::TIMER_IST);
     set_gate(pic::IRQ0_VECTOR + 1, isr_keyboard as *const () as u64, 0);
     set_gate(pic::IRQ0_VECTOR + 12, isr_mouse as *const () as u64, 0);
+    set_gate(super::smp::WAKE_VECTOR, isr_smp_wake as *const () as u64, 0);
+    load();
+}
 
+/// Load the IDT on this core (the boot core from `init`, each other core from smp.rs).
+pub fn load() {
     #[repr(C, packed)]
     struct IdtPointer {
         limit: u16,

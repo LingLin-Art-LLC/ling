@@ -4,6 +4,30 @@ mod tests;
 
 use wasm_bindgen::prelude::*;
 
+/// Multithreaded build: `await initThreadPool(navigator.hardwareConcurrency)` before
+/// `run_program` starts rayon's Web Worker pool (the parallel rasteriser + post passes).
+#[cfg(all(target_arch = "wasm32", feature = "threads"))]
+pub use wasm_bindgen_rayon::init_thread_pool;
+
+/// The physical display size (device px) the page shows the game on — read by
+/// the `display_size()` builtin to size the UI layer for crisp pixel text.
+#[wasm_bindgen(js_name = "set_display")]
+pub fn set_display(w: f64, h: f64) {
+    #[cfg(target_arch = "wasm32")]
+    ling::gfx::wasm_set_display(w, h);
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = (w, h);
+}
+
+/// Resize the game's framebuffer (applied at the next frame boundary).
+#[wasm_bindgen(js_name = "resize_canvas")]
+pub fn resize_canvas(w: u32, h: u32) {
+    #[cfg(target_arch = "wasm32")]
+    ling::gfx::wasm_request_resize(w as usize, h as usize);
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = (w, h);
+}
+
 /// Initialise the rendering context on the given OffscreenCanvas.
 /// Must be called once before run_program.
 #[wasm_bindgen(js_name = "init_canvas")]
@@ -13,6 +37,26 @@ pub fn init_canvas(canvas: web_sys::OffscreenCanvas) {
     ling::gfx::webgl::init_canvas(canvas);
     #[cfg(not(target_arch = "wasm32"))]
     let _ = canvas;
+}
+
+/// Turn the WebGL2 triangle path on or off (default on; falls back to the CPU rasteriser by itself
+/// if the shaders don't compile). Call before `run_program`.
+#[wasm_bindgen(js_name = "set_gpu_scene")]
+pub fn set_gpu_scene(on: bool) {
+    #[cfg(target_arch = "wasm32")]
+    ling::gfx::webgl_scene::set_enabled(on);
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = on;
+}
+
+/// Gamepad `index` as the page sees it (the Gamepad API exists only on the page, not
+/// in the game's worker): button values 0..1 in W3C standard order, axes [lx, ly, rx, ry].
+#[wasm_bindgen(js_name = "set_gamepad")]
+pub fn set_gamepad(index: u32, connected: bool, buttons: Vec<f32>, axes: Vec<f32>) {
+    #[cfg(target_arch = "wasm32")]
+    ling::runtime::input_web_set_pad(index as usize, connected, &buttons, &axes);
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = (index, connected, buttons, axes);
 }
 
 /// Register a module source so that `use "path"` statements resolve on wasm32.
@@ -137,4 +181,37 @@ pub fn set_master_volume(volume: f32) {
     ling::gfx::wasm_set_master_volume(volume);
     #[cfg(not(target_arch = "wasm32"))]
     let _ = volume;
+}
+
+/// Hand a streamed asset's bytes to the runtime (answers an `asset_request`).
+#[wasm_bindgen(js_name = "register_asset")]
+pub fn register_asset(path: &str, bytes: &[u8]) {
+    ling::assets::put(path, bytes.to_vec());
+}
+
+/// Drop a streamed asset from memory (proximity eviction).
+#[wasm_bindgen(js_name = "drop_asset")]
+pub fn drop_asset(path: &str) {
+    ling::assets::remove(path);
+}
+
+/// Newline-separated paths the running program has requested since the last call.
+#[wasm_bindgen(js_name = "take_asset_requests")]
+pub fn take_asset_requests() -> String {
+    ling::assets::take_requests()
+}
+
+/// [count, bytes] currently resident.
+#[wasm_bindgen(js_name = "asset_stats")]
+pub fn asset_stats() -> Vec<f64> {
+    vec![ling::assets::count() as f64, ling::assets::bytes_total() as f64]
+}
+
+/// Typed, pasted or IME-composed text for `text_poll` (send "\u{8}" for Backspace).
+#[wasm_bindgen(js_name = "on_text_input")]
+pub fn on_text_input(text: &str) {
+    #[cfg(target_arch = "wasm32")]
+    ling::gfx::wasm_text_input(text);
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = text;
 }

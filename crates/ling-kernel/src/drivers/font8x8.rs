@@ -115,7 +115,7 @@ static FONT8X8_BASIC: [[u8; 8]; LAST - FIRST + 1] = [
     [0x6E,0x3B,0x00,0x00,0x00,0x00,0x00,0x00], // '~'
 ];
 
-fn glyph(c: u8) -> &'static [u8; 8] {
+pub fn glyph(c: u8) -> &'static [u8; 8] {
     static BLANK: [u8; 8] = [0; 8];
     let i = c as usize;
     if i < FIRST || i > LAST {
@@ -147,6 +147,23 @@ pub fn advance() -> u32 {
     8 * scale()
 }
 
+// x86_64 draws into the back buffer and `present()`s it; aarch64 (Raspberry Pi)
+// has no back-buffer compositor, so text goes straight to the live framebuffer.
+#[inline]
+fn put_pixel(x: u32, y: u32, color: u32) {
+    #[cfg(target_arch = "x86_64")]
+    framebuffer::back_set_pixel(x, y, color);
+    #[cfg(not(target_arch = "x86_64"))]
+    framebuffer::set_pixel(x, y, color);
+}
+#[inline]
+fn put_rect(x: u32, y: u32, w: u32, h: u32, color: u32) {
+    #[cfg(target_arch = "x86_64")]
+    framebuffer::back_fill_rect(x, y, w, h, color);
+    #[cfg(not(target_arch = "x86_64"))]
+    framebuffer::fill_rect(x, y, w, h, color);
+}
+
 pub fn draw_char(x: u32, y: u32, c: u8, fg: u32, bg: u32) {
     let s = unsafe { SCALE };
     if s > 1 {
@@ -157,7 +174,7 @@ pub fn draw_char(x: u32, y: u32, c: u8, fg: u32, bg: u32) {
     for (row, bits) in rows.iter().enumerate() {
         for col in 0..8u32 {
             let set = (bits >> col) & 1 != 0;
-            framebuffer::back_set_pixel(x + col, y + row as u32, if set { fg } else { bg });
+            put_pixel(x + col, y + row as u32, if set { fg } else { bg });
         }
     }
 }
@@ -170,6 +187,34 @@ pub fn draw_str(x: u32, y: u32, s: &[u8], fg: u32, bg: u32) {
     for (i, &c) in s.iter().enumerate() {
         draw_char(x + i as u32 * adv, y, c, fg, bg);
     }
+    // UTF-8 (file names, titles, messages in any script): the bytes above drew blank cells; draw
+    // those characters into them from the UI font (see `lingapp::utf8_cells_overlay`)
+    if s.iter().any(|&b| b >= 0x80) {
+        overlay_utf8(x, y, s, adv, 8 * scale(), fg, bg, usize::MAX);
+    }
+}
+
+/// The non-ASCII characters of a UTF-8 line drawn in `cell_w` x `cell_h` byte cells at `(x, y)`,
+/// anti-aliased against `bg`. Callers that draw text a byte at a time (terminal, editor) call this
+/// after their pass; ASCII cells are left as they are.
+pub fn overlay_utf8(x: u32, y: u32, s: &[u8], cell_w: u32, cell_h: u32, fg: u32, bg: u32, max_cells: usize) {
+    crate::lingapp::utf8_cells_overlay(s, cell_w as i32, cell_h as i32, max_cells, |dx, dy, cv| {
+        let (px, py) = (x as i32 + dx, y as i32 + dy);
+        if px < 0 || py < 0 {
+            return;
+        }
+        let c = if cv == 255 { fg } else { mix(bg, fg, cv as u32) };
+        put_pixel(px as u32, py as u32, c);
+    });
+}
+
+/// `a` blended toward `b` by `t`/255, per channel.
+fn mix(a: u32, b: u32, t: u32) -> u32 {
+    let ch = |s: u32| {
+        let (ca, cb) = ((a >> s) & 0xFF, (b >> s) & 0xFF);
+        ((ca * (255 - t) + cb * t) / 255) << s
+    };
+    ch(16) | ch(8) | ch(0)
 }
 
 /// Integer-scaled glyph: each source pixel becomes a `scale`x`scale` block.
@@ -187,7 +232,7 @@ pub fn draw_char_scaled(x: u32, y: u32, c: u8, fg: u32, bg: u32, scale: u32) {
     for (row, bits) in rows.iter().enumerate() {
         for col in 0..8u32 {
             let set = (bits >> col) & 1 != 0;
-            framebuffer::back_fill_rect(x + col * s, y + row as u32 * s, s, s, if set { fg } else { bg });
+            put_rect(x + col * s, y + row as u32 * s, s, s, if set { fg } else { bg });
         }
     }
 }

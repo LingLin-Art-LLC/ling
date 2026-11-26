@@ -94,9 +94,13 @@ using Panda3D's `/=`, which C++ implements as reciprocal-multiply.
   see `crates/ling-codegen/`), not the tree-walking interpreter (`ling run
   --interp`, kept as the semantic reference/fallback in `src/runtime/`), which
   is far slower and not what this suite measures.
-- On the JIT, Ling is ~1.7× slower than C and ~34× faster than CPython
-  (geometric mean) — competitive with Go and within reach of Rust/C++ on most
-  workloads.
+- On the JIT (run of 2026-11-12, ling 2030.1.53), Ling is ~4× slower than C
+  and ~15× faster than CPython (geometric mean). Tight integer loops
+  (`loop_sum`, `primes`, `crypto_lcg_stream`) run at native speed; recursion
+  (`fib`) and float-heavy loops (`leibniz`, `mandelbrot`) are 5–15× behind C.
+  The August 2026 run measured ~1.7× / ~34×: those workloads have regressed
+  since (both the 2026-11-01 and 2026-11-11 builds show it), so check the JIT
+  changes from late October before trusting these as a floor.
 - The gap to C/Rust is **smallest** on heavy-`sin` work (`fm_synth`), where
   everyone is bottlenecked on `libm` — and even shows mingw's `sin()` making
   C/C++ slower than Rust/Go here. The gap is **largest** on `fib`, where

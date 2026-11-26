@@ -13,9 +13,21 @@
 
 pub mod cpu;
 pub mod intc;
+pub mod gic;
+pub mod fdt;
+pub mod power;
 pub mod mailbox;
 pub mod mmio;
+pub mod rp1;
 pub mod timer;
+pub mod xhci;
+pub mod wifi;
+pub mod wpa;
+pub mod netdev;
+pub mod sdcard;
+pub mod rng;
+pub mod rp1_eth;
+pub mod hdmi_audio;
 pub mod paging;
 pub mod vectors;
 pub mod trap;

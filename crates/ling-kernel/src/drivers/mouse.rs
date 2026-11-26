@@ -106,6 +106,16 @@ pub(crate) fn irq_byte(byte: u8) {
     unsafe {
         BYTE_COUNT = BYTE_COUNT.wrapping_add(1);
         LAST_BYTE = byte;
+        // A packet's three bytes arrive within a couple of milliseconds; a
+        // partial packet older than that lost a byte (8042 overrun while
+        // interrupts were off). Start over instead of gluing the next
+        // packet's header onto it -- the bit-3 check below cannot catch a
+        // stale dx/dy byte that happens to have bit 3 set.
+        let now = crate::arch::timer::now_us();
+        if PACKET_IDX != 0 && now.wrapping_sub(LAST_BYTE_US) > 30_000 {
+            PACKET_IDX = 0;
+        }
+        LAST_BYTE_US = now;
         // Self-correcting framing: the first byte of a standard 3-byte packet
         // always has bit 3 ("always 1") set. If we're at packet-start and it
         // isn't, we're reading mid-packet after a dropped byte (the single-byte
@@ -138,6 +148,7 @@ pub fn resync() {
 
 static mut BYTE_COUNT: u32 = 0;
 static mut LAST_BYTE: u8 = 0;
+static mut LAST_BYTE_US: u64 = 0;
 
 /// Raw IRQ12 bytes received since boot -- diagnostic counter for verifying
 /// the interrupt path end-to-end (a cursor that doesn't move could be a
@@ -170,6 +181,57 @@ fn apply_packet(p: [u8; 3]) {
         // PS/2 reports +Y as "up"; screen/framebuffer +Y is "down".
         MOUSE_Y = (MOUSE_Y - dy).clamp(0, BOUND_H - 1);
         BUTTONS = flags & 0x07;
+        // move the on-screen pointer now, from the interrupt, not at the app's next frame
+        crate::drivers::cursor_overlay::moved(MOUSE_X, MOUSE_Y);
+    }
+}
+
+/// A USB mouse report (`arch::xhci`): relative motion with +Y already
+/// pointing down the screen, and the button bits in the same order.
+pub(crate) fn usb_report(dx: i32, dy: i32, buttons: u8) {
+    crate::drivers::keyboard::note_activity();
+    unsafe {
+        MOUSE_X = (MOUSE_X + dx).clamp(0, BOUND_W - 1);
+        MOUSE_Y = (MOUSE_Y + dy).clamp(0, BOUND_H - 1);
+        BUTTONS = buttons & 0x07;
+        crate::drivers::cursor_overlay::moved(MOUSE_X, MOUSE_Y);
+    }
+}
+
+/// A USB pen / absolute pointer report (`drivers::hiddigi`): `nx` / `ny` 0..1 across the screen. The pointer
+/// moves only while the pen is in range (a pen leaving reports 0, 0); the buttons always apply. Returns the
+/// position in screen pixels with its fraction, for pen samples.
+pub(crate) fn usb_abs(nx: f32, ny: f32, buttons: u8, in_range: bool) -> (f32, f32) {
+    crate::drivers::keyboard::note_activity();
+    unsafe {
+        let fx = nx.clamp(0.0, 1.0) * (BOUND_W - 1) as f32;
+        let fy = ny.clamp(0.0, 1.0) * (BOUND_H - 1) as f32;
+        if in_range {
+            MOUSE_X = (fx + 0.5) as i32;
+            MOUSE_Y = (fy + 0.5) as i32;
+            crate::drivers::cursor_overlay::moved(MOUSE_X, MOUSE_Y);
+        }
+        BUTTONS = buttons & 0x07;
+        (fx, fy)
+    }
+}
+
+/// The pointer bounds (`set_bounds`): the screen's width and height.
+pub fn bounds() -> (i32, i32) {
+    unsafe { (BOUND_W, BOUND_H) }
+}
+
+/// A pen's pointer (`drivers::pen`): (`x`, `y`) in screen pixels, already through the pen's click logic
+/// (tap freeze, double-tap snap). The pointer moves only while the pen is `near`; the buttons always apply.
+pub(crate) fn pen_abs(x: f32, y: f32, buttons: u8, near: bool) {
+    crate::drivers::keyboard::note_activity();
+    unsafe {
+        if near {
+            MOUSE_X = ((x + 0.5) as i32).clamp(0, BOUND_W - 1);
+            MOUSE_Y = ((y + 0.5) as i32).clamp(0, BOUND_H - 1);
+            crate::drivers::cursor_overlay::moved(MOUSE_X, MOUSE_Y);
+        }
+        BUTTONS = buttons & 0x07;
     }
 }
 

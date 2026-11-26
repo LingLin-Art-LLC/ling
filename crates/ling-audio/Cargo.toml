@@ -1,6 +1,6 @@
 [package]
 name = "ling-audio"
-version = "2030.0.12"
+version = "2030.0.13"
 edition = "2021"
 authors = ["Ling Lin <taellinglin@gmail.com>", "Sanny Lin <SannyLing53@gmail.com>"]
 description = "4D positional audio synthesis and WAV BGM for Ling"
@@ -13,6 +13,7 @@ cpal     = "0.15"
 hound    = "3.5"
 half     = "2"
 rustfft  = "6.2"
+lewton   = "0.10"   # Ogg Vorbis BGM (load_wav dispatches on the .ogg extension)
 
 [lib]
 name = "ling_audio"

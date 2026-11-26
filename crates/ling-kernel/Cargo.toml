@@ -1,6 +1,6 @@
 [package]
 name = "ling-kernel"
-version = "2030.1.36"
+version = "2030.1.37"
 edition = "2021"
 license = "Apache-2.0 OR MIT"
 description = "Minimal kernel runtime for Ling — no_std CPU intrinsics, VGA, serial, and boot support"
@@ -26,6 +26,32 @@ request_framebuffer = []
 # needs a `cc` cross-compiler that doesn't exist for this bare-metal
 # target — confirmed by an actual failed RPi build). Slower, portably
 # correct on every architecture instead.
+ling-osdaw = { path = "../ling-osdaw", version = "2030.0.2" }
+# LingStationX's 34 insert / master effects (EQ, Compressor, Reverb ... Ling Master): ling-daw's own
+# effect DSP as no_std + alloc (generated from ling-daw/src/dsp), run by lingdaw.rs.
+ling-fxcore = { path = "../ling-fxcore" }
+# Horizon's video player (drivers/videoplay.rs): YouTube's DASH streams demuxed
+# and decoded on LingOS itself -- MP4 / sidx / fragments, H.264, AAC. All three
+# are freestanding (no_std + alloc).
+ling-mp4 = { path = "../ling-mp4" }
+ling-h264 = { path = "../ling-h264" }
+ling-aac = { path = "../ling-aac" }
+# Local media files (drivers/mediaplay.rs): Matroska / WebM, MPEG-2 video (DVD rips), MPEG audio (MP2 / MP3).
+ling-mkv = { path = "../ling-mkv" }
+ling-mpeg2 = { path = "../ling-mpeg2" }
+ling-mpa = { path = "../ling-mpa" }
+# Pure-Rust no_std maths (sin/cos/pow/log10/exp/floor…) for the Ling value
+# runtime (`lingrt`) — compiled `.ling` code calls these through the AOT ABI.
+libm = "0.2"
+# Vectors / matrices / quaternions (no_std via libm) for glTF skinning (drivers/gltf.rs).
+glam = { version = "0.33", default-features = false, features = ["libm"] }
+# TrueType/OpenType rasteriser (no_std + alloc) for the app runtime's px_text:
+# draws compiled apps' own fonts (embedded via [includes]) with host metrics.
+fontdue = { version = "0.9", default-features = false, features = ["hashbrown"] }
+# project.json for the in-kernel DAW engine (lingdaw): the same serde types as
+# ling-daw's project.rs, no_std + alloc.
+serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
+serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
 blake3 = { version = "1.5", default-features = false, features = ["pure"] }
 
 # Ed25519 signature *verification* only (no `alloc`, no `rand_core`/`std`,
@@ -52,6 +78,23 @@ ed25519-dalek = { version = "2.2", default-features = false }
 # AES-GCM) because it's pure software -- no AES-NI dependency.
 sha2 = { version = "0.10", default-features = false }
 hmac = { version = "0.12", default-features = false }
+# WPA2 4-way handshake in the kernel (arch/aarch64/wpa.rs): PBKDF2/PRF/MIC are
+# HMAC-SHA1, the group key arrives AES-key-wrapped.
+sha1 = { version = "0.10", default-features = false }
+# LingSockets (lingsock.rs): RSA-OAEP for Discord's QR sign-in (no_std, alloc)
+rsa = { version = "0.9", default-features = false, features = ["u64_digit"] }
+# TLS certificate checking (x509.rs): ECDSA P-256 / P-384 signatures (api.anthropic.com's chain is
+# Google Trust Services: P-256 leaf + WE1, P-384 GTS Root R4). Same versions ling-fido already uses.
+p256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
+p384 = { version = "0.13", default-features = false, features = ["ecdsa"] }
+rand_core = { version = "0.6", default-features = false }
+aes = { version = "0.8", default-features = false }
+# Security keys at sign-in (fs/seckey.rs): CTAPHID + FIDO U2F + P-256 ECDSA checks, no_std + alloc.
+ling-fido = { path = "../ling-fido", version = "2030.0.1" }
+# Bluetooth host stack (HCI, Intel firmware download, L2CAP, HID, SBC), sans-IO: drivers/bluetooth.rs drives it.
+ling-bt = { path = "../ling-bt", version = "2030.0.1" }
+# Account passwords: Argon2id (fs/users.rs), pure Rust, no_std + alloc.
+argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
 hkdf = { version = "0.12", default-features = false }
 chacha20poly1305 = { version = "0.10", default-features = false }
 # Raw ChaCha20 (legacy 64-bit-nonce variant) + Poly1305 for the SSH server's
@@ -66,13 +109,16 @@ x25519-dalek = { version = "2.0", default-features = false, features = ["static_
 # PNG decode: DEFLATE/zlib inflate, no_std + alloc (no std, no C). PNG chunk
 # parsing + scanline unfiltering are done in-tree (drivers/image.rs).
 miniz_oxide = { version = "0.8", default-features = false, features = ["with-alloc"] }
+# JPEG pictures (web images, YouTube thumbnails, the media helper's video frames): no_std, baseline + progressive
+zune-jpeg = { version = "0.4", default-features = false }
+zune-core = { version = "0.4", default-features = false }
 
 # The browser's layout engine ("bring": browser-in-ling) -- its own
 # package/repo (../../../bring-browser) so it host-tests with plain
 # `cargo test` and stays reusable outside the kernel. no_std, zero deps,
 # pure functions: HTML-subset in, styled wrapped lines + a link table
 # out. The kernel side (drivers/browser.rs) only fetches, scrolls, draws.
-bring-browser = { path = "../../../bring-browser" }
+bring-browser = { path = "../../../bring-browser", version = "0.1.0" }
 
 # horizon: LingOS's second web engine, sibling to bring-browser -- a real
 # DOM + CSS box-model layout with a <canvas> 2D surface, producing a pixel
@@ -80,7 +126,7 @@ bring-browser = { path = "../../../bring-browser" }
 # and dynamic display list don't fit fixed buffers the way bring's do),
 # zero third-party deps. The kernel side (drivers/horizon.rs) only
 # fetches, scrolls, draws -- same division of labor as bring-browser.
-horizon-browser = { path = "../../../horizon-browser" }
+horizon-browser = { path = "../../../horizon-browser", version = "0.1.0" }
 
 # ling-messenger: P2P end-to-end-encrypted chat core -- identity, an
 # authenticated handshake, and encrypted framing. no_std + alloc, real
@@ -89,7 +135,29 @@ horizon-browser = { path = "../../../horizon-browser" }
 # does LAN discovery, UDP I/O, and the desktop UI -- see its own README
 # for exactly what security properties the handshake does and doesn't
 # provide.
-ling-messenger = { path = "../../../ling-messenger" }
+ling-messenger = { path = "../../../ling-messenger", version = "0.2.0" }
+
+# Qwen3 inference, freestanding (no_std + alloc + libm): the `ask` command and the model task in drivers/llm.rs. The weights live on a
+# raw second IDE disk (see live/make-model-disk.py in LingOS), so the kernel image itself stays small.
+ling-llm = { path = "../ling-llm", version = "2030.0.2" }
+
+# Stable Diffusion 1.5 on the CPU, freestanding (no_std + alloc + libm): the lingdiffusion app's local engine (drivers/diffusion.rs).
+# The checkpoint is read from a FAT volume at run time; nothing of it is in the image.
+ling-sd = { path = "../ling-sd", version = "2030.0.1" }
+
+# Ling Wallet builtins (walletrt.rs): the LW-1 primitives + HyperTorus PoW,
+# no_std + alloc (entropy comes from the hardware RNG via
+# rng::set_entropy_source). bip39 = the wallet's 24-word recovery phrase,
+# base64 = base64url_* with the host's exact engine config, blake2 = the
+# chunked-memory Argon2id (Argon2's own hash; already in the tree via argon2).
+ling-crypto = { path = "../ling-crypto", default-features = false, features = ["alloc"] }
+bip39 = { version = "2", default-features = false, features = ["alloc"] }
+base64 = { version = "0.22", default-features = false, features = ["alloc"] }
+blake2 = { version = "0.10", default-features = false }
+
+# LingAnime's paint / 2.5D engine (the art_* builtins, drivers/artpaint.rs), no_std + alloc: files, the clock
+# and parallel loops come from the kernel through ling_paint::os::set_host.
+ling-paint = { path = "../ling-paint", default-features = false }
 
 [profile.release]
 lto = "fat"

@@ -48,8 +48,40 @@ fn derive_secret(secret: &[u8; 32], label: &[u8], transcript: &[u8; 32]) -> [u8;
     out
 }
 
+/// Where a session's bytes go: the legacy client socket (`netstack::tcp_write`
+/// / `tcp_read_some`), or a socket handle of its own (`lingsock`'s streams, any
+/// number at once). Writes are split into segments the socket takes
+/// (`tcp_write_h` refuses anything over its MSS).
+#[derive(Clone, Copy)]
+pub(crate) enum Io {
+    Legacy,
+    H(usize),
+}
+
+impl Io {
+    pub(crate) fn write(self, data: &[u8]) -> bool {
+        for c in data.chunks(1400) {
+            let ok = match self {
+                Io::Legacy => netstack::tcp_write(c),
+                Io::H(h) => netstack::tcp_write_h(h, c),
+            };
+            if !ok {
+                return false;
+            }
+        }
+        true
+    }
+
+    pub(crate) fn read(self, sink: &mut [u8], budget_us: u64) -> usize {
+        match self {
+            Io::Legacy => netstack::tcp_read_some(sink, budget_us),
+            Io::H(h) => netstack::tcp_read_h(h, sink, budget_us),
+        }
+    }
+}
+
 /// A directional traffic key set + record sequence counter.
-struct Keys {
+pub(crate) struct Keys {
     key: [u8; 32],
     iv: [u8; 12],
     seq: u64,
@@ -75,7 +107,7 @@ fn record_nonce(iv: &[u8; 12], seq: u64) -> [u8; 12] {
 /// Decrypt one TLS 1.3 application_data record in place. `hdr` is the 5-byte
 /// record header (the AEAD's AAD); `body` is ciphertext||tag(16). On success
 /// returns (inner_content_type, plaintext_len) with the plaintext at body[..len].
-fn decrypt_record(keys: &mut Keys, hdr: &[u8; 5], body: &mut [u8]) -> Option<(u8, usize)> {
+pub(crate) fn decrypt_record(keys: &mut Keys, hdr: &[u8; 5], body: &mut [u8]) -> Option<(u8, usize)> {
     if body.len() < 16 {
         return None;
     }
@@ -100,7 +132,7 @@ fn decrypt_record(keys: &mut Keys, hdr: &[u8; 5], body: &mut [u8]) -> Option<(u8
 
 /// Encrypt `data` as a TLS 1.3 record of inner type `ct` into `out` (which must
 /// hold 5 + data.len() + 1 + 16 bytes). Returns the total record length.
-fn encrypt_record(keys: &mut Keys, ct: u8, data: &[u8], out: &mut [u8]) -> usize {
+pub(crate) fn encrypt_record(keys: &mut Keys, ct: u8, data: &[u8], out: &mut [u8]) -> usize {
     let inner_len = data.len() + 1;
     let rec_len = inner_len + 16;
     out[0] = 0x17;
@@ -197,7 +229,7 @@ fn build_client_hello(host: &str, pubkey: &[u8; 32], out: &mut [u8]) -> (usize, 
     n += 8;
 
     // signature_algorithms (server needs one to sign its CertificateVerify)
-    let algos: [u16; 6] = [0x0403, 0x0804, 0x0807, 0x0401, 0x0805, 0x0501];
+    let algos: [u16; 7] = [0x0403, 0x0503, 0x0804, 0x0807, 0x0401, 0x0805, 0x0501];
     out[n] = 0x00;
     out[n + 1] = 0x0d;
     n += 2;
@@ -394,6 +426,42 @@ pub fn https_get(host: &str, port: u16, path: &str, out: &mut [u8], log: &mut dy
     Ok(total)
 }
 
+/// Any HTTP method with an optional body over a fresh TLS session (programs'
+/// `http_get` / `http_post_async`): the whole response (headers + body) lands
+/// in `out`, like `https_get`. The request is sent in `chunk`-byte records
+/// (the record buffer is small).
+pub fn https_request(
+    host: &str,
+    port: u16,
+    method: &str,
+    path: &str,
+    content_type: &str,
+    extra: &str,
+    body: &[u8],
+    out: &mut [u8],
+    chunk: usize,
+    log: &mut dyn FnMut(&[u8]),
+) -> Result<usize, &'static str> {
+    let _net = netstack::NetGuard::new();
+    let (mut c_app, mut s_app, pos, rxlen) = tls_handshake(host, port, log)?;
+    let tx = unsafe { &mut *&raw mut TXBUF };
+    let rx = unsafe { &mut *&raw mut RX };
+    let mut req = alloc::format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nUser-Agent: LingOS\r\n{extra}").into_bytes();
+    if !body.is_empty() {
+        req.extend_from_slice(alloc::format!("Content-Type: {content_type}\r\nContent-Length: {}\r\n", body.len()).as_bytes());
+    }
+    req.extend_from_slice(b"\r\n");
+    req.extend_from_slice(body);
+    for piece in req.chunks(chunk.clamp(256, 3800)) {
+        let m = encrypt_record(&mut c_app, 0x17, piece, tx);
+        if !Io::Legacy.write(&tx[..m]) {
+            return Err("write request failed");
+        }
+    }
+    let (total, _p, _r) = read_response(&mut s_app, rx, pos, rxlen, out, false);
+    Ok(total)
+}
+
 /// Run a full TLS 1.3 handshake to `host:port` and derive application traffic
 /// keys. Returns `(client_app_keys, server_app_keys, pos, rxlen)` where
 /// pos/rxlen mark bytes already buffered in the static RX after the handshake.
@@ -403,16 +471,60 @@ fn tls_handshake(host: &str, port: u16, log: &mut dyn FnMut(&[u8])) -> Result<(K
     if !netstack::tcp_connect(ip, port) {
         return Err("connect failed");
     }
+    let tx = unsafe { &mut *&raw mut TXBUF };
+    let rx = unsafe { &mut *&raw mut RX };
+    handshake_io(Io::Legacy, host, tx, rx, log)
+}
 
+/// The TLS 1.3 handshake over an already connected socket. `tx` holds at least
+/// 4 KiB, `rx` is the receive buffer; on success the returned pos/rxlen mark
+/// application bytes already in `rx` after the server's Finished.
+pub(crate) fn handshake_io(
+    io: Io,
+    host: &str,
+    tx: &mut [u8],
+    rx: &mut [u8],
+    log: &mut dyn FnMut(&[u8]),
+) -> Result<(Keys, Keys, usize, usize), &'static str> {
+    handshake_io_opts(io, host, tx, rx, log, false)
+}
+
+/// Why the last verified handshake was refused (for the caller's message).
+static mut VERIFY_ERR: Option<alloc::string::String> = None;
+
+pub(crate) fn last_verify_error() -> alloc::string::String {
+    unsafe { (*(&raw const VERIFY_ERR)).clone().unwrap_or_default() }
+}
+
+/// The handshake with `verify`: the server's certificate chain must lead to a
+/// bundled root (x509.rs), name `host` and be in date; its CertificateVerify must
+/// be signed by the leaf's key over this handshake's transcript; and its Finished
+/// must check out. Without `verify` (Horizon's sites for now) none of that is
+/// checked -- see the module note.
+pub(crate) fn handshake_io_opts(
+    io: Io,
+    host: &str,
+    tx: &mut [u8],
+    rx: &mut [u8],
+    log: &mut dyn FnMut(&[u8]),
+    verify: bool,
+) -> Result<(Keys, Keys, usize, usize), &'static str> {
+    unsafe { VERIFY_ERR = None };
+    let mut certs: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::new();
+    let mut cv_ok = false;
+    let mut s_hs_secret = [0u8; 32];
+    let fail = |why: alloc::string::String| -> &'static str {
+        unsafe { VERIFY_ERR = Some(why) };
+        "the server's certificate did not check out"
+    };
     let mut secret = [0u8; 32];
     if !random_bytes(&mut secret) {
         return Err("no entropy (RDRAND)");
     }
     let pubkey = x25519_public(secret);
 
-    let tx = unsafe { &mut *&raw mut TXBUF };
     let (ch_rec, ch_off, ch_len) = build_client_hello(host, &pubkey, tx);
-    if !netstack::tcp_write(&tx[..ch_rec]) {
+    if !io.write(&tx[..ch_rec]) {
         return Err("write ClientHello failed");
     }
     log(b"tls: ClientHello sent\n");
@@ -421,9 +533,8 @@ fn tls_handshake(host: &str, port: u16, log: &mut dyn FnMut(&[u8])) -> Result<(K
     let mut transcript = Sha256::new();
     transcript.update(&tx[ch_off..ch_off + ch_len]);
 
-    // Read the server's first flight into RX.
-    let rx = unsafe { &mut *&raw mut RX };
-    let mut rxlen = netstack::tcp_read_some(rx, 8_000_000);
+    // Read the server's first flight into rx.
+    let mut rxlen = io.read(rx, 8_000_000);
     if rxlen == 0 {
         return Err("no ServerHello");
     }
@@ -456,7 +567,7 @@ fn tls_handshake(host: &str, port: u16, log: &mut dyn FnMut(&[u8])) -> Result<(K
                 rxlen -= pos;
                 pos = 0;
             }
-            let n = netstack::tcp_read_some(&mut rx[rxlen..], 6_000_000);
+            let n = io.read(&mut rx[rxlen..], 6_000_000);
             if n == 0 {
                 log_trunc(log, b"trunc-hdr", 0, 0, rxlen, pos);
                 return Err("truncated handshake");
@@ -479,7 +590,7 @@ fn tls_handshake(host: &str, port: u16, log: &mut dyn FnMut(&[u8])) -> Result<(K
                     return Err("record too large");
                 }
             }
-            let n = netstack::tcp_read_some(&mut rx[rxlen..], 6_000_000);
+            let n = io.read(&mut rx[rxlen..], 6_000_000);
             if n == 0 {
                 log_trunc(log, b"trunc-rec", rtype as usize, rlen, rxlen, pos);
                 return Err("truncated record");
@@ -516,6 +627,7 @@ fn tls_handshake(host: &str, port: u16, log: &mut dyn FnMut(&[u8])) -> Result<(K
             server_hs = Some(traffic_keys(&s_hs));
             client_hs = Some(traffic_keys(&c_hs));
             c_hs_secret = c_hs;
+            s_hs_secret = s_hs;
             pos = body_end;
             continue;
         }
@@ -548,6 +660,54 @@ fn tls_handshake(host: &str, port: u16, log: &mut dyn FnMut(&[u8])) -> Result<(K
                 }
                 let mtype = hs_acc[hp];
                 let msg = &hs_acc[hp..hp + 4 + mlen];
+                if verify && mtype == 0x0B {
+                    // Certificate: request_context<0..255>, certificate_list<0..2^24-1> of
+                    // { cert_data<1..2^24-1>, extensions<0..2^16-1> }
+                    let b = &msg[4..];
+                    let ctx = *b.first().unwrap_or(&0) as usize;
+                    let mut p = 1 + ctx + 3;
+                    while p + 3 <= b.len() {
+                        let cl = ((b[p] as usize) << 16) | ((b[p + 1] as usize) << 8) | b[p + 2] as usize;
+                        p += 3;
+                        if p + cl + 2 > b.len() {
+                            break;
+                        }
+                        certs.push(b[p..p + cl].to_vec());
+                        p += cl;
+                        let el = ((b[p] as usize) << 8) | b[p + 1] as usize;
+                        p += 2 + el;
+                    }
+                    let refs: alloc::vec::Vec<&[u8]> = certs.iter().map(|c| c.as_slice()).collect();
+                    match crate::x509::verify_chain(&refs, host, crate::clock::unix_now() as i64) {
+                        Ok(root) => log(alloc::format!("tls: {host}'s certificate checks out (root {root})\n").as_bytes()),
+                        Err(e) => return Err(fail(e)),
+                    }
+                }
+                if verify && mtype == 0x0F {
+                    // CertificateVerify: signed over the transcript up to (not including) itself
+                    let th: [u8; 32] = transcript.clone().finalize().into();
+                    let b = &msg[4..];
+                    if b.len() < 4 || certs.is_empty() {
+                        return Err(fail(alloc::string::String::from("no certificate before the CertificateVerify")));
+                    }
+                    let scheme = ((b[0] as u16) << 8) | b[1] as u16;
+                    let sl = ((b[2] as usize) << 8) | b[3] as usize;
+                    let Some(leaf) = crate::x509::Cert::parse(&certs[0]) else { return Err(fail(alloc::string::String::from("unreadable leaf certificate"))) };
+                    if b.len() < 4 + sl || !crate::x509::verify_certificate_verify(&leaf, scheme, &th, &b[4..4 + sl]) {
+                        return Err(fail(alloc::format!("the server's handshake signature (scheme {scheme:#06x}) is wrong")));
+                    }
+                    cv_ok = true;
+                }
+                if verify && mtype == 0x14 {
+                    // server Finished = HMAC(finished_key(s hs traffic), transcript before it)
+                    let th: [u8; 32] = transcript.clone().finalize().into();
+                    let mut fkey = [0u8; 32];
+                    hkdf_expand_label(&s_hs_secret, b"finished", &[], &mut fkey);
+                    let want = hmac_sha256(&fkey, &th);
+                    if !cv_ok || msg.len() != 4 + 32 || msg[4..] != want {
+                        return Err(fail(alloc::string::String::from(if cv_ok { "the server's Finished does not match" } else { "the server skipped its certificate" })));
+                    }
+                }
                 // Server Finished is type 0x14.
                 if mtype == 0x14 {
                     // th up to and including server Finished -> app secrets.
@@ -598,9 +758,9 @@ fn tls_handshake(host: &str, port: u16, log: &mut dyn FnMut(&[u8])) -> Result<(K
         finmsg[3] = 32;
         finmsg[4..36].copy_from_slice(&verify);
         // Dummy ChangeCipherSpec (middlebox compatibility), then the Finished.
-        let _ = netstack::tcp_write(&[0x14, 0x03, 0x03, 0x00, 0x01, 0x01]);
+        let _ = io.write(&[0x14, 0x03, 0x03, 0x00, 0x01, 0x01]);
         let m = encrypt_record(c_hs_keys, 0x16, &finmsg, tx);
-        if !netstack::tcp_write(&tx[..m]) {
+        if !io.write(&tx[..m]) {
             return Err("write Finished failed");
         }
     }
@@ -852,4 +1012,300 @@ fn parse_content_length(headers: &[u8]) -> Option<usize> {
         i += 1;
     }
     None
+}
+
+// -- Streaming GET: bodies of any size, record by record --------------------
+// `https_get` lands the whole response in one buffer, which caps a download at
+// whatever the caller can allocate (the kernel heap's largest block is 64 MiB).
+// The package installer needs 100+ MB, so this variant hands each decrypted
+// piece of the BODY to a sink as it arrives: HTTP headers are parsed and
+// stripped (status, Content-Length, Content-Range, chunked transfer-encoding),
+// and nothing larger than one TLS record is ever buffered.
+
+/// What a streamed response said about itself.
+#[derive(Clone, Copy, Default)]
+pub struct StreamInfo {
+    /// HTTP status code (0 if no status line arrived).
+    pub status: u16,
+    /// `Content-Length`, when the server sent one.
+    pub content_length: Option<u64>,
+    /// The total size after the `/` of a `Content-Range` (a range request's
+    /// full resource size).
+    pub range_total: Option<u64>,
+    /// Body bytes delivered to the sink.
+    pub body_bytes: u64,
+    /// The body ended where the framing said it would (Content-Length reached,
+    /// last chunk seen, or -- with neither -- the peer closed cleanly).
+    pub complete: bool,
+    /// Why reading stopped ("done", "peer closed", "stalled", "decrypt
+    /// failed", ...), for a caller deciding whether to resume.
+    pub end: &'static str,
+}
+
+fn header_value<'a>(headers: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
+    for line in headers.split(|&b| b == b'\n') {
+        if line.len() > key.len() && line[..key.len()].eq_ignore_ascii_case(key) && line[key.len()] == b':' {
+            let mut v = &line[key.len() + 1..];
+            while let [b' ' | b'\t', rest @ ..] = v {
+                v = rest;
+            }
+            while let [rest @ .., b'\r' | b' ' | b'\t'] = v {
+                v = rest;
+            }
+            return Some(v);
+        }
+    }
+    None
+}
+
+fn parse_u64(v: &[u8]) -> Option<u64> {
+    let mut n: u64 = 0;
+    let mut any = false;
+    for &b in v {
+        if !b.is_ascii_digit() {
+            break;
+        }
+        n = n.checked_mul(10)?.checked_add((b - b'0') as u64)?;
+        any = true;
+    }
+    any.then_some(n)
+}
+
+/// Chunked transfer-encoding decoder state.
+enum Chunk {
+    /// Reading the hex size line (value so far, saw a `;` extension).
+    Size(u64, bool),
+    /// In chunk data with this many bytes left.
+    Data(u64),
+    /// Expecting the CRLF after chunk data.
+    DataEnd,
+    /// After the 0-size chunk: trailers until an empty line.
+    Trailer(bool),
+    Done,
+}
+
+struct BodyState<'s> {
+    hdr: alloc::vec::Vec<u8>,
+    in_body: bool,
+    chunked: Option<Chunk>,
+    info: StreamInfo,
+    aborted: bool,
+    head: &'s mut dyn FnMut(&StreamInfo) -> bool,
+    sink: &'s mut dyn FnMut(&[u8]) -> bool,
+}
+
+impl BodyState<'_> {
+    fn deliver(&mut self, data: &[u8]) {
+        if data.is_empty() || self.aborted {
+            return;
+        }
+        let mut d = data;
+        if let Some(cl) = self.info.content_length {
+            if self.chunked.is_none() {
+                let left = cl.saturating_sub(self.info.body_bytes);
+                d = &d[..(d.len() as u64).min(left) as usize];
+            }
+        }
+        self.info.body_bytes += d.len() as u64;
+        if !d.is_empty() && !(self.sink)(d) {
+            self.aborted = true;
+        }
+    }
+
+    fn feed_chunked(&mut self, mut data: &[u8]) {
+        while !data.is_empty() && !self.aborted {
+            let st = self.chunked.take().unwrap_or(Chunk::Done);
+            match st {
+                Chunk::Size(v, ext) => {
+                    let b = data[0];
+                    data = &data[1..];
+                    self.chunked = Some(match b {
+                        b'\n' if v == 0 => Chunk::Trailer(true),
+                        b'\n' => Chunk::Data(v),
+                        b'\r' => Chunk::Size(v, ext),
+                        _ if ext => Chunk::Size(v, true),
+                        b';' | b' ' | b'\t' => Chunk::Size(v, true),
+                        _ => {
+                            let dv = (b as char).to_digit(16).unwrap_or(0) as u64;
+                            Chunk::Size(v.saturating_mul(16).saturating_add(dv), false)
+                        },
+                    });
+                },
+                Chunk::Data(left) => {
+                    let take = (data.len() as u64).min(left) as usize;
+                    let (now, rest) = data.split_at(take);
+                    data = rest;
+                    self.deliver(now);
+                    let left = left - take as u64;
+                    self.chunked = Some(if left == 0 { Chunk::DataEnd } else { Chunk::Data(left) });
+                },
+                Chunk::DataEnd => {
+                    let b = data[0];
+                    data = &data[1..];
+                    self.chunked = Some(if b == b'\n' { Chunk::Size(0, false) } else { Chunk::DataEnd });
+                },
+                Chunk::Trailer(line_start) => {
+                    let b = data[0];
+                    data = &data[1..];
+                    self.chunked = Some(match b {
+                        b'\n' if line_start => Chunk::Done,
+                        b'\n' => Chunk::Trailer(true),
+                        b'\r' => Chunk::Trailer(line_start),
+                        _ => Chunk::Trailer(false),
+                    });
+                },
+                Chunk::Done => {
+                    self.chunked = Some(Chunk::Done);
+                    return;
+                },
+            }
+        }
+    }
+
+    /// Feed decrypted application data (headers first, then body).
+    fn feed(&mut self, data: &[u8]) {
+        if self.in_body {
+            if self.chunked.is_some() {
+                self.feed_chunked(data);
+            } else {
+                self.deliver(data);
+            }
+            return;
+        }
+        self.hdr.extend_from_slice(data);
+        let he = http_body_offset(&self.hdr);
+        if he == 0 {
+            if self.hdr.len() > 32 * 1024 {
+                self.aborted = true; // no header terminator in 32 KiB: not HTTP
+            }
+            return;
+        }
+        let headers = &self.hdr[..he];
+        // "HTTP/1.1 200 OK"
+        let sp = headers.iter().position(|&b| b == b' ').unwrap_or(0);
+        self.info.status = parse_u64(&headers[sp + 1..]).unwrap_or(0) as u16;
+        self.info.content_length = header_value(headers, b"content-length").and_then(parse_u64);
+        self.info.range_total = header_value(headers, b"content-range")
+            .and_then(|v| v.iter().position(|&b| b == b'/').map(|i| &v[i + 1..]))
+            .and_then(parse_u64);
+        let chunked = header_value(headers, b"transfer-encoding").is_some_and(|v| v.windows(7).any(|w| w.eq_ignore_ascii_case(b"chunked")));
+        if chunked {
+            self.chunked = Some(Chunk::Size(0, false));
+            self.info.content_length = None;
+        }
+        self.in_body = true;
+        if !(self.head)(&self.info) {
+            self.aborted = true;
+            return;
+        }
+        let rest = self.hdr.split_off(he);
+        self.hdr = alloc::vec::Vec::new();
+        self.feed(&rest);
+    }
+
+    fn finished(&self) -> bool {
+        if !self.in_body {
+            return false;
+        }
+        match &self.chunked {
+            Some(Chunk::Done) => true,
+            Some(_) => false,
+            None => self.info.content_length.is_some_and(|cl| self.info.body_bytes >= cl),
+        }
+    }
+}
+
+/// Streaming HTTPS GET of `path` on `host:port` (one TLS session, `Connection:
+/// close`). `extra_headers` is inserted verbatim into the request (each line
+/// ending in `\r\n`, e.g. `"Range: bytes=-4\r\n"`; empty for none). Once the
+/// response headers are in, `head(&info)` is called (status, lengths); return
+/// false to stop. Then every body piece goes to `sink` (de-chunked, headers
+/// stripped); return false from it to abort. Returns the final `StreamInfo`
+/// (`complete` = the body arrived in full); `Err` only when no connection or
+/// response could be made at all.
+pub fn https_get_stream(
+    host: &str,
+    port: u16,
+    path: &str,
+    extra_headers: &str,
+    head: &mut dyn FnMut(&StreamInfo) -> bool,
+    sink: &mut dyn FnMut(&[u8]) -> bool,
+    log: &mut dyn FnMut(&[u8]),
+) -> Result<StreamInfo, &'static str> {
+    let _net = netstack::NetGuard::new();
+    let (mut c_app, mut s_app, mut pos, mut rxlen) = tls_handshake(host, port, log)?;
+    let tx = unsafe { &mut *&raw mut TXBUF };
+    let rx = unsafe { &mut *&raw mut RX };
+    let req = alloc::format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nUser-Agent: LingOS\r\n{extra_headers}\r\n");
+    for piece in req.as_bytes().chunks(3800) {
+        let m = encrypt_record(&mut c_app, 0x17, piece, tx);
+        if !netstack::tcp_write(&tx[..m]) {
+            return Err("write GET failed");
+        }
+    }
+    let mut st = BodyState { hdr: alloc::vec::Vec::new(), in_body: false, chunked: None, info: StreamInfo::default(), aborted: false, head, sink };
+    let mut tmp = alloc::vec![0u8; 18 * 1024];
+    let mut closed_cleanly = false;
+    let mut end: &'static str = "done";
+    loop {
+        if st.aborted {
+            end = "aborted";
+            break;
+        }
+        if st.finished() {
+            break;
+        }
+        // Make sure one whole record (5-byte header + body) is buffered.
+        let need = if pos + 5 <= rxlen { 5 + (((rx[pos + 3] as usize) << 8) | rx[pos + 4] as usize) } else { 5 };
+        if pos + need > rxlen {
+            if pos > 0 {
+                rx.copy_within(pos..rxlen, 0);
+                rxlen -= pos;
+                pos = 0;
+            }
+            if rxlen >= rx.len() {
+                end = "oversized record";
+                break; // a record larger than the receive buffer: protocol error
+            }
+            let n = netstack::tcp_read_some(&mut rx[rxlen..], 10_000_000);
+            if n == 0 {
+                end = if netstack::tcp_is_established() { "stalled 10 s" } else { "peer closed" };
+                break;
+            }
+            rxlen += n;
+            continue;
+        }
+        let rlen = need - 5;
+        if rx[pos] == 0x14 {
+            pos += need;
+            continue; // ChangeCipherSpec
+        }
+        let mut hdr = [0u8; 5];
+        hdr.copy_from_slice(&rx[pos..pos + 5]);
+        if rlen > tmp.len() {
+            end = "oversized record";
+            break;
+        }
+        tmp[..rlen].copy_from_slice(&rx[pos + 5..pos + need]);
+        pos += need;
+        let Some((ctype, plen)) = decrypt_record(&mut s_app, &hdr, &mut tmp[..rlen]) else {
+            end = "decrypt failed";
+            break;
+        };
+        if ctype == 0x17 {
+            st.feed(&tmp[..plen]);
+        } else if ctype == 0x15 {
+            closed_cleanly = true;
+            end = "peer closed (TLS alert)";
+            break; // alert (close_notify)
+        }
+    }
+    let mut info = st.info;
+    info.end = end;
+    info.complete = !st.aborted
+        && (st.finished() || (st.in_body && st.chunked.is_none() && info.content_length.is_none() && closed_cleanly));
+    if info.status == 0 && !st.aborted {
+        return Err("no HTTP response");
+    }
+    Ok(info)
 }

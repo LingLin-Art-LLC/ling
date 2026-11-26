@@ -1119,16 +1119,28 @@ fn cmd_build(args: &[String], lang: &InvocationLanguage) -> anyhow::Result<()> {
         }
     } else {
         // Pure .ling project (no Cargo.toml): AOT-compile to a native executable
-        // by default (pass --no-aot to embed the interpreter). Target the resolved
-        // entry file — `ling build <file>` flattens imports from there — otherwise
-        // hand `ling build` the directory and let it auto-detect the entry.
-        let target = entry.as_deref().unwrap_or(root.as_path());
+        // by default (pass --no-aot to embed the interpreter).
+        //
+        // A project with a manifest builds as a project: hand `ling build` the DIRECTORY so it
+        // reads the manifest (portable, includes, pack, targets) rather than just the entry
+        // file — building the bare file skips the manifest, so a `portable` app loses its
+        // bundled assets and launcher and comes up as a blank window. Only a bare folder of
+        // `.ling` files with no manifest falls back to building the resolved entry file, where
+        // `ling build <file>` flattens imports from there.
+        let has_manifest = MANIFEST_NAMES.iter().any(|n| root.join(n).exists());
+        let target: &std::path::Path = if has_manifest {
+            root.as_path()
+        } else {
+            entry.as_deref().unwrap_or(root.as_path())
+        };
         run_aot_build(target, &forwarded, lang)?;
     }
     Ok(())
 }
 
-/// The current host's `ling build` platform token.
+/// The current host's `ling build` platform token. Kept for callers that want to pin the host
+/// target explicitly; the default build path now leaves the choice to `ling build`.
+#[allow(dead_code)]
 fn native_platform_name() -> &'static str {
     if cfg!(target_os = "windows") {
         "win"
@@ -1180,9 +1192,11 @@ fn run_aot_build(
     if aot {
         cmd.arg("--aot");
     }
-    if !args.iter().any(|a| a == "--platform") {
-        cmd.arg("--platform").arg(native_platform_name());
-    }
+    // Platform choice is left to `ling build`: an explicit --platform (forwarded below) wins,
+    // otherwise `ling build` builds the manifest's `targets` (or the host platform plus web
+    // when it names none). We no longer force the host platform here, so a manifest that
+    // declares e.g. `targets = ["win", "lingos", "lingos-rpi"]` produces all of them from a
+    // bare `lingfu build .`.
     // Forward every build flag except our own --no-aot opt-out.
     for a in args.iter().filter(|a| a.as_str() != "--no-aot") {
         cmd.arg(a);
@@ -1197,6 +1211,16 @@ fn run_aot_build(
 
 // ─── cmd_run ─────────────────────────────────────────────────────────────────
 
+/// The entry file a manifest declares: `entry` in its `[spirit]` (or `[package]`) table, `None` when it names none.
+fn manifest_entry(manifest: &std::path::Path) -> Option<String> {
+    let text = std::fs::read_to_string(manifest).ok()?;
+    let doc: toml::Value = toml::from_str(&text).ok()?;
+    ["spirit", "package"]
+        .iter()
+        .find_map(|t| doc.get(t)?.get("entry")?.as_str().map(str::to_string))
+        .filter(|e| !e.trim().is_empty())
+}
+
 fn cmd_run(args: &[String], lang: &InvocationLanguage) -> anyhow::Result<()> {
     if let Some(manifest) = find_manifest() {
         let slang = lang_from_manifest(&manifest);
@@ -1204,8 +1228,10 @@ fn cmd_run(args: &[String], lang: &InvocationLanguage) -> anyhow::Result<()> {
         let root = manifest.parent().unwrap_or(std::path::Path::new("."));
         let src_dir = root.join(dirs.src);
 
-        // Try entry file candidates in order
+        // Try entry file candidates in order: the manifest's own `entry` (e.g. `[spirit] entry = "ling/main.ling"`) first
+        let declared = manifest_entry(&manifest).map(|e| root.join(e));
         let entry_candidates = [
+            declared.unwrap_or_default(),
             src_dir.join(dirs.entry),
             root.join(dirs.entry),
             src_dir.join("main.ling"),

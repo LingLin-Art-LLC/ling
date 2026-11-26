@@ -144,7 +144,11 @@ def build_svg(data):
 
     # ── headline callout ──────────────────────────────────────────────────────
     rect(pad, y, W - 2 * pad, 70, PANEL, rx=10)
-    hl = "Ling's Cranelift JIT keeps pace with systems languages."
+    # The headline follows the data: only claim parity when the numbers show it.
+    if ling_vs_c and ling_vs_c <= 2.0:
+        hl = "Ling's Cranelift JIT keeps pace with systems languages."
+    else:
+        hl = "Ling's Cranelift JIT: native-speed loops and integer code, far ahead of CPython."
     text(pad + 20, y + 28, hl, size=17, weight="bold", fill="#E8B84A")
 
     def fmt_cmp(r):

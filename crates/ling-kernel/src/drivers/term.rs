@@ -69,6 +69,13 @@ pub fn tick_cursor_blink() {
 }
 
 fn blit_active_to_hardware() {
+    // With a linear framebuffer up, the VGA text page at 0xB8000 is not on
+    // screen, and writes there are slow (uncached legacy VGA on a real PC, a
+    // trap per byte in QEMU): copying all 4000 bytes after every character
+    // made one 80-char log line cost ~1.2 s of frozen desktop.
+    if crate::drivers::framebuffer::available() {
+        return;
+    }
     unsafe {
         let t = &TERMS[ACTIVE];
         for i in 0..(WIDTH * HEIGHT * 2) {

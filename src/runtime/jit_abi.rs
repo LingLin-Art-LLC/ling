@@ -51,6 +51,9 @@ const TAG_KIND_STRING: u64 = 0x0003_0000_0000_0000;
 const TAG_KIND_LIST: u64 = 0x0004_0000_0000_0000;
 const TAG_KIND_OK: u64 = 0x0008_0000_0000_0000;
 const TAG_KIND_ERR: u64 = 0x0009_0000_0000_0000;
+/// any other `Value` (a `form` record, a `choose` variant, a closure) carried whole as a boxed `Value`, so it survives a trip
+/// through JIT code into a builtin and back instead of turning into unit
+const TAG_KIND_BOXED: u64 = 0x000A_0000_0000_0000;
 
 #[inline]
 fn is_number(val: u64) -> bool {
@@ -114,6 +117,14 @@ pub fn decode_value(val: u64) -> Value {
                     Value::Err(Box::new(inner.clone()))
                 }
             },
+            TAG_KIND_BOXED => {
+                let ptr = decode_ptr(val);
+                if ptr.is_null() {
+                    Value::Unit
+                } else {
+                    unsafe { &*(ptr as *const Value) }.clone()
+                }
+            },
             _ => Value::Unit,
         }
     }
@@ -149,9 +160,10 @@ pub fn encode_value(val: &Value) -> u64 {
             let ptr = Box::into_raw(Box::new((**inner).clone())) as *const u8;
             TAG_PATTERN | TAG_KIND_ERR | (ptr as u64 & PTR_MASK)
         },
-        Value::Fn(_, _, _) => TAG_UNIT,
-        Value::Struct { name: _, fields: _ } => TAG_UNIT,
-        Value::Variant { .. } => TAG_UNIT,
+        Value::Fn(..) | Value::Struct { .. } | Value::Variant { .. } => {
+            let ptr = Box::into_raw(Box::new(val.clone())) as *const u8;
+            TAG_PATTERN | TAG_KIND_BOXED | (ptr as u64 & PTR_MASK)
+        },
     }
 }
 
@@ -170,7 +182,49 @@ pub unsafe extern "C" fn ling_builtin(
     let args_slice = std::slice::from_raw_parts(args_ptr, args_len);
 
     with_interp(|interp| {
-        let args: Vec<Value> = args_slice.iter().map(|&a| decode_value(a)).collect();
+        // a global read (MIR's `__ling_global("NAME")`, every use of a top-level `bind` in a function): straight from the
+        // globals, not through the whole builtin dispatch
+        if name == "__ling_global" && args_slice.len() == 1 {
+            if let Value::Str(g) = decode_value(args_slice[0]) {
+                return interp.global_seed.get(g.as_str()).map(encode_value).unwrap_or(TAG_UNIT);
+            }
+        }
+        let mut args: Vec<Value> = args_slice.iter().map(|&a| decode_value(a)).collect();
+        // match patterns MIR compiles (`ok(v)`, `bad(e)`, `Circle(r)`): (value, "c" constructor / "v" variant, name, arity / index)
+        if name == "__ling_pat_test" || name == "__ling_pat_part" {
+            use crate::parser::ast::Pattern;
+            let get = |i: usize| args.get(i).cloned().unwrap_or(Value::Unit);
+            let (val, kind, ctor, n) = (get(0), get(1), get(2), get(3));
+            let (Value::Str(kind), Value::Str(ctor)) = (kind, ctor) else { return TAG_UNIT };
+            let n = if let Value::Number(x) = n { x.max(0.0) as usize } else { 0 };
+            if name == "__ling_pat_test" {
+                let pat = if kind == "c" {
+                    Pattern::Constructor(ctor, (n > 0).then(|| Box::new(Pattern::Wildcard)))
+                } else {
+                    Pattern::Variant(ctor, vec![Pattern::Wildcard; n])
+                };
+                return if interp.match_pattern(&pat, &val).is_some() { TAG_TRUE } else { TAG_FALSE };
+            }
+            let part = match (kind.as_str(), &val) {
+                (_, Value::Ok(v)) | (_, Value::Err(v)) => v.as_ref().clone(),
+                ("v", Value::Variant { payload, .. }) => payload.get(n).cloned().unwrap_or(Value::Unit),
+                // `ok(v)` also matches a plain value: the value itself
+                ("c", v) => v.clone(),
+                _ => Value::Unit,
+            };
+            return encode_value(&part);
+        }
+        // MIR lowers `recv.method(args)` (and a field read `recv.field`) to a call of "recv.method" with the receiver first;
+        // unless a function really has that name, it is a method / field call, dispatched as the tree-walker does
+        if let Some((_, method)) = name.rsplit_once('.') {
+            if !args.is_empty() && !interp.functions.contains_key(name) {
+                let recv = args.remove(0);
+                return match interp.call_method(recv, method, args) {
+                    Ok(val) => encode_value(&val),
+                    Err(_) => TAG_UNIT,
+                };
+            }
+        }
         let env = rustc_hash::FxHashMap::default();
         match interp.call_named(name, args, &env) {
             Ok(val) => encode_value(&val),
@@ -369,16 +423,21 @@ pub unsafe extern "C" fn ling_not(a: u64) -> u64 {
 pub unsafe extern "C" fn ling_print_val(val: u64) -> u64 {
     use std::io::Write;
     let v = decode_value(val);
-    print!("{}", v);
-    std::io::stdout().flush().ok();
+    // Never panic when stdout is absent (e.g. a windows_subsystem="windows"
+    // GUI build has no console): writing through `write!` ignores the error,
+    // whereas the `print!`/`println!` macros unwrap it and abort the thread.
+    let mut out = std::io::stdout();
+    let _ = write!(out, "{}", v);
+    let _ = out.flush();
     TAG_UNIT
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn ling_print_newline() -> u64 {
     use std::io::Write;
-    println!();
-    std::io::stdout().flush().ok();
+    let mut out = std::io::stdout();
+    let _ = writeln!(out);
+    let _ = out.flush();
     TAG_UNIT
 }
 
@@ -392,10 +451,11 @@ pub unsafe extern "C" fn ling_time_now() -> u64 {
 
 #[no_mangle]
 pub unsafe extern "C" fn ling_print(cstr: *const u8) {
+    use std::io::Write;
     if !cstr.is_null() {
-        let s = unsafe { std::ffi::CStr::from_ptr(cstr as *const i8) };
+        let s = unsafe { std::ffi::CStr::from_ptr(cstr as *const std::ffi::c_char) };
         if let Ok(s) = s.to_str() {
-            print!("{}", s);
+            let _ = write!(std::io::stdout(), "{}", s);
         }
     }
 }
@@ -407,12 +467,65 @@ pub unsafe extern "C" fn ling_alloc(size: u64) -> u64 {
     ptr as u64
 }
 
+/// Release an encoded heap handle: drop the box behind it, dispatched on the
+/// kind tag — the boxes are different concrete types per kind (see
+/// `encode_value`), so a tag-blind `Box::from_raw(.. as *mut Value)` would be
+/// UB for strings and lists. Numbers, unit, bools and null pointers are no-ops,
+/// so the codegen can emit releases unconditionally. Takes the full encoded
+/// u64 (not a stripped pointer).
 #[no_mangle]
-pub unsafe extern "C" fn ling_free(ptr: u64) -> u64 {
-    if ptr != 0 {
-        let _ = Box::from_raw(ptr as *mut Value);
+pub unsafe extern "C" fn ling_free(val: u64) -> u64 {
+    if is_number(val) {
+        return TAG_UNIT;
+    }
+    let ptr = decode_ptr(val);
+    if ptr.is_null() {
+        return TAG_UNIT;
+    }
+    match tag_kind(val) {
+        TAG_KIND_STRING => drop(unsafe { Box::from_raw(ptr as *mut String) }),
+        TAG_KIND_LIST => drop(unsafe { Box::from_raw(ptr as *mut Rc<Vec<Value>>) }),
+        TAG_KIND_OK | TAG_KIND_ERR | TAG_KIND_BOXED => {
+            drop(unsafe { Box::from_raw(ptr as *mut Value) })
+        },
+        _ => {},
     }
     TAG_UNIT
+}
+
+/// Clone the box behind an encoded heap handle into a fresh, independently
+/// owned box; identity for numbers/singletons/null. The codegen emits this at
+/// the only places an alias of a box would otherwise be created (a plain
+/// local-to-local copy, the list argument of the in-place list shims when it
+/// isn't the self-accumulator, and arguments handed to another JIT function),
+/// so every boxed local owns its handle exclusively and `ling_free` on
+/// reassignment or return can never free a box another local still holds.
+/// Lists clone only the `Rc` (O(1)); `Rc::make_mut` inside `ling_list_push` /
+/// `ling_list_set` then copy-on-writes when shared, which also keeps JIT list
+/// semantics value-like, matching the interpreter.
+#[no_mangle]
+pub unsafe extern "C" fn ling_retain(val: u64) -> u64 {
+    if is_number(val) {
+        return val;
+    }
+    let ptr = decode_ptr(val);
+    if ptr.is_null() {
+        return val;
+    }
+    let kind = tag_kind(val);
+    let new_ptr = match kind {
+        TAG_KIND_STRING => {
+            Box::into_raw(Box::new(unsafe { &*(ptr as *const String) }.clone())) as u64
+        },
+        TAG_KIND_LIST => {
+            Box::into_raw(Box::new(Rc::clone(unsafe { &*(ptr as *const Rc<Vec<Value>>) }))) as u64
+        },
+        TAG_KIND_OK | TAG_KIND_ERR | TAG_KIND_BOXED => {
+            Box::into_raw(Box::new(unsafe { &*(ptr as *const Value) }.clone())) as u64
+        },
+        _ => return val,
+    };
+    TAG_PATTERN | kind | (new_ptr & PTR_MASK)
 }
 
 #[no_mangle]

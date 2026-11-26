@@ -67,10 +67,13 @@ pub fn calibrate() {
         let mut spins: u64 = 0;
         const MAX_SPINS: u64 = 100_000_000;
         let mut timed_out = false;
+        // With a CPUID rate, give up after 50 ms of TSC (a gated PIT never
+        // finishes, and 1e8 PAUSEs is ~4 s on Skylake-and-later cores).
+        let tsc_limit = cpuid_tsc_mhz().map(|m| m * 50_000).unwrap_or(u64::MAX);
         while io::inb(SPEAKER_PORT) & 0x20 == 0 {
             cpu::pause();
             spins += 1;
-            if spins > MAX_SPINS {
+            if spins > MAX_SPINS || cpu::rdtsc().wrapping_sub(t0) > tsc_limit {
                 timed_out = true;
                 break;
             }
@@ -82,7 +85,10 @@ pub fn calibrate() {
             // A plausible modern-CPU TSC frequency estimate so `now_us`/
             // `delay_us` are merely imprecise instead of unusable if the
             // PIT-based measurement can't complete in this environment.
-            TSC_PER_US = 1000;
+            // Real boards often gate the 8254 off (Z590 "8254 clock gating"):
+            // ask the CPU for its TSC rate before guessing 1 GHz (which made
+            // every wait 3.5x too long on a 3.5 GHz i9).
+            TSC_PER_US = cpuid_tsc_mhz().unwrap_or(1000);
             TSC_AT_BOOT = t1;
             crate::drivers::serial::write(b"timer: TSC_PER_US=");
             print_decimal(TSC_PER_US);
@@ -94,6 +100,29 @@ pub fn calibrate() {
         crate::drivers::serial::write(b" spins\n");
 
         TSC_PER_US = (t1 - t0) / (CALIBRATION_MS * 1000);
+        // A PIT that is gated off or missing can also report "done" at once or early (QEMU with
+        // pit=off: after 0 spins -> 1 MHz, every timeout 1000x short). The rate itself decides:
+        // a real TSC runs at 100 MHz .. 10 GHz. (A spin-count floor of 1000 also rejected a good
+        // 3068 MHz reading under KVM, where every port read is a slow VM exit and a 10 ms count
+        // takes only a few hundred.) Where the CPU states its TSC rate, a PIT figure more than 3%
+        // away from it is the PIT's fault (the user's Z590 clock ran ~56 min fast in a few hours).
+        let measured = TSC_PER_US;
+        let plausible = spins >= 2 && (100..=10_000).contains(&measured);
+        let cpuid = cpuid_tsc_mhz();
+        let use_cpuid = match cpuid {
+            Some(c) => !plausible || measured.abs_diff(c) * 100 > c * 3,
+            None => false,
+        };
+        if use_cpuid || !plausible {
+            TSC_PER_US = if use_cpuid { cpuid.unwrap_or(1000) } else { 1000 };
+            TSC_AT_BOOT = t1;
+            crate::drivers::serial::write(b"timer: PIT figure ");
+            print_decimal(measured);
+            crate::drivers::serial::write(b" MHz rejected; TSC_PER_US=");
+            print_decimal(TSC_PER_US);
+            crate::drivers::serial::write(if use_cpuid { b" (CPUID)\n" } else { b" (guess; the network time corrects the clock)\n" });
+            return;
+        }
         if TSC_PER_US == 0 {
             // A TSC too slow (or a `t1==t0` freak reading) to measure at
             // this resolution would make every delay/clock call below
@@ -107,6 +136,40 @@ pub fn calibrate() {
         print_decimal(TSC_PER_US);
         crate::drivers::serial::write(b"\n");
     }
+}
+
+/// The TSC rate the CPU reports: leaf 0x15 (TSC/crystal ratio x crystal Hz),
+/// else leaf 0x16 (base MHz; the TSC runs at base on Intel cores). None in a
+/// VM or when the leaves are absent/zero.
+fn cpuid_tsc_mhz() -> Option<u64> {
+    use core::arch::x86_64::__cpuid;
+    unsafe {
+        let max = __cpuid(0).eax;
+        if __cpuid(1).ecx & (1 << 31) != 0 {
+            return None; // hypervisor: its leaves are not trustworthy
+        }
+        if max >= 0x15 {
+            let l = __cpuid(0x15);
+            if l.eax != 0 && l.ebx != 0 && l.ecx != 0 {
+                let mhz = l.ecx as u64 * l.ebx as u64 / l.eax as u64 / 1_000_000;
+                if mhz >= 100 {
+                    return Some(mhz);
+                }
+            }
+        }
+        if max >= 0x16 {
+            let base = (__cpuid(0x16).eax & 0xFFFF) as u64;
+            if base >= 100 {
+                return Some(base);
+            }
+        }
+        None
+    }
+}
+
+/// The TSC's rate in MHz (from the boot calibration).
+pub fn tsc_mhz() -> u64 {
+    unsafe { TSC_PER_US }
 }
 
 /// Microseconds since `calibrate()` was called.
@@ -125,6 +188,10 @@ pub fn delay_us(us: u64) {
     let target = unsafe { cpu::rdtsc() } + us * unsafe { TSC_PER_US };
     while unsafe { cpu::rdtsc() } < target {
         unsafe { cpu::pause() };
+        // long waits (resets, link settling) keep the boot screen moving
+        if us >= 1000 {
+            crate::drivers::bootscreen::tick();
+        }
     }
 }
 
@@ -161,9 +228,22 @@ static mut LAST_YIELD_US: u64 = 0;
 /// desktop still renders smoothly while a background fetch runs, long enough
 /// that a fast download isn't throttled to one segment per frame render.
 const YIELD_EVERY_US: u64 = 16_000;
+/// How long a background task may wait for nothing before it yields (see `poll_until`).
+const IDLE_YIELD_US: u64 = 250;
+/// A busy non-main task yields at least this often.
+const BG_YIELD_EVERY_US: u64 = 4_000;
 
 pub fn poll_until(timeout_us: u64, mut cond: impl FnMut() -> bool) -> bool {
-    let deadline = now_us() + timeout_us;
+    let start = now_us();
+    let deadline = start + timeout_us;
+    let mut idle_from = start;
+    // the time other tasks ran inside this wait's yields: the rest of it is the
+    // boot core idle-waiting (per-core load, smp::note_idle)
+    let mut lent = 0u64;
+    let done = |lent: u64, r: bool| -> bool {
+        super::smp::note_idle(now_us().saturating_sub(start).saturating_sub(lent));
+        r
+    };
     loop {
         // Hand the CPU to any other cooperative task at most ~every 16ms --
         // this is what lets a background network fetch (the package manager's
@@ -174,15 +254,42 @@ pub fn poll_until(timeout_us: u64, mut cond: impl FnMut() -> bool) -> bool {
         // is Ready. Uses wrapping compare so the first call (LAST_YIELD_US=0)
         // yields once immediately, then settles into cadence.
         let t = now_us();
-        if t.wrapping_sub(unsafe { LAST_YIELD_US }) >= YIELD_EVERY_US {
+        // A background task (the SSH server's or the chat listener's accept
+        // window) that has waited IDLE_YIELD_US with nothing arriving gives the
+        // CPU straight back: spinning out the whole cadence cost the desktop up
+        // to 16 ms per idle task per frame (two of them halved the frame rate).
+        // A busy transfer still gets the full cadence (its data keeps arriving
+        // within the window, so `idle_from` keeps resetting).
+        let bg_idle = t.wrapping_sub(idle_from) >= IDLE_YIELD_US && !crate::proc::sched::is_main();
+        // a busy background task (a transfer, a wallet sync) hands main back
+        // every 4 ms, so it can't hold a desktop frame for a whole refresh
+        let every = if crate::proc::sched::is_main() { YIELD_EVERY_US } else { BG_YIELD_EVERY_US };
+        if bg_idle || t.wrapping_sub(unsafe { LAST_YIELD_US }) >= every {
+            let ty = now_us();
             crate::proc::sched::yield_now();
+            idle_from = now_us();
+            // Coroutine-aware, but ONLY inside the green thread's own network
+            // transaction (it holds the net lock): an app isolate blocked in a
+            // fetch hands the CPU back to main so the desktop keeps rendering.
+            // Disk waits never yield a coroutine -- interleaved ATA/lingfs
+            // commits between a coroutine and main would corrupt the FS.
+            if crate::coro::in_coro() && crate::drivers::netstack::net_owned_by_me() {
+                crate::coro::yield_now();
+            }
+            // the boot screen animates from boot's waits
+            crate::drivers::bootscreen::tick();
             unsafe { LAST_YIELD_US = now_us() };
+            lent += super::smp::yield_cost(ty, now_us());
         }
         if cond() {
-            return true;
+            return done(lent, true);
         }
         if now_us() >= deadline {
-            return false;
+            return done(lent, false);
+        }
+        // a disk wait on the desktop's own thread: keep the USB pointer moving
+        if crate::proc::sched::is_main() {
+            crate::arch::xhci::pump_input();
         }
         unsafe { cpu::pause() };
     }

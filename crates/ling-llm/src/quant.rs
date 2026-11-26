@@ -1,0 +1,769 @@
+//! Weights and the matrix-vector products over them.
+//!
+//! A tensor is held as a list of chunks of whole rows, each at most [`CHUNK_BYTES`], so no single allocation is large (LingOS's frame
+//! allocator hands out 64 MiB at most, and the token embedding of Qwen3-0.6B alone is 165 MB). Products run over a *batch* of vectors:
+//! the weight rows are the outer loop and the vectors the inner one, so prompt processing reads every weight once per batch instead of
+//! once per token.
+//!
+//! Q8_0 weights are multiplied in integers against the activations quantized to Q8_0 as well (the way llama.cpp and candle do it, so the
+//! results agree to rounding); the K-quants are dequantized a block at a time and multiplied in f32.
+use crate::error::Error;
+use crate::f16;
+use crate::gguf::{DType, Source};
+use alloc::vec;
+use alloc::vec::Vec;
+
+/// the largest piece of a weight tensor held in one allocation
+pub const CHUNK_BYTES: usize = 8 << 20;
+
+/// Rows per chunk: the chunk size (a power of two from 64 KiB to [`CHUNK_BYTES`], less a little room for an allocator's header) that
+/// wastes the least once every chunk is rounded up to a power of two, as a buddy allocator does (LingOS's: a 2.2 MB tensor in one
+/// piece takes 4 MiB there, an exact 4 MiB piece 8 MiB). Ties go to the bigger chunks.
+fn rows_per_chunk(rows: usize, row_bytes: usize) -> usize {
+    const SLACK: usize = 64;
+    let held = |b: usize| (b + SLACK).next_power_of_two();
+    let mut best = ((CHUNK_BYTES - SLACK) / row_bytes).max(1);
+    let mut best_cost = usize::MAX;
+    let mut p = CHUNK_BYTES;
+    while p >= 64 << 10 {
+        let rpc = (p - SLACK) / row_bytes;
+        if rpc >= 1 {
+            let (full, rem) = (rows / rpc, rows % rpc);
+            let cost = full * held(rpc * row_bytes) + if rem > 0 { held(rem * row_bytes) } else { 0 };
+            if cost < best_cost {
+                best_cost = cost;
+                best = rpc;
+            }
+        }
+        p /= 2;
+    }
+    best
+}
+
+/// Where weight chunks may live besides the heap: `(alloc, free)`. An embedder with memory the general allocator cannot reach
+/// (LingOS: the RAM above 4 GiB, which on a 64 GB PC is where an 8 GB model fits) hands it out here; `alloc` returning None (or no
+/// hook) falls back to the heap.
+static mut CHUNK_HOOK: Option<(fn(usize) -> Option<*mut u8>, fn(*mut u8, usize))> = None;
+
+pub fn set_chunk_alloc(alloc: fn(usize) -> Option<*mut u8>, free: fn(*mut u8, usize)) {
+    unsafe { CHUNK_HOOK = Some((alloc, free)) };
+}
+
+/// One piece of a weight tensor: a heap buffer, or `len` bytes from the embedder's [`set_chunk_alloc`] (given back on drop).
+pub struct Chunk {
+    ptr: *mut u8,
+    len: usize,
+    heap: Option<Vec<u8>>,
+}
+
+// the bytes are written once at load and only read after that
+unsafe impl Send for Chunk {}
+unsafe impl Sync for Chunk {}
+
+impl Chunk {
+    fn new(len: usize) -> Chunk {
+        if let Some((alloc, _)) = unsafe { CHUNK_HOOK } {
+            if let Some(ptr) = alloc(len) {
+                return Chunk { ptr, len, heap: None };
+            }
+        }
+        Chunk::from_vec(vec![0u8; len])
+    }
+
+    fn from_vec(mut v: Vec<u8>) -> Chunk {
+        // a Vec's buffer does not move when the Vec itself does
+        Chunk { ptr: v.as_mut_ptr(), len: v.len(), heap: Some(v) }
+    }
+}
+
+impl core::ops::Deref for Chunk {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        unsafe { core::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+impl core::ops::DerefMut for Chunk {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        unsafe { core::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+}
+
+impl Drop for Chunk {
+    fn drop(&mut self) {
+        if self.heap.is_none() {
+            if let Some((_, free)) = unsafe { CHUNK_HOOK } {
+                free(self.ptr, self.len);
+            }
+        }
+    }
+}
+
+pub struct QTensor {
+    pub dtype: DType,
+    pub rows: usize,
+    pub cols: usize,
+    row_bytes: usize,
+    rows_per_chunk: usize,
+    chunks: Vec<Chunk>,
+}
+
+impl QTensor {
+    /// Read `rows` x `cols` elements of `dtype` starting at the absolute offset `abs`.
+    pub fn load(src: &dyn Source, abs: u64, rows: usize, cols: usize, dtype: DType) -> Result<QTensor, Error> {
+        if cols == 0 || rows == 0 || cols % dtype.block() != 0 {
+            return Err(Error::Format("a tensor's row length does not fit its block size"));
+        }
+        let row_bytes = dtype.row_bytes(cols);
+        if abs.checked_add((rows * row_bytes) as u64).map_or(true, |end| end > src.len()) {
+            return Err(Error::Format("a tensor runs past the end of the file"));
+        }
+        let rows_per_chunk = rows_per_chunk(rows, row_bytes);
+        let mut chunks = Vec::new();
+        let mut start = 0;
+        while start < rows {
+            let n = rows_per_chunk.min(rows - start);
+            let mut v = Chunk::new(n * row_bytes);
+            src.read_at(abs + (start * row_bytes) as u64, &mut v)?;
+            chunks.push(v);
+            start += n;
+        }
+        Ok(QTensor { dtype, rows, cols, row_bytes, rows_per_chunk, chunks })
+    }
+
+    /// Build from rows of f32 (tests and tiny tensors).
+    pub fn from_f32(rows: usize, cols: usize, data: &[f32]) -> QTensor {
+        assert_eq!(data.len(), rows * cols);
+        let bytes: Vec<u8> = data.iter().flat_map(|x| x.to_le_bytes()).collect();
+        QTensor { dtype: DType::F32, rows, cols, row_bytes: cols * 4, rows_per_chunk: rows, chunks: vec![Chunk::from_vec(bytes)] }
+    }
+
+    #[inline]
+    pub fn row(&self, r: usize) -> &[u8] {
+        let c = r / self.rows_per_chunk;
+        let o = (r % self.rows_per_chunk) * self.row_bytes;
+        &self.chunks[c][o..o + self.row_bytes]
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.rows * self.row_bytes
+    }
+
+    /// one row as f32 (the embedding lookup)
+    pub fn dequant_row(&self, r: usize, out: &mut [f32]) {
+        let row = self.row(r);
+        match self.dtype {
+            DType::F32 => {
+                for (i, o) in out.iter_mut().enumerate().take(self.cols) {
+                    *o = f32::from_le_bytes([row[i * 4], row[i * 4 + 1], row[i * 4 + 2], row[i * 4 + 3]]);
+                }
+            }
+            DType::F16 => {
+                for (i, o) in out.iter_mut().enumerate().take(self.cols) {
+                    *o = f16::to_f32(u16::from_le_bytes([row[i * 2], row[i * 2 + 1]]));
+                }
+            }
+            DType::Q8_0 => {
+                for b in 0..self.cols / 32 {
+                    let blk = &row[b * 34..b * 34 + 34];
+                    let d = f16::to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+                    for i in 0..32 {
+                        out[b * 32 + i] = d * (blk[2 + i] as i8) as f32;
+                    }
+                }
+            }
+            DType::Q4K => {
+                let mut tmp = [0.0f32; 256];
+                for b in 0..self.cols / 256 {
+                    dequant_q4k(&row[b * 144..b * 144 + 144], &mut tmp);
+                    out[b * 256..b * 256 + 256].copy_from_slice(&tmp);
+                }
+            }
+            DType::Q6K => {
+                let mut tmp = [0.0f32; 256];
+                for b in 0..self.cols / 256 {
+                    dequant_q6k(&row[b * 210..b * 210 + 210], &mut tmp);
+                    out[b * 256..b * 256 + 256].copy_from_slice(&tmp);
+                }
+            }
+        }
+    }
+}
+
+// ── block dequantizers (the K-quants follow ggml's layouts) ─────────────────────
+#[inline]
+fn scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
+    if j < 4 {
+        (q[j] & 63, q[j + 4] & 63)
+    } else {
+        ((q[j + 4] & 0xf) | ((q[j - 4] >> 6) << 4), (q[j + 4] >> 4) | ((q[j] >> 6) << 4))
+    }
+}
+
+/// 144 bytes: d (f16), dmin (f16), 12 bytes of packed 6-bit scales and mins, 128 bytes of 4-bit quants
+pub fn dequant_q4k(blk: &[u8], y: &mut [f32; 256]) {
+    let d = f16::to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+    let dmin = f16::to_f32(u16::from_le_bytes([blk[2], blk[3]]));
+    let scales = &blk[4..16];
+    let qs = &blk[16..144];
+    let mut is = 0;
+    for j in 0..4 {
+        let q = &qs[j * 32..j * 32 + 32];
+        let (sc, m) = scale_min_k4(is, scales);
+        let (d1, m1) = (d * sc as f32, dmin * m as f32);
+        let (sc, m) = scale_min_k4(is + 1, scales);
+        let (d2, m2) = (d * sc as f32, dmin * m as f32);
+        for l in 0..32 {
+            y[j * 64 + l] = d1 * (q[l] & 0xf) as f32 - m1;
+            y[j * 64 + 32 + l] = d2 * (q[l] >> 4) as f32 - m2;
+        }
+        is += 2;
+    }
+}
+
+/// 210 bytes: 128 bytes of low 4 bits, 64 bytes of high 2 bits, 16 signed scales, d (f16)
+pub fn dequant_q6k(blk: &[u8], y: &mut [f32; 256]) {
+    let ql = &blk[0..128];
+    let qh = &blk[128..192];
+    let sc = &blk[192..208];
+    let d = f16::to_f32(u16::from_le_bytes([blk[208], blk[209]]));
+    for half in 0..2 {
+        let (ql, qh, sc, y) = (&ql[half * 64..], &qh[half * 32..], &sc[half * 8..], &mut y[half * 128..]);
+        for l in 0..32 {
+            let is = l / 16;
+            let q1 = ((ql[l] & 0xf) | ((qh[l] & 3) << 4)) as i32 - 32;
+            let q2 = ((ql[l + 32] & 0xf) | (((qh[l] >> 2) & 3) << 4)) as i32 - 32;
+            let q3 = ((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) as i32 - 32;
+            let q4 = ((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) as i32 - 32;
+            y[l] = d * (sc[is] as i8) as f32 * q1 as f32;
+            y[l + 32] = d * (sc[is + 2] as i8) as f32 * q2 as f32;
+            y[l + 64] = d * (sc[is + 4] as i8) as f32 * q3 as f32;
+            y[l + 96] = d * (sc[is + 6] as i8) as f32 * q4 as f32;
+        }
+    }
+}
+
+// ── activations, in f32 and quantized to Q8_0 ───────────────────────────────────
+/// `b` vectors of length `n`: write `x` (b * n floats), then call [`XBatch::set_len`] with the batch size
+pub struct XBatch {
+    pub n: usize,
+    pub b: usize,
+    pub x: Vec<f32>,
+    q: Vec<i8>,
+    d: Vec<f32>,
+    quantized: bool,
+}
+
+impl XBatch {
+    pub fn new(max_batch: usize, n: usize) -> XBatch {
+        XBatch { n, b: 0, x: vec![0.0; max_batch * n], q: vec![0; max_batch * n], d: vec![0.0; max_batch * (n / 32).max(1)], quantized: false }
+    }
+    /// `b` vectors are now in `x`
+    pub fn set_len(&mut self, b: usize) {
+        self.b = b;
+        self.quantized = false;
+    }
+    pub fn vec(&self, t: usize) -> &[f32] {
+        &self.x[t * self.n..(t + 1) * self.n]
+    }
+    pub fn vec_mut(&mut self, t: usize) -> &mut [f32] {
+        &mut self.x[t * self.n..(t + 1) * self.n]
+    }
+    fn quantize(&mut self) {
+        if self.quantized || self.n % 32 != 0 {
+            return;
+        }
+        let nb = self.n / 32;
+        for t in 0..self.b {
+            for blk in 0..nb {
+                let xs = &self.x[t * self.n + blk * 32..t * self.n + blk * 32 + 32];
+                let amax = xs.iter().fold(0.0f32, |a, v| a.max(crate::m::abs(*v)));
+                let d = amax / 127.0;
+                let id = if d > 0.0 { 1.0 / d } else { 0.0 };
+                self.d[t * nb + blk] = d;
+                let qs = &mut self.q[t * self.n + blk * 32..t * self.n + blk * 32 + 32];
+                for i in 0..32 {
+                    qs[i] = crate::m::round(xs[i] * id).clamp(-127.0, 127.0) as i8;
+                }
+            }
+        }
+        self.quantized = true;
+    }
+}
+
+// ── SIMD dot products (x86-64, chosen at run time) ───────────────────────────────
+
+static SIMD: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// No SIMD beyond the build's baseline (portable code).
+pub const SIMD_NONE: u8 = 0;
+/// AVX2 + FMA + F16C: the Q8_0 dot product 32 bytes at a time (vpmaddubsw + vpmaddwd).
+pub const SIMD_AVX2: u8 = 1;
+/// AVX-512 VNNI (+ VL, BW) on top of AVX2: vpdpbusd does the byte products and their sums of four in one instruction.
+pub const SIMD_VNNI: u8 = 2;
+
+/// Which dot-product kernels to use. The embedder checks CPUID *and* that the OS enabled the state (XCR0: YMM for AVX2, opmask +
+/// ZMM for AVX-512); a level the CPU lacks is undefined behaviour (#UD).
+pub fn set_simd(level: u8) {
+    SIMD.store(level.min(SIMD_VNNI), core::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn simd() -> u8 {
+    SIMD.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// "AVX-512 VNNI", "AVX2" or "portable", for status lines.
+pub fn simd_name() -> &'static str {
+    match simd() {
+        SIMD_VNNI => "AVX-512 VNNI",
+        SIMD_AVX2 => "AVX2",
+        _ => "portable",
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn f16_scale(blk: *const u8) -> f32 {
+    use core::arch::x86_64::*;
+    let bits = u16::from_le_bytes([*blk, *blk.add(1)]);
+    _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(bits as i32)))
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn hsum256(v: core::arch::x86_64::__m256) -> f32 {
+    use core::arch::x86_64::*;
+    let s = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps::<1>(v));
+    let s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+    let s = _mm_add_ss(s, _mm_movehdup_ps(s));
+    _mm_cvtss_f32(s)
+}
+
+/// Q8_0 row . Q8_0 vector with AVX2. Signed x signed bytes: vpmaddubsw wants unsigned x signed, so it gets |x| and w with x's
+/// sign moved onto it (vpsignb) -- the products are the same. |x| <= 127 (the activations are quantized to +-127) and
+/// |w| <= 127, so a pair sum stays below i16's limit.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn dot_q8_0_avx2(row: &[u8], qx: &[i8], dx: &[f32]) -> f32 {
+    use core::arch::x86_64::*;
+    let nb = (row.len() / 34).min(qx.len() / 32).min(dx.len());
+    let (rp, xp) = (row.as_ptr(), qx.as_ptr());
+    let ones = _mm256_set1_epi16(1);
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
+    let mut b = 0;
+    while b < nb {
+        let blk = rp.add(b * 34);
+        let w = _mm256_loadu_si256(blk.add(2) as *const __m256i);
+        let x = _mm256_loadu_si256(xp.add(b * 32) as *const __m256i);
+        let p = _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_sign_epi8(x, x), _mm256_sign_epi8(w, x)), ones);
+        let d = _mm256_set1_ps(f16_scale(blk) * *dx.get_unchecked(b));
+        if b & 1 == 0 {
+            acc0 = _mm256_fmadd_ps(d, _mm256_cvtepi32_ps(p), acc0);
+        } else {
+            acc1 = _mm256_fmadd_ps(d, _mm256_cvtepi32_ps(p), acc1);
+        }
+        b += 1;
+    }
+    hsum256(_mm256_add_ps(acc0, acc1))
+}
+
+/// The same with AVX-512 VNNI: vpdpbusd (u8 x s8, four products summed into each i32 lane) replaces vpmaddubsw + vpmaddwd, on
+/// 256-bit registers (one Q8_0 block of 32 bytes per instruction; EVEX-encoded, so it needs AVX512VL).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512vl,avx512bw,avx512vnni,avx2,fma,f16c")]
+unsafe fn dot_q8_0_vnni(row: &[u8], qx: &[i8], dx: &[f32]) -> f32 {
+    use core::arch::x86_64::*;
+    let nb = (row.len() / 34).min(qx.len() / 32).min(dx.len());
+    let (rp, xp) = (row.as_ptr(), qx.as_ptr());
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
+    let mut b = 0;
+    while b < nb {
+        let blk = rp.add(b * 34);
+        let w = _mm256_loadu_si256(blk.add(2) as *const __m256i);
+        let x = _mm256_loadu_si256(xp.add(b * 32) as *const __m256i);
+        let p = _mm256_dpbusd_epi32(_mm256_setzero_si256(), _mm256_sign_epi8(x, x), _mm256_sign_epi8(w, x));
+        let d = _mm256_set1_ps(f16_scale(blk) * *dx.get_unchecked(b));
+        if b & 1 == 0 {
+            acc0 = _mm256_fmadd_ps(d, _mm256_cvtepi32_ps(p), acc0);
+        } else {
+            acc1 = _mm256_fmadd_ps(d, _mm256_cvtepi32_ps(p), acc1);
+        }
+        b += 1;
+    }
+    hsum256(_mm256_add_ps(acc0, acc1))
+}
+
+/// f32 dot product with AVX2 + FMA (the K-quant paths and the attention scores), 32 floats a step in four accumulators.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
+    use core::arch::x86_64::*;
+    let n = a.len().min(b.len());
+    let (ap, bp) = (a.as_ptr(), b.as_ptr());
+    let mut s = [_mm256_setzero_ps(); 4];
+    let mut i = 0;
+    while i + 32 <= n {
+        for j in 0..4 {
+            s[j] = _mm256_fmadd_ps(_mm256_loadu_ps(ap.add(i + 8 * j)), _mm256_loadu_ps(bp.add(i + 8 * j)), s[j]);
+        }
+        i += 32;
+    }
+    while i + 8 <= n {
+        s[0] = _mm256_fmadd_ps(_mm256_loadu_ps(ap.add(i)), _mm256_loadu_ps(bp.add(i)), s[0]);
+        i += 8;
+    }
+    let mut t = hsum256(_mm256_add_ps(_mm256_add_ps(s[0], s[1]), _mm256_add_ps(s[2], s[3])));
+    while i < n {
+        t += *ap.add(i) * *bp.add(i);
+        i += 1;
+    }
+    t
+}
+
+#[inline]
+pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    if simd() >= SIMD_AVX2 {
+        // SAFETY: set_simd's caller checked the CPU and the OS state
+        return unsafe { dot_f32_avx2(a, b) };
+    }
+    let mut s = [0.0f32; 4];
+    let n = a.len().min(b.len());
+    let mut i = 0;
+    while i + 4 <= n {
+        s[0] += a[i] * b[i];
+        s[1] += a[i + 1] * b[i + 1];
+        s[2] += a[i + 2] * b[i + 2];
+        s[3] += a[i + 3] * b[i + 3];
+        i += 4;
+    }
+    let mut t = s[0] + s[1] + s[2] + s[3];
+    while i < n {
+        t += a[i] * b[i];
+        i += 1;
+    }
+    t
+}
+
+#[inline]
+fn dot_q8_0(row: &[u8], qx: &[i8], dx: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: set_simd's caller checked the CPU and the OS state
+        match simd() {
+            SIMD_VNNI => return unsafe { dot_q8_0_vnni(row, qx, dx) },
+            SIMD_AVX2 => return unsafe { dot_q8_0_avx2(row, qx, dx) },
+            _ => {},
+        }
+    }
+    dot_q8_0_portable(row, qx, dx)
+}
+
+fn dot_q8_0_portable(row: &[u8], qx: &[i8], dx: &[f32]) -> f32 {
+    let mut sum = 0.0f32;
+    for (b, blk) in row.chunks_exact(34).enumerate() {
+        let d = f16::to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+        let q = &blk[2..34];
+        let x = &qx[b * 32..b * 32 + 32];
+        let mut acc = 0i32;
+        for i in 0..32 {
+            acc += (q[i] as i8 as i32) * (x[i] as i32);
+        }
+        sum += d * dx[b] * acc as f32;
+    }
+    sum
+}
+
+static YIELD: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Register a function the engine calls every few dozen weight rows. A kernel uses it to hand the CPU back to the desktop while a
+/// long generation runs (the function itself decides whether it is time to).
+pub fn set_yield(f: fn()) {
+    YIELD.store(f as usize, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+fn pump() {
+    let p = YIELD.load(core::sync::atomic::Ordering::Relaxed);
+    if p != 0 {
+        // SAFETY: only `set_yield` stores here, and it stores a `fn()`
+        let f: fn() = unsafe { core::mem::transmute(p) };
+        f();
+    }
+}
+
+/// A way to run `f(ctx, 0) .. f(ctx, n-1)` on several cores and return when all are done (see [`set_parallel`]).
+pub type ParFn = fn(n: usize, ctx: *const (), f: unsafe fn(*const (), usize));
+
+static PAR: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Let [`matmul`] spread its rows over several cores. The jobs never allocate and never call the yield function (that runs
+/// between groups of rows, on the calling core), so a kernel's worker cores can run them. Unset, everything runs in order.
+pub fn set_parallel(f: ParFn) {
+    PAR.store(f as usize, core::sync::atomic::Ordering::Relaxed);
+}
+
+unsafe fn par_tramp<F: Fn(usize) + Sync>(ctx: *const (), i: usize) {
+    (*(ctx as *const F))(i)
+}
+
+pub(crate) fn par_for<F: Fn(usize) + Sync>(n: usize, f: &F) {
+    let p = PAR.load(core::sync::atomic::Ordering::Relaxed);
+    if p == 0 || n <= 1 {
+        for i in 0..n {
+            f(i);
+        }
+        return;
+    }
+    // SAFETY: only `set_parallel` stores here, and it stores a `ParFn`
+    let pf: ParFn = unsafe { core::mem::transmute(p) };
+    pf(n, f as *const F as *const (), par_tramp::<F>);
+}
+
+/// The output buffer shared by the row jobs: each job writes only its own rows.
+struct OutPtr(*mut f32);
+unsafe impl Sync for OutPtr {}
+impl OutPtr {
+    #[inline]
+    unsafe fn put(&self, i: usize, v: f32) {
+        *self.0.add(i) = v;
+    }
+}
+
+/// Rows per job, and rows between two calls of the yield function. Every group is one round of jobs over the cores with a wait for
+/// the slowest at its end: 512-row groups meant ~1000 rounds per token for Qwen3-0.6B (its 151936-row output layer alone ~300),
+/// and those waits, not the arithmetic, set the decoding speed. A 4096-row group of an 8B model's widest matrix is ~18 MB of
+/// weights, well under a millisecond on a desktop's memory, so the yield function still runs often.
+const ROWS_PER_JOB: usize = 16;
+const ROWS_PER_GROUP: usize = 4096;
+
+/// Row `r` of `w` . every vector of the batch, into `out[t * rows + r]` -- without allocating.
+fn row_products(w: &QTensor, x: &XBatch, r: usize, out: &OutPtr) {
+    let (b, rows, row) = (x.b, w.rows, w.row(r));
+    match w.dtype {
+        DType::Q8_0 => {
+            let nb = w.cols / 32;
+            for t in 0..b {
+                let v = dot_q8_0(row, &x.q[t * x.n..(t + 1) * x.n], &x.d[t * nb..(t + 1) * nb]);
+                unsafe { out.put(t * rows + r, v) };
+            }
+        }
+        DType::F32 | DType::F16 => {
+            for t in 0..b {
+                let xv = x.vec(t);
+                let mut acc = 0.0f32;
+                for (i, xi) in xv.iter().enumerate().take(w.cols) {
+                    let wi = if w.dtype == DType::F32 {
+                        f32::from_le_bytes([row[i * 4], row[i * 4 + 1], row[i * 4 + 2], row[i * 4 + 3]])
+                    } else {
+                        f16::to_f32(u16::from_le_bytes([row[i * 2], row[i * 2 + 1]]))
+                    };
+                    acc += wi * xi;
+                }
+                unsafe { out.put(t * rows + r, acc) };
+            }
+        }
+        DType::Q4K | DType::Q6K => {
+            // one 256-value block at a time on the stack; every vector of the batch takes its share of it
+            const MAXB: usize = 64;
+            let mut tmp = [0.0f32; 256];
+            if b <= MAXB {
+                let mut acc = [0.0f32; MAXB];
+                for blk in 0..w.cols / 256 {
+                    if w.dtype == DType::Q4K {
+                        dequant_q4k(&row[blk * 144..blk * 144 + 144], &mut tmp);
+                    } else {
+                        dequant_q6k(&row[blk * 210..blk * 210 + 210], &mut tmp);
+                    }
+                    for (t, a) in acc.iter_mut().enumerate().take(b) {
+                        *a += dot_f32(&tmp, &x.vec(t)[blk * 256..blk * 256 + 256]);
+                    }
+                }
+                for (t, a) in acc.iter().enumerate().take(b) {
+                    unsafe { out.put(t * rows + r, *a) };
+                }
+            } else {
+                for t in 0..b {
+                    let mut a = 0.0f32;
+                    for blk in 0..w.cols / 256 {
+                        if w.dtype == DType::Q4K {
+                            dequant_q4k(&row[blk * 144..blk * 144 + 144], &mut tmp);
+                        } else {
+                            dequant_q6k(&row[blk * 210..blk * 210 + 210], &mut tmp);
+                        }
+                        a += dot_f32(&tmp, &x.vec(t)[blk * 256..blk * 256 + 256]);
+                    }
+                    unsafe { out.put(t * rows + r, a) };
+                }
+            }
+        }
+    }
+}
+
+/// out[t * rows + r] = row r of `w` . vector t of `x`, for every t in the batch. Rows are spread over the cores
+/// [`set_parallel`] offers, a group at a time, with the yield function called between groups.
+pub fn matmul(w: &QTensor, x: &mut XBatch, out: &mut [f32]) {
+    debug_assert_eq!(x.n, w.cols);
+    let rows = w.rows;
+    assert!(out.len() >= x.b * rows);
+    if w.dtype == DType::Q8_0 {
+        x.quantize();
+    }
+    let x: &XBatch = x;
+    let outp = OutPtr(out.as_mut_ptr());
+    let mut g0 = 0;
+    while g0 < rows {
+        pump();
+        let g1 = (g0 + ROWS_PER_GROUP).min(rows);
+        let jobs = (g1 - g0).div_ceil(ROWS_PER_JOB);
+        par_for(jobs, &|j: usize| {
+            let r0 = g0 + j * ROWS_PER_JOB;
+            for r in r0..(r0 + ROWS_PER_JOB).min(g1) {
+                row_products(w, x, r, &outp);
+            }
+        });
+        g0 = g1;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// runs the jobs last-to-first, the way a pool of cores may finish them
+    fn reversed(n: usize, ctx: *const (), f: unsafe fn(*const (), usize)) {
+        for i in (0..n).rev() {
+            unsafe { f(ctx, i) };
+        }
+    }
+
+    #[test]
+    fn parallel_rows_give_the_same_products() {
+        // 700 rows: two groups and many jobs, the last one short
+        let (rows, cols) = (700usize, 64usize);
+        let mut bytes = Vec::new();
+        for i in 0..rows * cols {
+            bytes.extend((((i * 31 % 97) as f32 - 48.0) / 19.0).to_le_bytes());
+        }
+        let t = QTensor::load(&bytes.as_slice(), 0, rows, cols, DType::F32).unwrap();
+        let mut x = XBatch::new(2, cols);
+        for k in 0..2 {
+            for (i, v) in x.vec_mut(k).iter_mut().enumerate() {
+                *v = ((i * (k + 5) % 23) as f32 - 11.0) / 6.0;
+            }
+        }
+        x.set_len(2);
+        let mut serial = vec![0.0f32; 2 * rows];
+        matmul(&t, &mut x, &mut serial);
+        set_parallel(reversed);
+        let mut par = vec![0.0f32; 2 * rows];
+        matmul(&t, &mut x, &mut par);
+        PAR.store(0, core::sync::atomic::Ordering::Relaxed);
+        assert_eq!(serial, par);
+    }
+
+    #[test]
+    fn q8_0_matmul_matches_the_f32_product_closely() {
+        // a 5 x 64 matrix quantized to Q8_0, and three vectors
+        let (rows, cols) = (5usize, 64usize);
+        let w: Vec<f32> = (0..rows * cols).map(|i| ((i * 37 % 101) as f32 - 50.0) / 25.0).collect();
+        let mut bytes = Vec::new();
+        for r in 0..rows {
+            for b in 0..cols / 32 {
+                let blk = &w[r * cols + b * 32..r * cols + b * 32 + 32];
+                let amax = blk.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+                let d = amax / 127.0;
+                bytes.extend(f16::from_f32(d).to_le_bytes());
+                for v in blk {
+                    bytes.push(((v / d).round() as i8) as u8);
+                }
+            }
+        }
+        let t = QTensor::load(&bytes.as_slice(), 0, rows, cols, DType::Q8_0).unwrap();
+        let mut x = XBatch::new(3, cols);
+        for k in 0..3 {
+            for (i, v) in x.vec_mut(k).iter_mut().enumerate() {
+                *v = ((i * (k + 3) * 13 % 29) as f32 - 14.0) / 7.0;
+            }
+        }
+        x.set_len(3);
+        let mut out = vec![0.0f32; 3 * rows];
+        let xs: Vec<Vec<f32>> = (0..3).map(|k| x.vec(k).to_vec()).collect();
+        matmul(&t, &mut x, &mut out);
+        // the same product made by hand from the dequantized weights and the dequantized activations: the kernel must agree exactly
+        let mut wdq = vec![0.0f32; cols];
+        for k in 0..3 {
+            let mut xdq = vec![0.0f32; cols];
+            for blk in 0..cols / 32 {
+                let part = &xs[k][blk * 32..blk * 32 + 32];
+                let amax = part.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+                let d = amax / 127.0;
+                for (i, v) in part.iter().enumerate() {
+                    xdq[blk * 32 + i] = ((v / d).round().clamp(-127.0, 127.0)) * d;
+                }
+            }
+            for r in 0..rows {
+                t.dequant_row(r, &mut wdq);
+                let by_hand: f32 = (0..cols).map(|i| wdq[i] * xdq[i]).sum();
+                assert!((out[k * rows + r] - by_hand).abs() < 1e-3 * (1.0 + by_hand.abs()), "{k},{r}: {} vs {by_hand}", out[k * rows + r]);
+                // and it stays near the true f32 product (the quantization noise of an 8-bit weight and an 8-bit activation)
+                let exact: f32 = (0..cols).map(|i| w[r * cols + i] * xs[k][i]).sum();
+                assert!((out[k * rows + r] - exact).abs() < 0.2 + 0.05 * exact.abs(), "{k},{r}: {} vs exact {exact}", out[k * rows + r]);
+            }
+        }
+    }
+
+    #[test]
+    fn big_tensors_are_held_in_chunks() {
+        let (rows, cols) = (40000usize, 64usize); // 40000 * 4 bytes... as F32 rows of 256 bytes = ~10 MB
+        let data = vec![0.5f32; rows * cols];
+        let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let t = QTensor::load(&bytes.as_slice(), 0, rows, cols, DType::F32).unwrap();
+        assert!(t.chunks.len() >= 2, "{} chunk(s)", t.chunks.len());
+        assert!(t.chunks.iter().all(|c| c.len() <= CHUNK_BYTES));
+        let mut r = vec![0.0f32; cols];
+        t.dequant_row(rows - 1, &mut r);
+        assert!(r.iter().all(|v| *v == 0.5));
+    }
+
+    #[test]
+    fn simd_dot_products_match_the_portable_ones() {
+        // a Q8_0 row of 8 blocks (weights -127..127, mixed scales) against a quantized vector, every level this CPU has
+        let nb = 8;
+        let mut row = Vec::new();
+        for b in 0..nb {
+            row.extend_from_slice(&f16::from_f32(0.01 + b as f32 * 0.003).to_le_bytes());
+            for i in 0..32 {
+                row.push(((((b * 32 + i) * 37) % 255) as i32 - 127) as i8 as u8);
+            }
+        }
+        let qx: Vec<i8> = (0..nb * 32).map(|i| (((i * 53) % 255) as i32 - 127) as i8).collect();
+        let dx: Vec<f32> = (0..nb).map(|b| 0.02 + b as f32 * 0.001).collect();
+        let a: Vec<f32> = (0..301).map(|i| (i % 17) as f32 * 0.1 - 0.8).collect();
+        let bb: Vec<f32> = (0..301).map(|i| (i % 13) as f32 * 0.07 - 0.4).collect();
+        set_simd(SIMD_NONE);
+        let want = dot_q8_0(&row, &qx, &dx);
+        let want_f = dot_f32(&a, &bb);
+        let mut levels = vec![];
+        #[cfg(target_arch = "x86_64")]
+        {
+            extern crate std;
+            if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") && std::is_x86_feature_detected!("f16c") {
+                levels.push(SIMD_AVX2);
+                if std::is_x86_feature_detected!("avx512vnni") && std::is_x86_feature_detected!("avx512vl") && std::is_x86_feature_detected!("avx512bw") {
+                    levels.push(SIMD_VNNI);
+                }
+            }
+        }
+        for l in levels {
+            set_simd(l);
+            let got = dot_q8_0(&row, &qx, &dx);
+            assert!((got - want).abs() <= 1e-4 * (1.0 + want.abs()), "{}: {got} vs {want}", simd_name());
+            let got_f = dot_f32(&a, &bb);
+            assert!((got_f - want_f).abs() <= 1e-4 * (1.0 + want_f.abs()), "{} f32: {got_f} vs {want_f}", simd_name());
+        }
+        set_simd(SIMD_NONE);
+    }
+}

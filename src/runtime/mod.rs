@@ -1,7 +1,15 @@
 // src/runtime/mod.rs — tree-walking interpreter with graphics support
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "ai"))]
 mod ai;
+#[cfg(all(not(target_arch = "wasm32"), feature = "game"))]
+mod body;
 #[cfg(not(target_arch = "wasm32"))]
+mod game3d;
+#[cfg(not(target_arch = "wasm32"))]
+mod daw;
+#[cfg(not(target_arch = "wasm32"))]
+mod paint;
+#[cfg(all(not(target_arch = "wasm32"), feature = "game"))]
 mod gamepad;
 #[cfg(target_arch = "wasm32")]
 mod input_web;
@@ -10,9 +18,28 @@ pub(crate) mod jit_abi;
 #[cfg(all(not(target_arch = "wasm32"), feature = "llm"))]
 mod llm;
 #[cfg(not(target_arch = "wasm32"))]
+mod glb;
+#[cfg(all(not(target_arch = "wasm32"), feature = "game"))]
+mod gpuview;
+#[cfg(all(not(target_arch = "wasm32"), feature = "ai"))]
+mod stt;
 mod terrain_bg;
+mod texmesh;
 #[cfg(all(not(target_arch = "wasm32"), feature = "vision"))]
 mod vision;
+#[cfg(not(target_arch = "wasm32"))]
+mod video;
+#[cfg(all(not(target_arch = "wasm32"), feature = "web"))]
+mod netx;
+#[cfg(all(not(target_arch = "wasm32"), feature = "web"))]
+mod lingjs;
+#[cfg(all(not(target_arch = "wasm32"), feature = "web"))]
+pub(crate) mod cookiejar;
+#[cfg(all(not(target_arch = "wasm32"), feature = "svg"))]
+mod webimg;
+#[cfg(not(target_arch = "wasm32"))]
+mod jsre;
+mod profiles;
 
 /// Initialize the AOT/JIT runtime. Must be called before any AOT-compiled code.
 /// Creates a new interpreter instance for runtime function dispatch.
@@ -20,6 +47,12 @@ mod vision;
 pub fn init_aot_runtime() {
     let interp = Interpreter::new();
     jit_abi::init(interp);
+}
+
+/// The page forwards gamepad `i` (the worker has no Gamepad API): see input_web::set_pad.
+#[cfg(target_arch = "wasm32")]
+pub fn input_web_set_pad(i: usize, connected: bool, values: &[f32], axes: &[f32]) {
+    input_web::set_pad(i, connected, values, axes);
 }
 
 /// Returns seconds since Unix epoch. On wasm32 uses `js_sys::Date::now()`
@@ -64,6 +97,32 @@ pub fn line_hue_phase() -> Option<f64> {
 
 // Wasm-only module registry: seeded by JS before `run_program` is called so
 // that `use "path"` statements resolve without a real filesystem.
+/// `builtin_route` value for a name answered by chunk `c` of `call_named_inner`'s main table: `MAIN_CHUNK_BASE + c`
+/// (the families use 0..FAMILIES.len() and `ROUTE_MAIN` = "main table, chunk not learned yet").
+const MAIN_CHUNK_BASE: u8 = 64;
+
+thread_local! {
+    /// (name, chunk) pairs learned by `ChunkLearn`, moved into `builtin_route` by the next call that is still learning
+    static MAIN_CHUNK_LEARNED: std::cell::RefCell<Vec<(String, u8)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Records which main-table chunk a name's call ended in. A local, not interpreter state, so a builtin that re-enters
+/// the interpreter (callbacks) can't mix up its caller's chunk; the record is made on drop, i.e. on every return path.
+struct ChunkLearn<'a> {
+    name: &'a str,
+    at: u8,
+    on: bool,
+}
+
+impl Drop for ChunkLearn<'_> {
+    fn drop(&mut self) {
+        if self.on {
+            let (n, c) = (self.name.to_string(), self.at);
+            MAIN_CHUNK_LEARNED.with(|q| q.borrow_mut().push((n, c)));
+        }
+    }
+}
+
 #[cfg(target_arch = "wasm32")]
 thread_local! {
     static WASM_MODULES: std::cell::RefCell<std::collections::HashMap<String, String>> =
@@ -81,6 +140,24 @@ pub fn register_wasm_module(path: &str, source: &str) {
 #[cfg(target_arch = "wasm32")]
 pub(crate) fn get_wasm_module(path: &str) -> Option<String> {
     WASM_MODULES.with(|m| m.borrow().get(path).cloned())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn js_global_call(name: &str, args: &[wasm_bindgen::JsValue]) -> wasm_bindgen::JsValue {
+    use wasm_bindgen::JsCast;
+    let g = js_sys::global();
+    if let Ok(f) = js_sys::Reflect::get(&g, &wasm_bindgen::JsValue::from_str(name)) {
+        if let Some(f) = f.dyn_ref::<js_sys::Function>() {
+            let arr = js_sys::Array::new();
+            for a in args {
+                arr.push(a);
+            }
+            if let Ok(v) = f.apply(&g, &arr) {
+                return v;
+            }
+        }
+    }
+    wasm_bindgen::JsValue::UNDEFINED
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -154,10 +231,19 @@ fn wasm_fetch_text(path: &str) -> Result<String, String> {
 
 #[cfg(not(target_arch = "wasm32"))]
 mod net;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "privacy"))]
 mod ssh;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "privacy"))]
 mod lingtp;
+// ling-wallet runtime additions (see ../ling-wallet/docs/LING_API.md)
+#[cfg(not(target_arch = "wasm32"))]
+mod threads;
+#[cfg(not(target_arch = "wasm32"))]
+mod bytes;
+#[cfg(all(not(target_arch = "wasm32"), feature = "privacy"))]
+mod lwcrypto;
+#[cfg(all(not(target_arch = "wasm32"), feature = "privacy"))]
+mod p2p;
 #[cfg(all(not(target_arch = "wasm32"), feature = "web"))]
 pub mod web;
 use crate::gfx::{GfxState, Light};
@@ -172,13 +258,13 @@ use std::rc::Rc;
 use crate::gfx::raster::draw_line;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::gfx::raster::fill_triangle;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
 use ling_audio::{AudioEngine, ToneParams, Wave};
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
 use ling_audio::FftAnalyzer;
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
 use ling_mic;
 
 // ─── Values ──────────────────────────────────────────────────────────────────
@@ -210,6 +296,10 @@ pub enum Value {
 // are hashed on every variable access and builtin dispatch, where SipHash dominates.
 use rustc_hash::FxHashMap;
 type Env = FxHashMap<String, Value>;
+
+fn return_list(v: Vec<Value>) -> Value {
+    Value::List(Rc::new(v))
+}
 
 #[inline]
 fn new_env() -> Env {
@@ -1223,6 +1313,19 @@ fn os_key_down(vk: i32) -> bool {
     }
 }
 
+/// (held now, pressed since the last call): the second catches a key tapped and released between two frames, which a once-per-frame
+/// look at the held state misses (fast typing at 20-50 ms per frame dropped letters).
+#[cfg(windows)]
+fn os_key_state(vk: i32) -> (bool, bool) {
+    unsafe {
+        extern "system" {
+            fn GetAsyncKeyState(vkey: i32) -> i16;
+        }
+        let s = GetAsyncKeyState(vk) as u16;
+        (s & 0x8000 != 0, s & 1 != 0)
+    }
+}
+
 /// True when `hwnd` is the actual OS foreground window. `GetAsyncKeyState`
 /// (see `os_key_down`) reads the global key-state table regardless of which
 /// window is focused, so the `topmost_window` input fallback must check this
@@ -1238,6 +1341,85 @@ fn window_is_foreground(hwnd: isize) -> bool {
         }
         hwnd != 0 && GetForegroundWindow() == hwnd
     }
+}
+
+/// True when `hwnd` holds this thread's keyboard focus — then WM_CHAR arrives and
+/// `text_poll` takes typed characters from it (keyboard layouts, AltGr, dead keys, IME).
+#[cfg(all(not(target_arch = "wasm32"), windows))]
+fn window_has_key_focus(hwnd: isize) -> bool {
+    unsafe {
+        extern "system" {
+            fn GetFocus() -> isize;
+        }
+        hwnd != 0 && GetFocus() == hwnd
+    }
+}
+
+/// True while an IME is composing in `hwnd` (Hangul / kana / pinyin not yet committed):
+/// keys like Backspace then edit the composition, not the text field.
+#[cfg(all(not(target_arch = "wasm32"), windows))]
+fn ime_composing(hwnd: isize) -> bool {
+    #[link(name = "imm32")]
+    extern "system" {
+        fn ImmGetContext(hwnd: isize) -> isize;
+        fn ImmReleaseContext(hwnd: isize, himc: isize) -> i32;
+        fn ImmGetCompositionStringW(himc: isize, index: u32, buf: *mut u16, len: u32) -> i32;
+    }
+    const GCS_COMPSTR: u32 = 0x0008;
+    unsafe {
+        let himc = ImmGetContext(hwnd);
+        if himc == 0 {
+            return false;
+        }
+        let n = ImmGetCompositionStringW(himc, GCS_COMPSTR, std::ptr::null_mut(), 0);
+        ImmReleaseContext(hwnd, himc);
+        n > 0
+    }
+}
+
+/// The character the ACTIVE keyboard layout gives virtual key `vk` (with the current
+/// Shift / Caps Lock / AltGr state) — `ToUnicodeEx` without touching dead-key state.
+/// Falls back to the US mapping (`vk_char`) when the layout gives nothing printable.
+#[cfg(all(not(target_arch = "wasm32"), windows))]
+fn vk_char_layout(vk: i32, shift: bool) -> Option<char> {
+    extern "system" {
+        fn ToUnicodeEx(vk: u32, scan: u32, state: *const u8, buf: *mut u16, len: i32, flags: u32, hkl: isize) -> i32;
+        fn GetKeyboardLayout(thread: u32) -> isize;
+        fn MapVirtualKeyExW(code: u32, map: u32, hkl: isize) -> u32;
+        fn GetKeyState(vk: i32) -> i16;
+    }
+    unsafe {
+        let hkl = GetKeyboardLayout(0);
+        let mut state = [0u8; 256];
+        if shift {
+            state[0x10] = 0x80;
+        }
+        if GetKeyState(0x14) & 1 != 0 {
+            state[0x14] = 0x01; // Caps Lock toggled
+        }
+        // AltGr = right Alt, reported by Windows as Ctrl + Alt
+        if os_key_down(0xA5) {
+            state[0x11] = 0x80;
+            state[0x12] = 0x80;
+            state[0xA2] = 0x80;
+            state[0xA5] = 0x80;
+        }
+        let scan = MapVirtualKeyExW(vk as u32, 0, hkl);
+        let mut buf = [0u16; 8];
+        // flags 0x4: leave the keyboard's dead-key state alone (Windows 10 1607+)
+        let n = ToUnicodeEx(vk as u32, scan, state.as_ptr(), buf.as_mut_ptr(), buf.len() as i32, 0x4, hkl);
+        if n == 1 {
+            if let Some(c) = char::from_u32(buf[0] as u32) {
+                if !c.is_control() {
+                    return Some(c);
+                }
+            }
+        }
+        if n < 0 || n > 1 {
+            return None; // a dead key or a multi-char sequence: nothing typed from this key alone
+        }
+    }
+    vk_char(vk, shift)
 }
 
 /// Delay (seconds) a key must stay held before it starts auto-repeating —
@@ -1312,6 +1494,30 @@ fn str_to_vk(name: &str) -> Option<i32> {
         "rctrl" | "rightctrl" => 0xA3,
         "lalt" | "leftalt" => 0xA4,
         "ralt" | "rightalt" => 0xA5,
+        "f1" => 0x70,
+        "f2" => 0x71,
+        "f3" => 0x72,
+        "f4" => 0x73,
+        "f5" => 0x74,
+        "f6" => 0x75,
+        "f7" => 0x76,
+        "f8" => 0x77,
+        "f9" => 0x78,
+        "f10" => 0x79,
+        "f11" => 0x7A,
+        "f12" => 0x7B,
+        "capslock" => 0x14,
+        "minus" | "-" => 0xBD,
+        "equals" | "=" | "plus" => 0xBB,
+        "comma" | "," => 0xBC,
+        "period" | "." => 0xBE,
+        "slash" | "/" => 0xBF,
+        "semicolon" | ";" => 0xBA,
+        "quote" | "'" => 0xDE,
+        "lbracket" | "[" => 0xDB,
+        "rbracket" | "]" => 0xDD,
+        "backslash" => 0xDC,
+        "grave" | "`" => 0xC0,
         "tab" => 0x09,
         "backspace" => VK_BACK,
         "delete" => 0x2E,
@@ -1383,7 +1589,7 @@ fn decode_blob(s: &str) -> Result<Vec<u8>, String> {
 }
 
 /// Decode a lowercase/uppercase hex string to bytes (ignores malformed tail).
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "crypto"))]
 fn hex_decode(s: &str) -> Vec<u8> {
     let s = s.trim();
     (0..s.len() / 2)
@@ -1392,7 +1598,7 @@ fn hex_decode(s: &str) -> Vec<u8> {
 }
 
 /// Decode a hex string into a fixed 32-byte key (zero-padded / truncated).
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "crypto"))]
 fn hex_to_32(s: &str) -> [u8; 32] {
     let v = hex_decode(s);
     let mut out = [0u8; 32];
@@ -1402,22 +1608,38 @@ fn hex_to_32(s: &str) -> [u8; 32] {
 }
 
 /// Builds a minimal, valid PDF with one page per input image (decoded via
-/// `image`, page sized to the image's own pixel dimensions), backing the
-/// `pdf_from_images` builtin. No PDF crate: each page is three objects
-/// (Page / Contents / Image XObject) hand-written directly, with the image
-/// stream flate-compressed raw RGB8 (`/Filter /FlateDecode /ColorSpace
-/// /DeviceRGB /BitsPerComponent 8`) — no separate re-encoding step beyond
-/// what `flate2` (already a dependency) does for the stream itself.
+/// `image`), backing both `pdf_from_images` and `pdf_from_images_sized`. No
+/// PDF crate: each page is three objects (Page / Contents / Image XObject)
+/// hand-written directly, with the image stream flate-compressed raw RGB8
+/// (`/Filter /FlateDecode /ColorSpace /DeviceRGB /BitsPerComponent 8`) — no
+/// separate re-encoding step beyond what `flate2` (already a dependency)
+/// does for the stream itself.
+///
+/// `page_pt`, when given, is the MediaBox size in PDF points (1/72in),
+/// applied to every page regardless of that image's own pixel dimensions —
+/// the content stream's `cm` matrix scales the image to fill it. `None`
+/// keeps the original behavior: MediaBox == the image's own pixel
+/// dimensions (i.e. an implied 72 DPI), which is what `pdf_from_images`
+/// still does — fine for a quick multi-image bundle, but it means a page
+/// sized in real inches always needs the source image already downsampled
+/// to that many pixels. `pdf_from_images_sized` exists so a caller can keep
+/// a high-resolution source image (embedded at its native `/Width /Height`,
+/// so viewers render it at full quality) while still declaring a sane
+/// physical page size — e.g. an actual banknote's real-world dimensions —
+/// independent of that pixel count.
 #[cfg(all(not(target_arch = "wasm32"), feature = "web"))]
 fn build_pdf_from_images(
     paths: &[String],
     out_path: &str,
+    page_pt: Option<(f64, f64)>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::io::Write as _;
 
     struct PageImg {
         w: u32,
         h: u32,
+        page_w: f64,
+        page_h: f64,
         compressed: Vec<u8>,
     }
 
@@ -1425,9 +1647,10 @@ fn build_pdf_from_images(
     for p in paths {
         let img = image::open(p)?.to_rgb8();
         let (w, h) = (img.width(), img.height());
+        let (page_w, page_h) = page_pt.unwrap_or((w as f64, h as f64));
         let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
         enc.write_all(img.as_raw())?;
-        pages.push(PageImg { w, h, compressed: enc.finish()? });
+        pages.push(PageImg { w, h, page_w, page_h, compressed: enc.finish()? });
     }
 
     let n = pages.len();
@@ -1458,13 +1681,14 @@ fn build_pdf_from_images(
         let content_num = page_num + 1;
         let image_num = page_num + 2;
         let (w, h) = (page.w, page.h);
+        let (pw, ph) = (page.page_w, page.page_h);
 
         off[page_num as usize] = buf.len();
         buf.extend_from_slice(format!(
-            "{page_num} 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {w} {h}] /Resources << /XObject << /Im0 {image_num} 0 R >> >> /Contents {content_num} 0 R >>\nendobj\n"
+            "{page_num} 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {pw:.2} {ph:.2}] /Resources << /XObject << /Im0 {image_num} 0 R >> >> /Contents {content_num} 0 R >>\nendobj\n"
         ).as_bytes());
 
-        let content = format!("q {w} 0 0 {h} 0 0 cm /Im0 Do Q");
+        let content = format!("q {pw:.2} 0 0 {ph:.2} 0 0 cm /Im0 Do Q");
         off[content_num as usize] = buf.len();
         buf.extend_from_slice(
             format!(
@@ -1793,10 +2017,24 @@ impl Default for UiTheme {
 
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub struct Interpreter {
+    /// Capabilities of this isolate (LING_API.md §1). `None` = the main
+    /// thread, which has every capability.
+    pub(crate) caps: Option<std::collections::HashSet<String>>,
+    /// Per-isolate state of the ling-wallet builtin families; each type is
+    /// owned by its module (threads.rs, lwcrypto.rs, p2p.rs).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) threads_state: threads::ThreadsState,
+    #[cfg(all(not(target_arch = "wasm32"), feature = "privacy"))]
+    pub(crate) lw_state: lwcrypto::LwState,
+    #[cfg(all(not(target_arch = "wasm32"), feature = "privacy"))]
+    pub(crate) p2p_state: p2p::P2pState,
     globals: HashMap<String, Expr>,
     /// Globals evaluated ONCE at program start (immutable after load).
     /// call_named clones this instead of re-evaluating every global per call.
     global_seed: Env,
+    /// which builtin family (index into `call_named_inner`'s chain, or `ROUTE_MAIN`) answered a name last time: the next call
+    /// goes straight there instead of trying every family's name table first
+    builtin_route: FxHashMap<String, u8>,
     functions: FxHashMap<String, Rc<FnDef>>,
     /// `form` definitions: struct name → ordered field names.
     pub(crate) structs: HashMap<String, Vec<String>>,
@@ -1809,10 +2047,12 @@ pub struct Interpreter {
     pub source_dir: Option<std::path::PathBuf>,
     /// Files already loaded — prevents circular imports.
     loaded_files: std::collections::HashSet<String>,
+    /// functions defined by user scripts (`script_load`), the only ones `script_call` may run
+    script_fns: std::collections::HashSet<String>,
     /// Optional audio engine — `None` if no audio device is available.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
     audio: Option<AudioEngine>,
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
     fft: RefCell<FftAnalyzer>,
     fft_bands_cache: RefCell<Vec<f32>>,
     /// Real-time clock — seconds since Unix epoch at startup (f64 works on both
@@ -1829,27 +2069,38 @@ pub struct Interpreter {
     /// Random state for rand() builtin (xorshift)
     rand_state: u64,
     /// Microphone input (Phase 1 audio reactivity)
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
     mic: Option<ling_mic::MicInput>,
     /// Persistent KEM keypairs (knot / hybrid identities), referenced by handle.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), feature = "crypto"))]
     crypto_ids: Vec<ling_crypto::KnotIdentity>,
     /// Persistent Ed25519 signing keypairs, referenced by handle.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), feature = "crypto"))]
     ed25519_ids: Vec<ling_crypto::Ed25519Keypair>,
     /// Persistent ML-DSA-65 (post-quantum) signing keypairs, referenced by handle.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), feature = "crypto"))]
     mldsa_ids: Vec<ling_crypto::MlDsa65Keypair>,
+    /// ML-DSA-87 (FIPS 204 category 5) keypairs, for the mldsa87_* builtins
+    #[cfg(feature = "crypto")]
+    mldsa87_ids: Vec<ling_crypto::MlDsa87Keypair>,
     /// Editable text-input buffer (ling-ui text fields).
     text_buffer: String,
     /// Frame counter for record_frame().
     record_n: u32,
     /// Accumulated microphone samples (for turning sound into crypto donuts).
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
     mic_buffer: Vec<f32>,
     /// Loaded vector UI fonts, referenced by handle (index) from `font_load`.
-    #[cfg(not(target_arch = "wasm32"))]
-    fonts: Vec<ling_graphics::VectorFont>,
+        fonts: Vec<ling_graphics::VectorFont>,
+    /// Resolved source path per font handle (for the lazy bitmap twin below).
+        font_paths: Vec<String>,
+    /// Lazily-built fontdue bitmap twins of `fonts` — `font_text_px` draws
+    /// cached coverage bitmaps (~µs/glyph) where the vector filler re-flattens
+    /// outlines every call (~ms/string). Same handles as `fonts`.
+        glyph_fonts: Vec<Option<ling_graphics::GlyphFont>>,
+    /// Per font handle: the font (and size factor) that draws the chars it has no glyph for
+    /// (`font_fallback`). Chains are followed a few links deep.
+        font_fallbacks: Vec<Option<(usize, f32)>>,
     /// Loaded raster images (PNG/etc.), referenced by handle (index) from
     /// `image_load` — read pixel-by-pixel via `image_pixel_r/g/b/a`. The
     /// `image` crate is a native-only dependency (see Cargo.toml's
@@ -1857,33 +2108,68 @@ pub struct Interpreter {
     /// like its sibling fields above (mldsa_ids, mic_buffer, fonts, music) —
     /// only exists on native targets; every image_* builtin below has a
     /// wasm32 stub arm to match.
-    #[cfg(not(target_arch = "wasm32"))]
-    images: Vec<image::RgbaImage>,
+        images: Vec<image::RgbaImage>,
+    /// `image_load` path -> handle cache, so UI code may call it every frame
+    /// (a skin lookup) without re-decoding or growing `images`.
+    image_cache: FxHashMap<String, usize>,
+    /// Textured LTM1 meshes (txm_load) and their textures (txm_tex) — cross-platform.
+    tex_meshes: Vec<texmesh::TxMesh>,
+    tex_images: Vec<std::sync::Arc<crate::gfx::depth::TexData>>,
     /// Customizable UI colour palette (set via `ui_theme`).
     ui_theme: UiTheme,
     /// Left-mouse state on the previous frame — for widget click-edge detection.
     mouse_was_down: bool,
     /// Live music engine (decode playback + GM synth) — lazily initialised.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
     music: Option<ling_music::MusicEngine>,
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
     music_init: bool,
+    /// LingStationX audio engine (`daw_*` builtins) — lazily initialised.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
+    daw: Option<ling_daw::Daw>,
+    /// LingAnime paint / 2.5D engine (`art_*` builtins) — lazily initialised.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "art"))]
+    paint: Option<Box<ling_paint::Studio>>,
+    /// Acoustic body kit (`body_*` builtins).
+    #[cfg(all(not(target_arch = "wasm32"), feature = "game"))]
+    body: body::BodyState,
+    /// Textured meshes, mesh collision and particles (`tm_*` / `coll_*` / `pfx_*`).
+    #[cfg(not(target_arch = "wasm32"))]
+    g3d: game3d::G3dState,
+    /// Global key/value store (`st_*` builtins) — shared app state for scripts.
+    gstore: FxHashMap<String, Value>,
+    /// Clip rectangle for the `px_*` primitives: x0, y0, x1, y1 (exclusive).
+    px_clip: Option<[i32; 4]>,
+    /// "Black" colour scheme active for the `px_*` primitives.
+    px_black: bool,
     /// Decoded tracks (for analysis + playback), by `music_load` handle.
+    #[cfg(feature = "audio")]
     tracks: Vec<ling_music::DecodedAudio>,
     /// Parsed `.lrc` lyrics, by `music_lrc` handle.
+    #[cfg(feature = "audio")]
     lyrics: Vec<ling_music::Lyrics>,
     /// Parsed MIDI songs, by `music_midi_load` handle.
+    #[cfg(feature = "audio")]
     midis: Vec<ling_music::MidiSong>,
     /// Soft bodies (deformable balls), by `soft_ball` handle.
+    #[cfg(feature = "game")]
     soft_bodies: Vec<ling_physics::soft::SoftBody>,
     /// Rigid-body world (angular dynamics), shared by `rb_*`.
+    #[cfg(feature = "game")]
     rigid_world: ling_physics::rigid::PhysicsWorld,
     /// Liquid grids (water/oil), by `liquid_new` handle.
+    #[cfg(feature = "game")]
     liquids: Vec<ling_physics::liquid::LiquidGrid>,
     meshes: Vec<crate::gfx::shapes::ColorMesh>,
     /// Loaded glTF models (skeleton + skin weights + animations), by `mesh_load` handle.
+    #[cfg(feature = "game")]
     gltf_models: std::cell::RefCell<Vec<ling_physics::gltf::GltfModel>>,
+    /// Built TexData per (gltf handle, mesh index), so gltf_pose_draw_tex does not
+    /// rebuild a model's textures every frame.
+    #[cfg(feature = "game")]
+    gltf_tex_cache: std::cell::RefCell<std::collections::HashMap<(usize, usize), std::sync::Arc<crate::gfx::depth::TexData>>>,
     /// Active cinematic dialog box (Ocarina/Majora-style), if any.
+    #[cfg(feature = "game")]
     dialog: Option<ling_game::dialog::Dialog>,
     /// Dialog highlight colours by role: text, name, place, item (0x00RRGGBB).
     dialog_colors: [u32; 4],
@@ -1895,7 +2181,7 @@ pub struct Interpreter {
     /// Unified input (gamepads/joysticks/VR/touch via the ling-input
     /// "Sensorium"). Lazily initialised on the first `pad_*` builtin call;
     /// `None` if no native input backend is available.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), feature = "game"))]
     input: RefCell<Option<InputState>>,
     /// Routes registered by `http_route(method, path, handler)`, consumed
     /// by `http_serve`. Lives here (not a global, unlike `net`) because the
@@ -1908,15 +2194,31 @@ pub struct Interpreter {
     /// sufficient and contention-free.
     #[cfg(all(not(target_arch = "wasm32"), feature = "web"))]
     db: Option<ling_http::rusqlite::Connection>,
+    /// Path given to `db_open`, kept so `http_serve` worker interpreters
+    /// (`drain_http_requests_pool`) can open their own connection to the
+    /// same database — one connection per interpreter, never shared.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "web"))]
+    db_path: Option<String>,
     /// `(url_prefix, disk_dir)` pairs registered by `http_static`, consumed by
     /// `http_serve` — served as raw bytes, bypassing the String-only Value bridge.
     #[cfg(all(not(target_arch = "wasm32"), feature = "web"))]
     http_static_dirs: Vec<(String, String)>,
+    /// `(hostname, disk_dir)` pairs registered by `http_vhost`, consumed by
+    /// `http_serve` — a request whose Host header names one of these is served
+    /// straight from that directory (at the root) before any route or prefix.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "web"))]
+    http_vhosts: Vec<(String, String)>,
     /// Background jobs started by `http_post_async`, polled by `http_job_poll`.
     /// A plain `Arc<Mutex<..>>` handle (not `Value`), so it's fine to touch from
     /// the background tokio task that fills in each job's result.
     #[cfg(all(not(target_arch = "wasm32"), feature = "web"))]
     async_jobs: web::AsyncJobs,
+    /// The top-level program this interpreter registered, kept so `http_serve`
+    /// with `workers > 1` can hand it to worker interpreters, which re-register
+    /// the same declarations on their own threads. `Arc` because the AST is
+    /// plain owned data (`Send + Sync` — see the threads.rs module docs).
+    #[cfg(all(not(target_arch = "wasm32"), feature = "web"))]
+    program: Option<std::sync::Arc<Program>>,
     /// Google sign-in exchanges started by `oauth_google_start`, polled by
     /// `oauth_google_done`/`_error`/`_sub`/`_email`/`_name`. Separate from
     /// `async_jobs` because a login result has three fields, not one string.
@@ -1932,7 +2234,7 @@ pub struct Interpreter {
     /// `lingtp_serve` — GET-only (no method), matching lingtp:// v1's
     /// request shape. Unlike `http_routes`, not gated on `feature = "web"`:
     /// lingtp only depends on ling-crypto, already unconditional here.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), feature = "privacy"))]
     lingtp_routes: Vec<(String, Value)>,
     /// Background jobs started by `terrain_grid_start`, polled by
     /// `terrain_grid_poll` — see runtime::terrain_bg. Plain OS threads, not
@@ -1943,12 +2245,12 @@ pub struct Interpreter {
     /// Status of the last `lingtp_get` call — paired accessor, same shape as
     /// `http_get_status()`. 1 = ok, 0 = connect/handshake error, -1 =
     /// signature invalid, -2 = host key changed (refused).
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), feature = "privacy"))]
     last_lingtp_status: i32,
 }
 
 /// Live gamepad input state: a ling-input hub fed by the native `gilrs` backend.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "game"))]
 struct InputState {
     sensorium: ling_input::Sensorium,
     backend: ling_input::backend::GilrsBackend,
@@ -1960,15 +2262,69 @@ impl Default for Interpreter {
     }
 }
 
+/// Convert a decoded glTF base-color image to a power-of-two `TexData`
+/// (0xAARRGGBB texels) for the textured skinned draw.
+#[cfg(feature = "game")]
+fn gltf_img_to_tex(img: &ling_physics::gltf::GltfImage) -> crate::gfx::depth::TexData {
+    let (w, h) = (img.w.max(1), img.h.max(1));
+    let p2 = |v: u32| { let mut p = 1u32; while p < v { p <<= 1; } p.min(1024) };
+    let (sw, sh) = (p2(w), p2(h));
+    let mut px = Vec::with_capacity((sw * sh) as usize);
+    for y in 0..sh {
+        let sy = (y * h / sh).min(h - 1);
+        for x in 0..sw {
+            let sx = (x * w / sw).min(w - 1);
+            let i = ((sy * w + sx) * 4) as usize;
+            let r = img.rgba.get(i).copied().unwrap_or(200) as u32;
+            let g = img.rgba.get(i + 1).copied().unwrap_or(200) as u32;
+            let b = img.rgba.get(i + 2).copied().unwrap_or(200) as u32;
+            let a = img.rgba.get(i + 3).copied().unwrap_or(255) as u32;
+            px.push((a << 24) | (r << 16) | (g << 8) | b);
+        }
+    }
+    crate::gfx::depth::TexData::new(sw, sh, px)
+}
+
 impl Interpreter {
     pub fn new() -> Self {
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
         let audio = AudioEngine::new()
-            .map_err(|e| eprintln!("audio init failed (no sound): {e}"))
+            .map_err(|e| {
+                eprintln!("audio init failed (no sound): {e}");
+                linux_audio_hint();
+            })
             .ok();
+        Self::build(
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
+            audio,
+        )
+    }
+
+    /// Lightweight interpreter for a thread isolate (threads.rs): no audio
+    /// device is opened (everything else in `build` is lazy/cheap), and it
+    /// holds only `caps`, so GUI/input builtins are refused.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn new_isolate(caps: std::collections::HashSet<String>) -> Self {
+        let mut me = Self::build(
+            #[cfg(feature = "audio")]
+            None,
+        );
+        me.caps = Some(caps);
+        me
+    }
+
+    fn build(#[cfg(all(not(target_arch = "wasm32"), feature = "audio"))] audio: Option<AudioEngine>) -> Self {
         Self {
+            caps: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            threads_state: Default::default(),
+            #[cfg(all(not(target_arch = "wasm32"), feature = "privacy"))]
+            lw_state: Default::default(),
+            #[cfg(all(not(target_arch = "wasm32"), feature = "privacy"))]
+            p2p_state: Default::default(),
             globals: HashMap::new(),
             global_seed: new_env(),
+            builtin_route: FxHashMap::default(),
             functions: FxHashMap::default(),
             structs: HashMap::new(),
             enum_variants: HashMap::new(),
@@ -1977,9 +2333,10 @@ impl Interpreter {
             svg: RefCell::new(None),
             source_dir: None,
             loaded_files: std::collections::HashSet::new(),
-            #[cfg(not(target_arch = "wasm32"))]
+            script_fns: std::collections::HashSet::new(),
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
             audio,
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
             fft: RefCell::new(FftAnalyzer::new(2048, 44100)),
             fft_bands_cache: RefCell::new(vec![]),
             start_time_secs: crate::runtime::now_secs(),
@@ -1989,57 +2346,90 @@ impl Interpreter {
             #[cfg(target_arch = "wasm32")]
             wasm_next_present_ms: 0.0,
             rand_state: 0x123456789ABCDEF,
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
             mic: None,
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "crypto"))]
             crypto_ids: Vec::new(),
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "crypto"))]
             ed25519_ids: Vec::new(),
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "crypto"))]
             mldsa_ids: Vec::new(),
+            #[cfg(feature = "crypto")]
+            mldsa87_ids: Vec::new(),
             text_buffer: String::new(),
             record_n: 0,
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
             mic_buffer: Vec::new(),
-            #[cfg(not(target_arch = "wasm32"))]
-            fonts: Vec::new(),
-            #[cfg(not(target_arch = "wasm32"))]
-            images: Vec::new(),
+                        fonts: Vec::new(),
+                        font_paths: Vec::new(),
+                        glyph_fonts: Vec::new(),
+                        font_fallbacks: Vec::new(),
+                        images: Vec::new(),
+            image_cache: FxHashMap::default(),
+            tex_meshes: Vec::new(),
+            tex_images: Vec::new(),
             ui_theme: UiTheme::default(),
             mouse_was_down: false,
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
             music: None,
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
             music_init: false,
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
+            daw: None,
+            #[cfg(all(not(target_arch = "wasm32"), feature = "art"))]
+            paint: None,
+            #[cfg(all(not(target_arch = "wasm32"), feature = "game"))]
+            body: body::BodyState::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            g3d: game3d::G3dState::default(),
+            gstore: FxHashMap::default(),
+            px_clip: None,
+            px_black: false,
+            #[cfg(feature = "audio")]
             tracks: Vec::new(),
+            #[cfg(feature = "audio")]
             lyrics: Vec::new(),
+            #[cfg(feature = "audio")]
             midis: Vec::new(),
+            #[cfg(feature = "game")]
             soft_bodies: Vec::new(),
+            #[cfg(feature = "game")]
             rigid_world: ling_physics::rigid::PhysicsWorld::new(),
+            #[cfg(feature = "game")]
             liquids: Vec::new(),
             meshes: Vec::new(),
+            #[cfg(feature = "game")]
             gltf_models: std::cell::RefCell::new(Vec::new()),
+            #[cfg(feature = "game")]
+            gltf_tex_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            #[cfg(feature = "game")]
             dialog: None,
             dialog_colors: [0xE6F2FF, 0xFFD24A, 0x4AD2FF, 0x6CFF8C], // text · name · place · item
             frames: Vec::new(),
             error_trace: None,
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "game"))]
             input: RefCell::new(None),
             #[cfg(all(not(target_arch = "wasm32"), feature = "web"))]
             http_routes: Vec::new(),
             #[cfg(all(not(target_arch = "wasm32"), feature = "web"))]
             db: None,
             #[cfg(all(not(target_arch = "wasm32"), feature = "web"))]
+            db_path: None,
+            #[cfg(all(not(target_arch = "wasm32"), feature = "web"))]
             http_static_dirs: Vec::new(),
             #[cfg(all(not(target_arch = "wasm32"), feature = "web"))]
+            http_vhosts: Vec::new(),
+            #[cfg(all(not(target_arch = "wasm32"), feature = "web"))]
             async_jobs: web::AsyncJobs::new(),
+            #[cfg(all(not(target_arch = "wasm32"), feature = "web"))]
+            program: None,
             #[cfg(all(not(target_arch = "wasm32"), feature = "web"))]
             oauth_jobs: web::OAuthJobs::new(),
             #[cfg(all(not(target_arch = "wasm32"), feature = "web"))]
             last_http_status: 0,
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "privacy"))]
             lingtp_routes: Vec::new(),
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "privacy"))]
             last_lingtp_status: 0,
             #[cfg(not(target_arch = "wasm32"))]
             terrain_grid_jobs: terrain_bg::TerrainGridJobs::new(),
@@ -2049,7 +2439,7 @@ impl Interpreter {
     /// Lazily initialise the input system and advance it one frame; returns the
     /// number of connected gamepads. Call once per game-loop iteration (like a
     /// window update) before reading `pad_*` state.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), feature = "game"))]
     fn pad_poll(&self) -> usize {
         let mut slot = self.input.borrow_mut();
         if slot.is_none() {
@@ -2069,7 +2459,7 @@ impl Interpreter {
 
     /// Read player `slot`'s gamepad with `f`, or return `default` if there is no
     /// input system / no such pad.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), feature = "game"))]
     fn with_pad<T>(&self, slot: usize, default: T, f: impl FnOnce(&ling_input::Gamepad) -> T) -> T {
         let inp = self.input.borrow();
         match inp.as_ref().and_then(|s| s.sensorium.player(slot)) {
@@ -2086,6 +2476,29 @@ impl Interpreter {
 
     #[cfg(target_arch = "wasm32")]
     fn wasm_pace_frame(&mut self) {
+        // Host hook: the page's worker defines `__ling_frame()` to pump input and
+        // streamed assets into the runtime while the (blocking) program is running.
+        {
+            use wasm_bindgen::JsCast;
+            let g = js_sys::global();
+            if let Ok(f) = js_sys::Reflect::get(&g, &wasm_bindgen::JsValue::from_str("__ling_frame")) {
+                if let Some(f) = f.dyn_ref::<js_sys::Function>() {
+                    let _ = f.call0(&g);
+                }
+            }
+        }
+        // live window resize / fullscreen requested by the page (resize_canvas export)
+        if let Some((w, h)) = crate::gfx::wasm_take_resize() {
+            let mut gfx = self.gfx.borrow_mut();
+            if gfx.width != w || gfx.height != h {
+                gfx.width = w;
+                gfx.height = h;
+                gfx.buffer = vec![0u32; w * h];
+                gfx.depth_buf = Vec::new();
+                gfx.zbuf_needs_clear = true;
+                crate::gfx::webgl::resize_canvas(w, h);
+            }
+        }
         let fps = self.wasm_target_fps.max(1.0);
         let frame_ms = 1000.0 / fps;
         let now = js_sys::Date::now();
@@ -2113,6 +2526,8 @@ impl Interpreter {
     where
         F: FnOnce(&mut Self) -> Result<T, EvalErr>,
     {
+        #[cfg(not(target_arch = "wasm32"))]
+        self.check_cancel()?;
         self.frames.push(name.to_string());
         let result = body(self);
         if matches!(result, Err(EvalErr::Runtime(_))) && self.error_trace.is_none() {
@@ -2125,7 +2540,7 @@ impl Interpreter {
     /// Render the active dialog box: beveled frame + dark fill, then the visible
     /// (typewriter-revealed) text word-wrapped with colour-coded runs, plus a
     /// blinking advance arrow once the page is fully typed.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), feature = "game"))]
     fn render_dialog(&mut self, x: f32, y: f32, w: f32, h: f32, font: i64, t: f32) {
         let (runs, typing) = match &self.dialog {
             Some(d) if !d.is_closed() => {
@@ -2191,7 +2606,7 @@ impl Interpreter {
             }
             for word in text.split_inclusive(' ') {
                 let wpx = if use_font {
-                    self.fonts[font as usize].measure(word, px)
+                    self.font_measure_fb(font as usize, word, px)
                 } else {
                     ling_ui::holo::text_width(word, px * 0.6, px * 0.24)
                 };
@@ -2252,7 +2667,7 @@ impl Interpreter {
 
     /// Lazily start the music engine on first use (playback/synth need a device;
     /// analysis/decoding do not). Returns `false` if no audio device is available.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
     fn ensure_music(&mut self) -> bool {
         if self.music.is_some() {
             return true;
@@ -2797,8 +3212,7 @@ impl Interpreter {
     /// Lay out `text` for font `id` at size `px`, returning every glyph contour as
     /// a screen-space polyline (x→right, y→down). `(x, y)` is the text box top-left;
     /// the baseline is placed `ascent*px` below it. Curves are flattened to 0.3 px.
-    #[cfg(not(target_arch = "wasm32"))]
-    fn font_layout_2d(
+        fn font_layout_2d(
         &mut self,
         id: usize,
         x: f32,
@@ -2815,8 +3229,7 @@ impl Interpreter {
 
     /// Same as [`font_layout_2d`] but grouped per glyph (so a fill can apply the
     /// non-zero winding rule within each glyph, preserving interior holes).
-    #[cfg(not(target_arch = "wasm32"))]
-    fn font_layout_2d_glyphs(
+        fn font_layout_2d_glyphs(
         &mut self,
         id: usize,
         x: f32,
@@ -2824,13 +3237,12 @@ impl Interpreter {
         px: f32,
         text: &str,
     ) -> Vec<Vec<Vec<[f32; 2]>>> {
-        let font = &mut self.fonts[id];
-        let asc = font.ascent();
+        let asc = self.fonts[id].ascent();
         let tol = 0.3 / px;
         let mut pen = 0.0f32;
         let mut glyphs = Vec::new();
         for ch in text.chars() {
-            let go = font.glyph_outline(ch, tol);
+            let go = self.font_glyph_fb(id, ch, tol);
             let mut contours = Vec::with_capacity(go.polylines.len());
             for pl in &go.polylines {
                 let mapped: Vec<[f32; 2]> = pl
@@ -2845,11 +3257,71 @@ impl Interpreter {
         glyphs
     }
 
+    /// The font that draws `ch` for handle `id`, and the size factor to draw it at: `id` itself
+    /// when it has the glyph (or nothing has it), else the first font down its `font_fallback`
+    /// chain that does. Blanks and control chars always stay with `id`.
+        fn font_for(&mut self, id: usize, ch: char) -> (usize, f32) {
+        if ch.is_whitespace() || ch.is_control() || self.font_fallbacks.get(id).map_or(true, |f| f.is_none()) {
+            return (id, 1.0);
+        }
+        let mut cur = id;
+        let mut scale = 1.0f32;
+        for _ in 0..6 {
+            if self.fonts[cur].has_glyph(ch) {
+                return (cur, scale);
+            }
+            match self.font_fallbacks.get(cur).copied().flatten() {
+                Some((fb, s)) if fb < self.fonts.len() && fb != cur => {
+                    cur = fb;
+                    scale *= s;
+                },
+                _ => break,
+            }
+        }
+        (id, 1.0)
+    }
+
+    /// `ch`'s outline (em units) through the fallback chain, scaled to the primary's em.
+        fn font_glyph_fb(&mut self, id: usize, ch: char, tol_em: f32) -> ling_graphics::GlyphOutline {
+        let (fid, scale) = self.font_for(id, ch);
+        let go = self.fonts[fid].glyph_outline(ch, tol_em / scale.max(0.01));
+        if scale == 1.0 {
+            return go;
+        }
+        ling_graphics::GlyphOutline {
+            polylines: go.polylines.iter().map(|pl| pl.iter().map(|p| [p[0] * scale, p[1] * scale]).collect()).collect(),
+            advance: go.advance * scale,
+        }
+    }
+
+    /// Normalized advance of `ch` through the fallback chain.
+        fn font_advance_fb(&mut self, id: usize, ch: char) -> f32 {
+        let (fid, scale) = self.font_for(id, ch);
+        self.fonts[fid].advance(ch) * scale
+    }
+
+    /// Pixel width of `text` at `px`, every char measured in the font that draws it.
+    pub(crate) fn font_measure_fb(&mut self, id: usize, text: &str, px: f32) -> f32 {
+        if self.font_fallbacks.get(id).map_or(true, |f| f.is_none()) {
+            return self.fonts[id].measure(text, px);
+        }
+        text.chars().map(|c| self.font_advance_fb(id, c)).sum::<f32>() * px
+    }
+
     /// Register every item (functions, structs, globals) and evaluate the
     /// non-`do` globals into `global_seed`, WITHOUT running the entry. Used to
     /// prime the JIT's fallback interpreter so cranelift-skipped (oversized)
     /// functions can still be interpreted with full access to globals + peers.
     pub fn register_program(&mut self, program: &Program) -> Result<(), String> {
+        // Keep the program so `http_serve` can hand it to worker interpreters.
+        // A worker pre-seeds this field with the shared `Arc` before calling
+        // here, so only the first registration pays for the copy.
+        #[cfg(all(not(target_arch = "wasm32"), feature = "web"))]
+        {
+            if self.program.is_none() {
+                self.program = Some(std::sync::Arc::new(program.clone()));
+            }
+        }
         for item in &program.items {
             self.register_item("", item)?;
         }
@@ -2960,7 +3432,7 @@ impl Interpreter {
     ) -> Result<(), String> {
         // ── Wasm32: no filesystem — use the pre-registered module registry ──
         #[cfg(target_arch = "wasm32")]
-        let (source, sub_dir) = {
+        let (source, sub_dir, cache_key) = {
             // Skip if already loaded (circular import guard)
             if self.loaded_files.contains(path) {
                 return Ok(());
@@ -2970,12 +3442,12 @@ impl Interpreter {
             let src = crate::runtime::get_wasm_module(path)
                 .or_else(|| crate::runtime::get_wasm_module(&format!("{}.ling", path)))
                 .ok_or_else(|| format!("use: cannot find module '{path}'"))?;
-            (src, None::<std::path::PathBuf>)
+            (src, None::<std::path::PathBuf>, ())
         };
 
         // ── Native: resolve against filesystem ──
         #[cfg(not(target_arch = "wasm32"))]
-        let (source, sub_dir) = {
+        let (source, sub_dir, cache_key) = {
             let base_dir = self
                 .source_dir
                 .clone()
@@ -3012,11 +3484,19 @@ impl Interpreter {
             let src = std::fs::read_to_string(&resolved)
                 .map_err(|e| format!("use: failed to read '{path}': {e}"))?;
             let dir = resolved.parent().map(|p| p.to_path_buf());
-            (src, dir)
+            (src, dir, canonical)
         };
 
-        let program = crate::parser::parse(&source)
+        // Native: parsed modules are shared process-wide (threads.rs cache),
+        // so every isolate that `use`s a module reuses one parse.
+        #[cfg(not(target_arch = "wasm32"))]
+        let program = threads::parse_cached_source(&cache_key, source)
             .map_err(|e| format!("use: parse error in '{path}': {e}"))?;
+        #[cfg(target_arch = "wasm32")]
+        let program = {
+            let _ = cache_key;
+            crate::parser::parse(&source).map_err(|e| format!("use: parse error in '{path}': {e}"))?
+        };
 
         // Compute target namespace: parent_ns :: alias (or just alias, or just parent_ns)
         let target_ns = match (parent_ns.is_empty(), alias) {
@@ -3112,6 +3592,8 @@ impl Interpreter {
                 // `bind counter = counter + 1` persists across iterations,
                 // which is the expected behaviour in a scripting language.
                 loop {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    self.check_cancel()?;
                     let cv = self.eval_expr(cond, env)?;
                     if !self.is_truthy(&cv) {
                         break;
@@ -3129,6 +3611,8 @@ impl Interpreter {
                 let iter_val = self.eval_expr(iter, env)?;
                 let items = self.value_to_iter(iter_val)?;
                 for item in items {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    self.check_cancel()?;
                     let mut local = env.clone();
                     local.insert(var.clone(), item);
                     match self.exec_block(body, &mut local) {
@@ -3387,12 +3871,425 @@ impl Interpreter {
             };
         }
 
+        // Capability gate for isolates (threads.rs); the main thread skips it.
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.caps.is_some() {
+            self.isolate_guard(name)?;
+        }
+
         #[cfg(target_arch = "wasm32")]
         if let Some(v) = self.wasm_music_builtin(name, &args)? {
             return Ok(v);
         }
 
+        // The builtin families, each with its own name table; a name is tried against them in this order. Every miss is a
+        // walk through a long table, so the family that answered is remembered per name (a builtin in the main table below
+        // skips all of them). A family that answered before but not now falls back to the full walk.
+        // textured meshes (txm_*) — cross-platform, so dispatched outside the
+        // native-only FAMILIES block below.
+        if name.starts_with("txm_") {
+            if let Some(r) = self.texmesh_builtin(name, &args) {
+                return r;
+            }
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        let mut main_chunk: Option<u8> = None;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            type Family = fn(&mut Interpreter, &str, &[Value]) -> Option<EvalResult>;
+            const FAMILIES: &[Family] = &[
+                Interpreter::daw_builtin,
+                Interpreter::paint_builtin,
+                Interpreter::video_builtin,
+                Interpreter::threads_builtin,
+                Interpreter::bytes_builtin,
+                #[cfg(feature = "privacy")]
+                Interpreter::lwcrypto_builtin,
+                #[cfg(feature = "privacy")]
+                Interpreter::p2p_builtin,
+                #[cfg(feature = "game")]
+                Interpreter::body_builtin,
+                Interpreter::game3d_builtin,
+            ];
+            const ROUTE_MAIN: u8 = FAMILIES.len() as u8;
+            const _: () = assert!(ROUTE_MAIN < MAIN_CHUNK_BASE);
+            match self.builtin_route.get(name).copied() {
+                Some(k) if k >= MAIN_CHUNK_BASE => main_chunk = Some(k - MAIN_CHUNK_BASE),
+                Some(ROUTE_MAIN) => {},
+                Some(k) => {
+                    if let Some(r) = FAMILIES[k as usize](self, name, &args) {
+                        return r;
+                    }
+                    self.builtin_route.remove(name);
+                    for f in FAMILIES.iter() {
+                        if let Some(r) = f(self, name, &args) {
+                            return r;
+                        }
+                    }
+                },
+                None => {
+                    for (k, f) in FAMILIES.iter().enumerate() {
+                        if let Some(r) = f(self, name, &args) {
+                            self.builtin_route.insert(name.to_string(), k as u8);
+                            return r;
+                        }
+                    }
+                    self.builtin_route.insert(name.to_string(), ROUTE_MAIN);
+                },
+            }
+        }
+
+        // The builtins a frame calls hundreds of times (slicing and measuring strings, list access): a short table tried
+        // before the main one, whose thousands of names are compared one after another (a late arm cost ~3 us a call).
         match name {
+            // image_pixel_r/g/b/a(id, x, y) → one 0..255 channel; image_pixel_u16(id, x, y)
+            // → r*256 + g, a 16-bit value (height maps) in one call instead of two.
+            // Out of range / bad id → 0. Hot: a terrain game samples thousands a frame,
+            // so these sit in this early table instead of deep in the main match.
+            "image_pixel_r" | "image_pixel_g" | "image_pixel_b" | "image_pixel_a" | "image_pixel_u16" => {
+                let id = self.arg_num(&args, 0, -1.0)? as i64;
+                let px = self.arg_num(&args, 1, 0.0)? as i64;
+                let py = self.arg_num(&args, 2, 0.0)? as i64;
+                if id >= 0 && (id as usize) < self.images.len() {
+                    let img = &self.images[id as usize];
+                    if px >= 0 && py >= 0 && (px as u32) < img.width() && (py as u32) < img.height() {
+                        let p = img.get_pixel(px as u32, py as u32);
+                        let v = match name {
+                            "image_pixel_r" => p[0] as f64,
+                            "image_pixel_g" => p[1] as f64,
+                            "image_pixel_b" => p[2] as f64,
+                            "image_pixel_a" => p[3] as f64,
+                            _ => p[0] as f64 * 256.0 + p[1] as f64,
+                        };
+                        return Ok(Value::Number(v));
+                    }
+                }
+                return Ok(Value::Number(0.0));
+            },
+            // image_height_tri(id, fx, fz, step) — sample a 16-bit height map (r*256 + g per
+            //   pixel, blue < 128 = no data) the way a node-grid terrain mesh draws it: the
+            //   cell of `step` pixels holding (fx, fz) in pixel units is split along its
+            //   (qx+step, qz)–(qx, qz+step) diagonal into two flat triangles and the height is
+            //   interpolated on the one containing the point. Returns 0..65535, or -1 where
+            //   the cell's corner has no data (or the image id is bad). One call replaces a
+            //   script doing four pixel reads and the interpolation itself.
+            "image_height_tri" => {
+                let id = self.arg_num(&args, 0, -1.0)? as i64;
+                let fx = self.arg_num(&args, 1, 0.0)?;
+                let fz = self.arg_num(&args, 2, 0.0)?;
+                let ms = self.arg_num(&args, 3, 1.0)?;
+                if id < 0 || id as usize >= self.images.len() || !(ms > 0.0) || !fx.is_finite() || !fz.is_finite() {
+                    return Ok(Value::Number(-1.0));
+                }
+                let img = &self.images[id as usize];
+                let (w, h) = (img.width() as i64, img.height() as i64);
+                // same out-of-range rule as image_pixel_*: 0 outside the image
+                let px = |x: f64, y: f64, c: usize| -> f64 {
+                    let (xi, yi) = (x as i64, y as i64);
+                    if xi >= 0 && yi >= 0 && xi < w && yi < h { img.get_pixel(xi as u32, yi as u32)[c] as f64 } else { 0.0 }
+                };
+                let u16v = |x: f64, y: f64| px(x, y, 0) * 256.0 + px(x, y, 1);
+                let qx = (fx / ms).floor() * ms;
+                let qz = (fz / ms).floor() * ms;
+                if px(qx, qz, 2) < 128.0 {
+                    return Ok(Value::Number(-1.0));
+                }
+                let tx = (fx - qx) / ms;
+                let tz = (fz - qz) / ms;
+                let h10 = u16v(qx + ms, qz);
+                let h01 = u16v(qx, qz + ms);
+                let h16 = if tx + tz <= 1.0 {
+                    let h00 = u16v(qx, qz);
+                    h00 + (h10 - h00) * tx + (h01 - h00) * tz
+                } else {
+                    let h11 = u16v(qx + ms, qz + ms);
+                    h11 + (h01 - h11) * (1.0 - tx) + (h10 - h11) * (1.0 - tz)
+                };
+                return Ok(Value::Number(h16));
+            },
+            // Parses a string to a number (0 on failure — degrades gracefully,
+            // like the other filesystem/parsing builtins in this file).
+            "to_number" | "转数字" => {
+                let s = self.arg_str(&args, 0, "");
+                return Ok(Value::Number(s.trim().parse().unwrap_or(0.0)));
+            },
+            // Plain SHA-256 hex — matches the browser's native SubtleCrypto
+            // digest("SHA-256", ...), which is what proof-of-work mining uses
+            // client-side (Web Crypto has no Blake3/SHA-3, so this is the one
+            // hash both sides can compute natively and fast).
+            "sha256_hex" | "SHA256哈希" => {
+                use sha2::Digest;
+                let s = self.arg_str(&args, 0, "");
+                let mut h = sha2::Sha256::new();
+                h.update(s.as_bytes());
+                return Ok(Value::Str(hex_encode(&h.finalize())));
+            },
+            // Parses a hex string (no "0x" prefix) to a number — `to_number`
+            // uses Rust's plain f64 parser, which doesn't understand hex.
+            "hex_to_number" | "十六进制转数字" => {
+                let s = self.arg_str(&args, 0, "");
+                let v = u64::from_str_radix(s.trim(), 16).unwrap_or(0);
+                return Ok(Value::Number(v as f64));
+            },
+            "split" | "str_split" | "แยก" | "جداسازی" | "قسّم" | "פצל" | "تقسیم_کرو" =>
+            {
+                let s = self.arg_str(&args, 0, "");
+                let sep = self.arg_str(&args, 1, "\n");
+                let sep = if sep.is_empty() { "\n".into() } else { sep };
+                let parts: Vec<Value> = s
+                    .split(sep.as_str())
+                    .map(|p| Value::Str(p.to_string()))
+                    .collect();
+                return Ok(Value::List(Rc::new(parts)));
+            },
+            "trim"
+            | "str_trim"
+            | "ตัดช่องว่าง"
+            | "حذف_فاصله"
+            | "اقتطع_الفراغات"
+            | "חתוך_רווחים"
+            | "خالی_جگہ_کاٹو" => {
+                let s = self.arg_str(&args, 0, "");
+                return Ok(Value::Str(s.trim().to_string()));
+            },
+            "starts_with"
+            | "str_starts_with"
+            | "เริ่มด้วย"
+            | "شروع_می‌شود_با"
+            | "يبدأ_بـ"
+            | "מתחיל_ב"
+            | "شروع_ہوتا_ہے" => {
+                let s = self.arg_str(&args, 0, "");
+                let prefix = self.arg_str(&args, 1, "");
+                return Ok(Value::Bool(s.starts_with(prefix.as_str())));
+            },
+            "ends_with"
+            | "str_ends_with"
+            | "ลงท้ายด้วย"
+            | "پایان_می‌یابد_با"
+            | "ينتهي_بـ"
+            | "מסתיים_ב"
+            | "ختم_ہوتا_ہے" => {
+                let s = self.arg_str(&args, 0, "");
+                let suffix = self.arg_str(&args, 1, "");
+                return Ok(Value::Bool(s.ends_with(suffix.as_str())));
+            },
+            "str_replace"
+            | "แทนสตริง"
+            | "جایگزینی_رشته"
+            | "استبدل_النص"
+            | "החלף_מחרוזת"
+            | "اسٹرنگ_تبدیل" => {
+                let s = self.arg_str(&args, 0, "");
+                let from = self.arg_str(&args, 1, "");
+                let to = self.arg_str(&args, 2, "");
+                return Ok(Value::Str(s.replace(from.as_str(), to.as_str())));
+            },
+            "str_find"
+            | "หาในสตริง"
+            | "جستجوی_رشته"
+            | "ابحث_في_النص"
+            | "חפש_מחרוזת"
+            | "اسٹرنگ_تلاش" => {
+                let s = self.arg_str(&args, 0, "");
+                let needle = self.arg_str(&args, 1, "");
+                // Return char index (not byte index) for consistency with substr
+                let pos = s
+                    .find(needle.as_str())
+                    .map(|byte_i| s[..byte_i].chars().count() as f64)
+                    .unwrap_or(-1.0);
+                return Ok(Value::Number(pos));
+            },
+            "substr"
+            | "str_slice"
+            | "ส่วนสตริง"
+            | "زیررشته"
+            | "جزء_النص"
+            | "תת_מחרוזת"
+            | "ذیلی_اسٹرنگ" => {
+                let s = self.arg_str(&args, 0, "");
+                let start = self.arg_num(&args, 1, 0.0)? as usize;
+                let len = args
+                    .get(2)
+                    .map(|v| self.to_number(v).unwrap_or(999999.0) as usize)
+                    .unwrap_or_else(|| s.chars().count().saturating_sub(start));
+                let chars: Vec<char> = s.chars().collect();
+                let end = (start + len).min(chars.len());
+                let slice: String = chars.get(start..end).unwrap_or(&[]).iter().collect();
+                return Ok(Value::Str(slice));
+            },
+            "to_str"
+            | "str"
+            | "num_str"
+            | "แปลงสตริง"
+            | "تبدیل_به_رشته"
+            | "حوّل_لنص"
+            | "המר_למחרוזת"
+            | "اسٹرنگ_میں_بدلو" => {
+                let v = args.into_iter().next().unwrap_or(Value::Unit);
+                return Ok(Value::Str(v.to_string()));
+            },
+            "str_repeat"
+            | "ทำซ้ำสตริง"
+            | "تکرار_رشته"
+            | "كرّر_النص"
+            | "חזור_על_מחרוזת"
+            | "اسٹرنگ_دہراؤ" => {
+                let s = self.arg_str(&args, 0, "");
+                let n = self.arg_num(&args, 1, 1.0)? as usize;
+                return Ok(Value::Str(s.repeat(n)));
+            },
+            // str_contains(s, sub) — documented in the builtins reference; the
+            // method form `s.contains(sub)` existed, the function form did not.
+            "str_contains" | "字符串包含" | "문자열포함" | "มีข้อความ" => {
+                let hay = self.arg_str(&args, 0, "");
+                let needle = self.arg_str(&args, 1, "");
+                return Ok(Value::Bool(hay.contains(needle.as_str())));
+            },
+            "str_upper" => {
+                let s = self.arg_str(&args, 0, "");
+                return Ok(Value::Str(s.to_uppercase()));
+            },
+            "str_lower" => {
+                let s = self.arg_str(&args, 0, "");
+                return Ok(Value::Str(s.to_lowercase()));
+            },
+            "str_len"
+            | "len"
+            | "list_len" // docs' historical name for list length — same builtin
+            | "ความยาว"
+            | "长度"
+            | "長さ"
+            | "길이"
+            | "طول_رشته"
+            | "طول_النص"
+            | "אורך_מחרוזת"
+            | "اسٹرنگ_لمبائی" => match args.first() {
+                Some(Value::Str(s)) => return Ok(Value::Number(s.chars().count() as f64)),
+                Some(Value::List(v)) => return Ok(Value::Number(v.len() as f64)),
+                _ => return Ok(Value::Number(0.0)),
+            },
+
+            // ── FNV-1a hash (deterministic, normalized 0.0–1.0) ──────────────
+            "hash_str" | "แฮช" | "درهم_رشته" | "بصمة_نص" | "גיבוב_מחרוזת" | "اسٹرنگ_ہیش" =>
+            {
+                let s = self.arg_str(&args, 0, "");
+                let mut h: u64 = 14695981039346656037_u64;
+                for b in s.bytes() {
+                    h ^= b as u64;
+                    h = h.wrapping_mul(1099511628211);
+                }
+                return Ok(Value::Number((h & 0xFFFFFF) as f64 / 16777215.0));
+            },
+            "hash_int" | "แฮชจำนวน" | "درهم_عدد" | "بصمة_عدد" | "גיבוב_מספר" | "نمبر_ہیش" =>
+            {
+                let s = self.arg_str(&args, 0, "");
+                let n = self.arg_num(&args, 1, 100.0)? as u64;
+                let mut h: u64 = 14695981039346656037_u64;
+                for b in s.bytes() {
+                    h ^= b as u64;
+                    h = h.wrapping_mul(1099511628211);
+                }
+                return Ok(Value::Number((h % n.max(1)) as f64));
+            },
+
+            // ── List utilities ────────────────────────────────────────────────
+            "list_new"
+            | "รายการใหม่"
+            | "新建列表"
+            | "新規リスト"
+            | "새목록"
+            | "فهرست_جدید"
+            | "قائمة_جديدة"
+            | "רשימה_חדשה"
+            | "نئی_فہرست"
+            | "nouvelle_liste"
+            | "neue_liste"
+            | "новый_список" => {
+                return Ok(Value::List(Rc::new(Vec::new())));
+            },
+            "list_push"
+            | "เพิ่มรายการ"
+            | "列表添加"
+            | "リスト追加"
+            | "목록추가"
+            | "افزودن_به_فهرست"
+            | "أضف_للقائمة"
+            | "הוסף_לרשימה"
+            | "فہرست_میں_شامل_کرو"
+            | "ajouter_liste"
+            | "liste_anhängen"
+            | "добавить_в_список" => {
+                let lst = args
+                    .first()
+                    .cloned()
+                    .unwrap_or(Value::List(Rc::new(vec![])));
+                let val = args.get(1).cloned().unwrap_or(Value::Unit);
+                if let Value::List(mut v) = lst {
+                    Rc::make_mut(&mut v).push(val);
+                    return Ok(Value::List(v));
+                }
+                return Ok(Value::List(Rc::new(vec![val])));
+            },
+            "list_get"
+            | "รับรายการ"
+            | "取元素"
+            | "要素取得"
+            | "요소가져오기"
+            | "دریافت_از_فهرست"
+            | "اجلب_من_القائمة"
+            | "קבל_מרשימה"
+            | "فہرست_سے_حاصل_کرو"
+            | "obtenir_liste"
+            | "liste_abrufen"
+            | "получить_из_списка" => {
+                // Borrow the list; clone only the element (was cloning the whole list).
+                let i = self.arg_num(&args, 1, 0.0)? as usize;
+                if let Some(Value::List(v)) = args.first() {
+                    return Ok(v.get(i).cloned().unwrap_or(Value::Str(String::new())));
+                }
+                return Ok(Value::Str(String::new()));
+            },
+            // font_width(handle, px, "string") — pixel width of a string in a loaded font.
+                        "font_width"
+            | "ความกว้างฟอนต์"
+            | "字体宽度"
+            | "フォント幅"
+            | "글꼴너비"
+            | "عرض_فونت"
+            | "عرض_الخط"
+            | "רוחב_גופן"
+            | "فونٹ_چوڑائی"
+            | "largeur_police"
+            | "schriftart_breite"
+            | "ширина_шрифта" => {
+                let id = self.arg_num(&args, 0, 0.0)? as i64;
+                let px = self.arg_num(&args, 1, 16.0)? as f32;
+                let s = self.arg_str(&args, 2, "");
+                if id >= 0 && (id as usize) < self.fonts.len() {
+                    return Ok(Value::Number(self.font_measure_fb(id as usize, &s, px) as f64));
+                }
+                return Ok(Value::Number(0.0));
+            },
+            _ => {},
+        }
+
+        // The main table, in chunks: rustc compiles a string `match` to compare after compare, so an arm deep in it cost
+        // ~100 ns more a call than one near the top. A name's chunk is learned on its first call (`ChunkLearn`) and later
+        // calls skip every chunk before it (one integer compare each).
+        #[cfg(target_arch = "wasm32")]
+        let main_chunk: Option<u8> =
+            self.builtin_route.get(name).copied().filter(|k| *k >= MAIN_CHUNK_BASE).map(|k| k - MAIN_CHUNK_BASE);
+        if main_chunk.is_none() {
+            MAIN_CHUNK_LEARNED.with(|q| {
+                for (n, c) in q.borrow_mut().drain(..) {
+                    self.builtin_route.insert(n, MAIN_CHUNK_BASE + c);
+                }
+            });
+        }
+        let __ck = main_chunk.unwrap_or(0);
+        let mut __cl = ChunkLearn { name, at: 0, on: main_chunk.is_none() };
+        if __ck == 0 { match name {
             // Module global read emitted by the MIR backend: resolve against the
             // evaluated global snapshot (functions see globals read-only).
             "__ling_global" => {
@@ -3412,9 +4309,14 @@ impl Interpreter {
                     .map(|v| v.to_string())
                     .collect::<Vec<_>>()
                     .join("");
-                println!("{s}");
+                // Never panic when stdout is absent (a windows_subsystem="windows"
+                // GUI build has no console, and isolates run on this interpreter):
+                // `write!` drops the error, `println!` would unwrap it and kill the
+                // thread — which silently takes down the node/wallet isolates.
                 use std::io::Write;
-                std::io::stdout().flush().ok();
+                let mut out = std::io::stdout();
+                let _ = writeln!(out, "{s}");
+                let _ = out.flush();
                 return Ok(Value::Unit);
             },
             // print_color(colorIdx, text...) — ANSI-coloured console line.
@@ -3448,7 +4350,8 @@ impl Interpreter {
                     .collect::<Vec<_>>()
                     .join("");
                 let code = 90 + col.clamp(0, 7);
-                println!("\x1b[1;{code}m{s}\x1b[0m");
+                use std::io::Write;
+                let _ = writeln!(std::io::stdout(), "\x1b[1;{code}m{s}\x1b[0m");
                 return Ok(Value::Unit);
             },
             // ── Format ──
@@ -3511,6 +4414,22 @@ impl Interpreter {
                     }
                 }
                 return Ok(Value::Unit);
+            },
+            // try(fn [, args...]) -> ok(result) / bad("message"): run a function value and turn a RUNTIME ERROR into a
+            // catchable value instead of killing the isolate. A `return` inside the function is its result, as a normal call.
+            // Used so a long-lived server (the node) survives one bad message. Does not catch a real panic (out of memory,
+            // stack overflow) — only the ordinary runtime errors builtins raise on bad input.
+            "try" | "try_call" => {
+                let f = match args.first() {
+                    Some(v @ Value::Fn(..)) => v.clone(),
+                    _ => return Ok(Value::Err(Box::new(Value::Str("try: first argument must be a function".into())))),
+                };
+                let call_args: Vec<Value> = args.iter().skip(1).cloned().collect();
+                return match self.call_value(f, call_args) {
+                    Ok(v) => Ok(Value::Ok(Box::new(v))),
+                    Err(EvalErr::Runtime(m)) => Ok(Value::Err(Box::new(Value::Str(m)))),
+                    Err(e) => Err(e),
+                };
             },
             // ── Flow::parallel stub ──
             "流水::并行" | "Flow::parallel" => {
@@ -3785,7 +4704,8 @@ impl Interpreter {
                 let x = self.arg_num(&args, 0, 0.0)?;
                 let lo = self.arg_num(&args, 1, 0.0)?;
                 let hi = self.arg_num(&args, 2, 1.0)?;
-                return Ok(Value::Number(x.clamp(lo, hi)));
+                // f64::clamp panics when lo > hi (or either is NaN) and a panic closes the program: take the bounds in order
+                return Ok(Value::Number(if lo <= hi { x.max(lo).min(hi) } else { x.max(hi).min(lo) }));
             },
 
             // ── Constants (also accessible as plain identifiers via lookup) ──
@@ -4030,6 +4950,7 @@ impl Interpreter {
             },
 
             // ── Step 4: Microphone Input ──
+            #[cfg(feature = "audio")]
             "mic_open"
             | "เปิดไมค์"
             | "开麦克风"
@@ -4061,7 +4982,11 @@ impl Interpreter {
                 #[cfg(target_arch = "wasm32")]
                 return Ok(Value::Unit);
             },
+            _ => {},
+        } }
+        if __ck <= 1 { __cl.at = 1; match name {
 
+            #[cfg(feature = "audio")]
             "mic_rms"
             | "เสียงRMS"
             | "麦克风音量"
@@ -4087,6 +5012,7 @@ impl Interpreter {
                 return Ok(Value::Number(0.0));
             },
 
+            #[cfg(feature = "audio")]
             "mic_peak"
             | "เสียงพีค"
             | "麦克风峰值"
@@ -4112,6 +5038,7 @@ impl Interpreter {
                 return Ok(Value::Number(0.0));
             },
 
+            #[cfg(feature = "audio")]
             "mic_fft"
             | "วิเคราะห์เสียงสด"
             | "实时频谱"
@@ -4753,6 +5680,9 @@ impl Interpreter {
                 );
                 return Ok(Value::Unit);
             },
+            _ => {},
+        } }
+        if __ck <= 2 { __cl.at = 2; match name {
 
             // shadow_blob(cx,cy, rx,ry, alpha) — soft colored shadow ellipse in
             // the current pen colour. Dark colour = normal shadow; any hue = a
@@ -4952,22 +5882,37 @@ impl Interpreter {
                         .get(2)
                         .map(|v| v.to_string())
                         .unwrap_or_else(|| "Ling".into());
+                    // optional 4th argument: 1 = resizable / maximizable window whose
+                    // framebuffer follows the client size; 2 = scaled: maximizable
+                    // window, the w×h framebuffer stays fixed and is stretched to
+                    // the client area with its aspect ratio kept
+                    let mode = self.arg_num(&args, 3, 0.0)?;
+                    let scaled = mode > 1.5;
+                    let resizable = mode > 0.5 && !scaled;
                     let mut gfx = self.gfx.borrow_mut();
                     let mut win = minifb::Window::new(
                         &title,
                         w,
                         h,
                         minifb::WindowOptions {
-                            resize: false,
+                            resize: resizable || scaled,
                             scale: minifb::Scale::X1,
+                            scale_mode: if scaled {
+                                minifb::ScaleMode::AspectRatioStretch
+                            } else {
+                                minifb::ScaleMode::Stretch
+                            },
                             ..Default::default()
                         },
                     )
                     .map_err(|e| EvalErr::from(format!("cannot open window: {e}")))?;
                     apply_frame_pacing(&mut win, gfx.vsync);
+                    gfx.resizable = resizable;
+                    set_scaled_buffer(scaled, w, h);
                     gfx.buffer = vec![0u32; w * h];
                     gfx.width = w;
                     gfx.height = h;
+                    win.set_input_callback(Box::new(crate::gfx::UnicodeInput));
                     gfx.window = Some(win);
                     gfx.topmost_window = false;
                     gfx.sync_projection();
@@ -4982,6 +5927,42 @@ impl Interpreter {
                     crate::gfx::webgl::resize(w as u32, h as u32);
                 }
                 return Ok(Value::Unit);
+            },
+
+            // window_maximize() — maximize the open window (Windows). Pair with
+            // open_window(w, h, title, 2) and a w:h matching window_work_area()
+            // for a maximized window whose picture keeps the screen's aspect.
+            "window_maximize" | "maximize_window" => {
+                #[cfg(all(not(target_arch = "wasm32"), windows))]
+                {
+                    let gfx = self.gfx.borrow();
+                    if let Some(win) = gfx.window.as_ref() {
+                        extern "system" {
+                            fn ShowWindow(hwnd: *mut std::ffi::c_void, cmd: i32) -> i32;
+                        }
+                        unsafe {
+                            ShowWindow(win.get_window_handle(), 3); // SW_MAXIMIZE
+                        }
+                    }
+                }
+                return Ok(Value::Unit);
+            },
+            // window_work_area() → [w, h]: the client size a maximized window
+            // gets (screen minus taskbar and title bar) — the aspect to render at.
+            "window_work_area" | "work_area" => {
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let (w, h) = work_area_client();
+                    return Ok(Value::List(Rc::new(vec![Value::Number(w as f64), Value::Number(h as f64)])));
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let gfx = self.gfx.borrow();
+                    return Ok(Value::List(Rc::new(vec![
+                        Value::Number(gfx.width as f64),
+                        Value::Number(gfx.height as f64),
+                    ])));
+                }
             },
 
             // ── เติม(r, g, b) — fill / clear screen with colour ──
@@ -5200,6 +6181,7 @@ impl Interpreter {
                 {
                     ling_fps_tick();
                     ling_phase_frame();
+                    ling_codegen::cranelift::fnprof::frame_tick();
                     // Flush depth queue and present — release borrow before reading mouse.
                     {
                         let mut gfx = self.gfx.borrow_mut();
@@ -5213,6 +6195,7 @@ impl Interpreter {
                             let queue = std::mem::take(&mut gfx.depth_queue);
                             {
                                 let g = &mut *gfx;
+                                crate::gfx::raster::set_persp_zd(g.camera.zdist);
                                 let z = if dt { Some(&mut g.depth_buf) } else { None };
                                 queue.flush(&mut g.buffer, z, reset_z, w, h, aa);
                             }
@@ -5251,11 +6234,89 @@ impl Interpreter {
                                 *prev = outp;
                             }
                         }
+                        let overlays = std::mem::take(&mut g.ui_overlays);
                         if let Some(win) = g.window.as_mut() {
                             let _b = std::time::Instant::now();
-                            win.update_with_buffer(&g.buffer, w, h)
-                                .map_err(|e| EvalErr::from(format!("present error: {e}")))?;
+                            if overlays.is_empty() {
+                                win.update_with_buffer(&g.buffer, w, h)
+                                    .map_err(|e| EvalErr::from(format!("present error: {e}")))?;
+                            } else {
+                                // upscale the low-res 3-D frame to the client size ourselves
+                                // (same letterbox maths as AspectRatioStretch, so the mouse
+                                // mapping in buffer_mouse_pos still holds), then lay the
+                                // display-resolution UI layers on top, nearest-sampled
+                                let (cw, ch) = win.get_size();
+                                let (cw, ch) = (cw.max(1), ch.max(1));
+                                let (ba, wa) = (w as f32 / h.max(1) as f32, cw as f32 / ch as f32);
+                                let (dw, dh, ox, oy) = if ba > wa {
+                                    let dh = (cw as f32 / ba).round() as usize;
+                                    (cw, dh.min(ch), 0usize, (ch - dh.min(ch)) / 2)
+                                } else {
+                                    let dw = (ch as f32 * ba).round() as usize;
+                                    (dw.min(cw), ch, (cw - dw.min(cw)) / 2, 0usize)
+                                };
+                                // one row-parallel pass into a pooled display-size frame: each row
+                                // gets the upscaled 3-D row, then every UI overlay's changed pixels
+                                // in order (same result as the old full-frame passes, which also
+                                // allocated a fresh 8 MB frame every present)
+                                let mut full = crate::gfx::scratch::take_u32(cw * ch);
+                                let xs: Vec<usize> = (0..dw).map(|x| (x * w / dw.max(1)).min(w - 1)).collect();
+                                let ovs: Vec<(&[u32], &[u32], usize, usize, Vec<usize>)> = overlays
+                                    .iter()
+                                    .filter(|(_, _, vw, vh)| *vw > 0 && *vh > 0)
+                                    .map(|(off, base, vw, vh)| {
+                                        let vxs: Vec<usize> = (0..dw).map(|x| (x * *vw / dw.max(1)).min(*vw - 1)).collect();
+                                        (off.as_slice(), base.as_slice(), *vw, *vh, vxs)
+                                    })
+                                    .collect();
+                                let frame = &g.buffer;
+                                ui_par_rows(&mut full, cw, |r, row| {
+                                    row.fill(0);
+                                    if r < oy || r >= oy + dh {
+                                        return; // letterbox bar
+                                    }
+                                    let y = r - oy;
+                                    let sy = (y * h / dh.max(1)).min(h - 1);
+                                    let srow = &frame[sy * w..sy * w + w];
+                                    let drow = &mut row[ox..ox + dw];
+                                    for (d, &sx) in drow.iter_mut().zip(xs.iter()) {
+                                        *d = srow[sx];
+                                    }
+                                    for (off, base, vw, vh, vxs) in &ovs {
+                                        let vy = (y * vh / dh.max(1)).min(vh - 1);
+                                        let orow = &off[vy * vw..vy * vw + vw];
+                                        let brow = &base[vy * vw..vy * vw + vw];
+                                        for (d, &vx) in drow.iter_mut().zip(vxs.iter()) {
+                                            let c = orow[vx];
+                                            if c != brow[vx] {
+                                                *d = c;
+                                            }
+                                        }
+                                    }
+                                });
+                                drop(ovs);
+                                let res = win.update_with_buffer(&full, cw, ch);
+                                crate::gfx::scratch::put_u32(full);
+                                // the overlays' layer buffers go back to the pool for next frame's ui_begin
+                                for (off, base, _, _) in overlays {
+                                    crate::gfx::scratch::put_u32(off);
+                                    crate::gfx::scratch::put_u32(base);
+                                }
+                                res.map_err(|e| EvalErr::from(format!("present error: {e}")))?;
+                            }
                             ling_phase_add(phase::BLIT, _b.elapsed().as_nanos());
+                        }
+                        // resizable windows: the framebuffer follows the client size (next frame)
+                        if g.resizable {
+                            if let Some((nw, nh)) = g.window.as_ref().map(|w| w.get_size()) {
+                                if nw > 0 && nh > 0 && (nw != g.width || nh != g.height) {
+                                    g.width = nw;
+                                    g.height = nh;
+                                    g.buffer = vec![0u32; nw * nh];
+                                    g.prev_frame.clear();
+                                    g.sync_projection();
+                                }
+                            }
                         }
                     }
                     // Read mouse AFTER update_with_buffer so events are processed.
@@ -5263,10 +6324,67 @@ impl Interpreter {
                         let gfx = self.gfx.borrow();
                         gfx.window
                             .as_ref()
-                            .and_then(|w| w.get_mouse_pos(minifb::MouseMode::Clamp))
+                            .filter(|w| {
+                        // minifb panics clamping the mouse into a window with no client area (minimised)
+                        let (sw, sh) = w.get_size();
+                        sw > 0 && sh > 0
+                    })
+                    .and_then(|w| buffer_mouse_pos(w))
                     };
                     let mut gfx = self.gfx.borrow_mut();
-                    if gfx.mouse_captured {
+                    // Windows: true relative look. Read the OS cursor, take the delta from the
+                    // client-area centre, and put the cursor back there every frame, so turning
+                    // never stops at a screen or window edge. Nothing is warped while another
+                    // window has focus.
+                    #[cfg(windows)]
+                    let win_captured = if gfx.mouse_captured {
+                        #[repr(C)]
+                        struct POINT { x: i32, y: i32 }
+                        #[repr(C)]
+                        struct RECT { left: i32, top: i32, right: i32, bottom: i32 }
+                        extern "system" {
+                            fn GetForegroundWindow() -> isize;
+                            fn GetClientRect(hwnd: isize, r: *mut RECT) -> i32;
+                            fn ClientToScreen(hwnd: isize, p: *mut POINT) -> i32;
+                            fn GetCursorPos(p: *mut POINT) -> i32;
+                            fn SetCursorPos(x: i32, y: i32) -> i32;
+                        }
+                        let hwnd = gfx.window.as_ref().map(|w| w.get_window_handle() as isize).unwrap_or(0);
+                        let mut handled = false;
+                        if hwnd != 0 {
+                            unsafe {
+                                let fg = GetForegroundWindow() == hwnd;
+                                let mut r = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+                                if fg && GetClientRect(hwnd, &mut r) != 0 && r.right > 0 && r.bottom > 0 {
+                                    let mut c = POINT { x: r.right / 2, y: r.bottom / 2 };
+                                    ClientToScreen(hwnd, &mut c);
+                                    let mut p = POINT { x: c.x, y: c.y };
+                                    GetCursorPos(&mut p);
+                                    if gfx.last_mx.is_nan() {
+                                        gfx.mouse_dx = 0.0;
+                                        gfx.mouse_dy = 0.0;
+                                    } else {
+                                        gfx.mouse_dx = (p.x - c.x) as f32;
+                                        gfx.mouse_dy = (p.y - c.y) as f32;
+                                    }
+                                    SetCursorPos(c.x, c.y);
+                                    gfx.last_mx = (r.right / 2) as f32;
+                                    gfx.last_my = (r.bottom / 2) as f32;
+                                } else {
+                                    gfx.mouse_dx = 0.0;
+                                    gfx.mouse_dy = 0.0;
+                                    gfx.last_mx = f32::NAN;
+                                }
+                            }
+                            handled = true;
+                        }
+                        handled
+                    } else { false };
+                    #[cfg(not(windows))]
+                    let win_captured = false;
+                    if win_captured {
+                        // done above
+                    } else if gfx.mouse_captured {
                         let w = gfx.width as f32;
                         let h = gfx.height as f32;
                         if let Some((mx, my)) = mouse_pos {
@@ -5403,6 +6521,7 @@ impl Interpreter {
                             let queue = std::mem::take(&mut gfx.depth_queue);
                             {
                                 let g = &mut *gfx;
+                                crate::gfx::raster::set_persp_zd(g.camera.zdist);
                                 let z = if dt { Some(&mut g.depth_buf) } else { None };
                                 queue.flush(&mut g.buffer, z, reset_z, w, h, aa);
                             }
@@ -5413,7 +6532,12 @@ impl Interpreter {
                         }
                         gfx.post_done = false;
                         crate::gfx::webgl::blit_rgb(&gfx.buffer, w, h);
+                        crate::gfx::webgl::post_ui(crate::gfx::wasm_ui_overlay_take());
                     }
+                    // click-edge latch for ui_button & co: remember whether the button was down at the END of
+                    // this frame (before the host hook below applies new input), so next frame
+                    // `down && !mouse_was_down` is true for exactly one frame per press.
+                    self.mouse_was_down = crate::gfx::wasm_mouse_down();
                     self.wasm_pace_frame();
                 }
                 // Update the click-edge latch for interactive UI widgets —
@@ -5427,6 +6551,9 @@ impl Interpreter {
                 self.frame_num += 1;
                 return Ok(Value::Unit);
             },
+            _ => {},
+        } }
+        if __ck <= 3 { __cl.at = 3; match name {
 
             // ── เปิดหน้าต่างเต็มจอ(title) — true native-res fullscreen window ──
             "เปิดหน้าต่างเต็มจอ"
@@ -5457,20 +6584,47 @@ impl Interpreter {
                 #[cfg(all(not(target_arch = "wasm32"), not(windows)))]
                 let (default_w, default_h) = native_screen_size();
 
+                // w/h ≤ 0 (or absent) → the native screen size, so a script can
+                // pass the 4th render-height arg without knowing the monitor.
                 let w = args
                     .get(1)
-                    .map(|v| self.to_number(v).unwrap_or(default_w) as usize)
-                    .unwrap_or(default_w as usize);
+                    .map(|v| self.to_number(v).unwrap_or(default_w))
+                    .filter(|v| *v > 0.0)
+                    .unwrap_or(default_w) as usize;
                 let h = args
                     .get(2)
-                    .map(|v| self.to_number(v).unwrap_or(default_h) as usize)
-                    .unwrap_or(default_h as usize);
+                    .map(|v| self.to_number(v).unwrap_or(default_h))
+                    .filter(|v| *v > 0.0)
+                    .unwrap_or(default_h) as usize;
+                // optional 4th arg: internal RENDER HEIGHT. The window still covers
+                // the whole screen at native size, but the CPU rasterizer draws into
+                // a smaller framebuffer (same aspect) that minifb stretches up — fill
+                // cost scales with pixels, so 720p on a 1440p screen is ~4x cheaper.
+                // Mouse coords are mapped back via the scaled-buffer path.
+                #[cfg(not(target_arch = "wasm32"))]
+                let render_h = args
+                    .get(3)
+                    .map(|v| self.to_number(v).unwrap_or(0.0))
+                    .or_else(|| {
+                        // No 4th arg: fall back to the LING_RENDER_H env var so a
+                        // launcher can pick the render scale without the script
+                        // changing (keeps scripts compatible with older engines).
+                        std::env::var("LING_RENDER_H").ok().and_then(|s| s.trim().parse::<f64>().ok())
+                    })
+                    .unwrap_or(0.0)
+                    .max(0.0) as usize;
                 #[cfg(not(target_arch = "wasm32"))]
                 {
                     let title = args
                         .first()
                         .map(|v| v.to_string())
                         .unwrap_or_else(|| "Ling".into());
+                    let scaled = render_h >= 120 && render_h < h;
+                    let (bw, bh) = if scaled {
+                        (((w as f64) * (render_h as f64) / (h as f64)).round().max(1.0) as usize, render_h)
+                    } else {
+                        (w, h)
+                    };
                     let mut gfx = self.gfx.borrow_mut();
                     let mut win = minifb::Window::new(
                         &title,
@@ -5482,17 +6636,24 @@ impl Interpreter {
                             resize: false,
                             topmost: true,
                             scale: minifb::Scale::X1,
+                            scale_mode: if scaled {
+                                minifb::ScaleMode::AspectRatioStretch
+                            } else {
+                                minifb::ScaleMode::Stretch
+                            },
                             ..Default::default()
                         },
                     )
                     .map_err(|e| EvalErr::from(format!("cannot open fullscreen: {e}")))?;
                     apply_frame_pacing(&mut win, gfx.vsync);
+                    set_scaled_buffer(scaled, bw, bh);
                     // Grab the native handle *before* moving the window into gfx.
                     #[cfg(windows)]
                     let hwnd = win.get_window_handle() as isize;
-                    gfx.buffer = vec![0u32; w * h];
-                    gfx.width = w;
-                    gfx.height = h;
+                    gfx.buffer = vec![0u32; bw * bh];
+                    gfx.width = bw;
+                    gfx.height = bh;
+                    win.set_input_callback(Box::new(crate::gfx::UnicodeInput));
                     gfx.window = Some(win);
                     gfx.topmost_window = true;
                     #[cfg(windows)]
@@ -5548,6 +6709,279 @@ impl Interpreter {
                 return Ok(Value::Number(self.gfx.borrow().height as f64));
             },
 
+            // display_info() -> [width, height, refresh hz, dpi, bits per pixel] of the primary
+            //   monitor, in physical pixels (the process is made DPI-aware first, so Windows display
+            //   scaling doesn't shrink the numbers)
+            "display_info" => {
+                let (w, h, hz, dpi, bpp) = display_info();
+                return Ok(Value::List(Rc::new(vec![
+                    Value::Number(w as f64),
+                    Value::Number(h as f64),
+                    Value::Number(hz as f64),
+                    Value::Number(dpi as f64),
+                    Value::Number(bpp as f64),
+                ])));
+            },
+            // ui_begin(scale) — open a UI layer: until ui_end(), every 2-D draw
+            //   goes into an offscreen buffer of the VIRTUAL size (real / scale),
+            //   seeded with a downsampled copy of the scene; get_width/get_height,
+            //   mouse_x/mouse_y, the ui_* widgets' mouse and project_3d all report
+            //   virtual coordinates. A HUD laid out for e.g. 720p then scales to any
+            //   resolution unchanged. scale ~ 1 → no-op.
+            // ui_end() — composite back: only the pixels the UI changed are
+            //   scaled onto the real frame (the 3-D scene stays sharp).
+            "ui_begin" => {
+                let sc = (self.arg_num(&args, 0, 1.0)? as f32).clamp(0.25, 8.0);
+                let mut g = self.gfx.borrow_mut();
+                if g.ui_layer.is_some() {   // (no 1:1 shortcut: ui_pixel_drawn needs the layer even at scale 1)
+                    return Ok(Value::Unit);
+                }
+                let (rw, rh) = (g.width, g.height);
+                let vw = ((rw as f32) / sc).round().max(1.0) as usize;
+                let vh = ((rh as f32) / sc).round().max(1.0) as usize;
+                #[cfg(target_arch = "wasm32")]
+                let detached_now = crate::gfx::wasm_ui_detached();
+                #[cfg(not(target_arch = "wasm32"))]
+                let detached_now = false;
+                if vw == rw && vh == rh && !detached_now {
+                    // same size as the frame (native 1080p, scale 1): draw straight into
+                    // the frame; only a snapshot is kept for ui_pixel_drawn. ui_end sees
+                    // the empty `real` and just leaves the buffer as drawn.
+                    let mut base = crate::gfx::scratch::take_u32(g.buffer.len());
+                    ui_par_copy(&mut base, &g.buffer);
+                    g.ui_layer = Some((Vec::new(), rw, rh, base));
+                    UI_SCALE.with(|c| c.set(sc));
+                    return Ok(Value::Unit);
+                }
+                let real = std::mem::take(&mut g.buffer);
+                // pooled layer buffers (fresh multi-MB allocations page-fault on
+                // first touch — this ran ~3 ms per ui_begin) + row-parallel copy
+                let mut off = crate::gfx::scratch::take_u32(vw * vh);
+                let xs: Vec<usize> = (0..vw).map(|vx| (vx * rw / vw).min(rw - 1)).collect();
+                ui_par_rows(&mut off, vw, |vy, dst| {
+                    let ry = (vy * rh / vh).min(rh - 1);
+                    let src = &real[ry * rw..ry * rw + rw];
+                    for (d, &rx) in dst.iter_mut().zip(xs.iter()) {
+                        *d = src[rx];
+                    }
+                });
+                let mut base = crate::gfx::scratch::take_u32(vw * vh);
+                ui_par_copy(&mut base, &off);
+                g.buffer = off;
+                g.width = vw;
+                g.height = vh;
+                g.ui_layer = Some((real, rw, rh, base));
+                UI_SCALE.with(|c| c.set(sc));
+                return Ok(Value::Unit);
+            },
+            // display_size() → [w, h] of the physical display the game is shown on
+            //   (browser: the window/screen in device pixels, from the host page;
+            //   native: the framebuffer). ui_detach(on) — browser only: keep UI
+            //   layers on their own canvas instead of compositing into the frame.
+            "display_size" => {
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let (w, h) = crate::gfx::wasm_display();
+                    if w > 0.0 && h > 0.0 {
+                        return Ok(Value::List(Rc::new(vec![Value::Number(w), Value::Number(h)])));
+                    }
+                }
+                let g = self.gfx.borrow();
+                return Ok(Value::List(Rc::new(vec![Value::Number(g.width as f64), Value::Number(g.height as f64)])));
+            },
+            // ui_pixel_drawn(x, y) — inside a ui_begin layer: 1 if this layer drew
+            //   the pixel at virtual (x, y), else 0. The game asks it for the cursor
+            //   so ANY drawn UI (windows, frames, buttons, text) blocks world clicks
+            //   while the transparent parts of the screen still click through.
+            "ui_pixel_drawn" => {
+                let x = self.arg_num(&args, 0, -1.0)?;
+                let y = self.arg_num(&args, 1, -1.0)?;
+                let g = self.gfx.borrow();
+                let mut hit = 0.0;
+                if let Some((_, _, _, base)) = g.ui_layer.as_ref() {
+                    if x >= 0.0 && y >= 0.0 {
+                        let (xi, yi) = (x as usize, y as usize);
+                        if xi < g.width && yi < g.height {
+                            let i = yi * g.width + xi;
+                            if i < base.len() && i < g.buffer.len() && g.buffer[i] != base[i] {
+                                hit = 1.0;
+                            }
+                        }
+                    }
+                }
+                return Ok(Value::Number(hit));
+            },
+            "ui_detach" => {
+                let _on = self.arg_num(&args, 0, 1.0)? > 0.5;
+                #[cfg(target_arch = "wasm32")]
+                crate::gfx::wasm_ui_detach(_on);
+                return Ok(Value::Unit);
+            },
+            "ui_end" => {
+                let mut g = self.gfx.borrow_mut();
+                if let Some((mut real, rw, rh, base)) = g.ui_layer.take() {
+                    if real.is_empty() {
+                        // direct mode (see ui_begin): the UI is already in the frame
+                        crate::gfx::scratch::put_u32(base);
+                        UI_SCALE.with(|c| c.set(1.0));
+                        return Ok(Value::Unit);
+                    }
+                    let (vw, vh) = (g.width, g.height);
+                    let off = std::mem::take(&mut g.buffer);
+                    #[cfg(target_arch = "wasm32")]
+                    let detached = crate::gfx::wasm_ui_detached();
+                    #[cfg(not(target_arch = "wasm32"))]
+                    let detached = false;
+                    #[cfg(not(target_arch = "wasm32"))]
+                    let native_overlay = (vw > rw || vh > rh) && SCALED_BUF.load(std::sync::atomic::Ordering::Relaxed) != 0;
+                    #[cfg(target_arch = "wasm32")]
+                    let native_overlay = false;
+                    if detached {
+                        // browser: the UI goes to its own canvas at its own resolution
+                        #[cfg(target_arch = "wasm32")]
+                        crate::gfx::wasm_ui_overlay_put(&off, &base, vw, vh);
+                    } else if native_overlay {
+                        // native, scaled render (3-D below display res): keep the UI at its
+                        // own resolution; present() upscales the frame, then lays this on top
+                        g.ui_overlays.push((off, base, vw, vh));
+                        g.buffer = real;
+                        g.width = rw;
+                        g.height = rh;
+                        UI_SCALE.with(|c| c.set(1.0));
+                        return Ok(Value::Unit);
+                    } else if vw > rw || vh > rh {
+                        // SHRINKING the UI (virtual layer bigger than the frame, e.g. a
+                        // 720-p HUD on a 432-p web canvas): point sampling dropped whole
+                        // rows/columns of every glyph (pixel fonts turned to mush), so
+                        // area-average instead — each real pixel blends the UI pixels
+                        // that changed inside its footprint, weighted by coverage.
+                        ui_par_rows(&mut real[..rw * rh], rw, |ry, rrow| {
+                            let y0 = ry * vh / rh;
+                            let y1 = (((ry + 1) * vh + rh - 1) / rh).min(vh).max(y0 + 1);
+                            for rx in 0..rw {
+                                let x0 = rx * vw / rw;
+                                let x1 = (((rx + 1) * vw + rw - 1) / rw).min(vw).max(x0 + 1);
+                                let (mut sr, mut sg, mut sb, mut n, mut tot) = (0u32, 0u32, 0u32, 0u32, 0u32);
+                                for vy in y0..y1 {
+                                    for vx in x0..x1 {
+                                        let i = vy * vw + vx;
+                                        tot += 1;
+                                        if off[i] != base[i] {
+                                            let c = off[i];
+                                            sr += (c >> 16) & 255;
+                                            sg += (c >> 8) & 255;
+                                            sb += c & 255;
+                                            n += 1;
+                                        }
+                                    }
+                                }
+                                if n > 0 {
+                                    let o = rrow[rx];
+                                    let (or, og, ob) = ((o >> 16) & 255, (o >> 8) & 255, o & 255);
+                                    let (ar, ag, ab) = (sr / n, sg / n, sb / n);
+                                    let m = |a: u32, b: u32| (a * n + b * (tot - n)) / tot;
+                                    rrow[rx] = (m(ar, or) << 16) | (m(ag, og) << 8) | m(ab, ob);
+                                }
+                            }
+                        });
+                    } else {
+                        let xs: Vec<usize> = (0..rw).map(|rx| (rx * vw / rw).min(vw - 1)).collect();
+                        ui_par_rows(&mut real[..rw * rh], rw, |ry, drow| {
+                            let vy = (ry * vh / rh).min(vh - 1);
+                            let orow = &off[vy * vw..vy * vw + vw];
+                            let brow = &base[vy * vw..vy * vw + vw];
+                            for (d, &vx) in drow.iter_mut().zip(xs.iter()) {
+                                let c = orow[vx];
+                                if c != brow[vx] {
+                                    *d = c;
+                                }
+                            }
+                        });
+                    }
+                    // the layer's buffers go back to the pool for the next ui_begin
+                    crate::gfx::scratch::put_u32(off);
+                    crate::gfx::scratch::put_u32(base);
+                    g.buffer = real;
+                    g.width = rw;
+                    g.height = rh;
+                }
+                UI_SCALE.with(|c| c.set(1.0));
+                return Ok(Value::Unit);
+            },
+            // set_render_height(h) — change the fullscreen window's internal render
+            //   height at runtime (dynamic resolution). The window stays at the native
+            //   size; the framebuffer becomes h tall (same aspect) and is stretched up.
+            //   h ≤ 0 or ≥ native → native resolution. Returns the new buffer height.
+            //   No-op (returns the current height) for non-fullscreen windows / wasm.
+            "set_render_height" => {
+                let want = self.arg_num(&args, 0, 0.0)?.max(0.0) as usize;
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let (dw, dh, _, _, _) = display_info();
+                    let (w, h) = (dw.max(1) as usize, dh.max(1) as usize);
+                    let mut g = self.gfx.borrow_mut();
+                    if g.window.is_some() && g.topmost_window {
+                        let scaled = want >= 120 && want < h;
+                        let (bw, bh) = if scaled {
+                            (((w as f64) * (want as f64) / (h as f64)).round().max(1.0) as usize, want)
+                        } else {
+                            (w, h)
+                        };
+                        if bw != g.width || bh != g.height {
+                            g.width = bw;
+                            g.height = bh;
+                            g.buffer = vec![0u32; bw * bh];
+                            g.prev_frame.clear();
+                            g.sync_projection();
+                            set_scaled_buffer(scaled, bw, bh);
+                        }
+                    }
+                    return Ok(Value::Number(g.height as f64));
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let _ = want;
+                    return Ok(Value::Number(self.gfx.borrow().height as f64));
+                }
+            },
+            // open_fullscreen_scaled(title, scale) - borderless fullscreen over the whole primary
+            //   monitor, rendering at 1 / scale of its resolution (scale 1, 2 or 4) and scaled up
+            //   by that whole number; frames paced to the monitor's refresh
+            #[cfg(not(target_arch = "wasm32"))]
+            "open_fullscreen_scaled" => {
+                let title = args.first().map(|v| v.to_string()).unwrap_or_else(|| "Ling".into());
+                let sc = match self.arg_num(&args, 1, 1.0)? as i32 { 4 => 4usize, 2 => 2, _ => 1 };
+                let (dw, dh, _, _, _) = display_info();
+                let (w, h) = ((dw as usize / sc).max(64), (dh as usize / sc).max(64));
+                let scale = match sc { 4 => minifb::Scale::X4, 2 => minifb::Scale::X2, _ => minifb::Scale::X1 };
+                let mut gfx = self.gfx.borrow_mut();
+                let mut win = minifb::Window::new(
+                    &title,
+                    w,
+                    h,
+                    minifb::WindowOptions { borderless: true, title: false, resize: false, topmost: true, scale, ..Default::default() },
+                )
+                .map_err(|e| EvalErr::from(format!("cannot open fullscreen: {e}")))?;
+                apply_frame_pacing(&mut win, gfx.vsync);
+                #[cfg(windows)]
+                let hwnd = win.get_window_handle() as isize;
+                gfx.buffer = vec![0u32; w * h];
+                gfx.width = w;
+                gfx.height = h;
+                win.set_input_callback(Box::new(crate::gfx::UnicodeInput));
+                gfx.window = Some(win);
+                gfx.topmost_window = true;
+                #[cfg(windows)]
+                {
+                    gfx.hwnd = hwnd;
+                }
+                gfx.sync_projection();
+                #[cfg(windows)]
+                make_borderless_fullscreen(hwnd, dw, dh);
+                #[cfg(windows)]
+                force_window_focus(hwnd);
+                return Ok(Value::Unit);
+            },
             // ── monitor detection: physical display, not the framebuffer ──────
             // monitor_width() → primary-monitor pixel width
             "monitor_width"
@@ -5650,6 +7084,9 @@ impl Interpreter {
                 }
                 return Ok(Value::Unit);
             },
+            _ => {},
+        } }
+        if __ck <= 4 { __cl.at = 4; match name {
 
             // set_vsync(on) → pace the window to the monitor's refresh rate.
             // Frame-rate pacing (minifb has no swap-interval), not tear-free
@@ -5847,6 +7284,7 @@ impl Interpreter {
                         }
                     };
                     // gamepad Start behaves like Enter everywhere
+                    #[cfg(feature = "game")]
                     let pressed =
                         pressed || ((name == "enter" || name == "return") && gamepad::start_edge());
                     return Ok(Value::Bool(pressed));
@@ -5876,6 +7314,17 @@ impl Interpreter {
                 return Ok(Value::Number(self.gfx.borrow().mouse_dx as f64));
                 #[cfg(target_arch = "wasm32")]
                 return Ok(Value::Number(crate::gfx::wasm_mouse_dx() as f64));
+            },
+            // ── mouse_scroll_x() → f64 — horizontal scroll delta this frame (tilt wheel / trackpad) ──
+            #[cfg(not(target_arch = "wasm32"))]
+            "mouse_scroll_x" => {
+                let gfx = self.gfx.borrow();
+                let s = gfx.window.as_ref().and_then(|w| w.get_scroll_wheel()).map(|(x, _)| x as f64).unwrap_or(0.0);
+                return Ok(Value::Number(s));
+            },
+            #[cfg(target_arch = "wasm32")]
+            "mouse_scroll_x" => {
+                return Ok(Value::Number(0.0));
             },
             // ── mouse_scroll() → f64 — vertical scroll-wheel delta this frame ──
             #[cfg(not(target_arch = "wasm32"))]
@@ -5929,6 +7378,7 @@ impl Interpreter {
 
             // ── Gamepad / joystick input (ling-input "Sensorium" + gilrs) ──
             // pad_poll() → number — advance input one frame; returns # connected pads.
+            #[cfg(feature = "game")]
             "pad_poll"
             | "手柄轮询"
             | "パッド更新"
@@ -5947,6 +7397,7 @@ impl Interpreter {
                 return Ok(Value::Number(input_web::poll() as f64));
             },
             // pad_count() → number — connected gamepads.
+            #[cfg(feature = "game")]
             "pad_count"
             | "手柄数"
             | "パッド数"
@@ -5969,6 +7420,7 @@ impl Interpreter {
                 return Ok(Value::Number(input_web::count() as f64));
             },
             // pad_connected(i) → bool.
+            #[cfg(feature = "game")]
             "pad_connected"
             | "手柄连接"
             | "パッド接続"
@@ -5997,6 +7449,7 @@ impl Interpreter {
                 }
             },
             // pad_button(i, name) → bool — is the button held?
+            #[cfg(feature = "game")]
             "pad_button"
             | "手柄按键"
             | "パッドボタン"
@@ -6026,6 +7479,7 @@ impl Interpreter {
             },
             // pad_pressed(i, name) → bool — pressed this frame?
             // On WASM we only have the current snapshot, so treat as button_down.
+            #[cfg(feature = "game")]
             "pad_pressed"
             | "手柄按下"
             | "パッド押下"
@@ -6050,10 +7504,11 @@ impl Interpreter {
                 {
                     let i = self.arg_num(&args, 0, 0.0)? as usize;
                     let name = self.arg_str(&args, 1, "");
-                    return Ok(Value::Bool(input_web::button_down(i, &name)));
+                    return Ok(Value::Bool(input_web::pressed(i, &name)));
                 }
             },
             // pad_lx(i)/pad_ly(i)/pad_rx(i)/pad_ry(i) → number — stick axes (−1..=1).
+            #[cfg(feature = "game")]
             "pad_lx"
             | "手柄左X"
             | "パッド左X"
@@ -6079,6 +7534,7 @@ impl Interpreter {
                     return Ok(Value::Number(input_web::axis_lx(i) as f64));
                 }
             },
+            #[cfg(feature = "game")]
             "pad_ly"
             | "手柄左Y"
             | "パッド左Y"
@@ -6104,6 +7560,7 @@ impl Interpreter {
                     return Ok(Value::Number(input_web::axis_ly(i) as f64));
                 }
             },
+            #[cfg(feature = "game")]
             "pad_rx"
             | "手柄右X"
             | "パッド右X"
@@ -6129,6 +7586,7 @@ impl Interpreter {
                     return Ok(Value::Number(input_web::axis_rx(i) as f64));
                 }
             },
+            #[cfg(feature = "game")]
             "pad_ry"
             | "手柄右Y"
             | "パッド右Y"
@@ -6155,6 +7613,7 @@ impl Interpreter {
                 }
             },
             // pad_lt(i)/pad_rt(i) → number — analog triggers (0..=1).
+            #[cfg(feature = "game")]
             "pad_lt"
             | "手柄左扳机"
             | "パッド左トリガー"
@@ -6180,6 +7639,7 @@ impl Interpreter {
                     return Ok(Value::Number(input_web::trigger_lt(i) as f64));
                 }
             },
+            #[cfg(feature = "game")]
             "pad_rt"
             | "手柄右扳机"
             | "パッド右トリガー"
@@ -6206,6 +7666,7 @@ impl Interpreter {
                 }
             },
             // pad_rumble(i, lo, hi) → unit — set rumble motor amplitudes (0..=1).
+            #[cfg(feature = "game")]
             "pad_rumble"
             | "手柄震动"
             | "パッド振動"
@@ -6261,7 +7722,7 @@ impl Interpreter {
                     gfx.camera.ty = y;
                     gfx.camera.tz = z;
                 }
-                #[cfg(not(target_arch = "wasm32"))]
+                #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
                 if let Some(audio) = &self.audio {
                     audio.set_listener_pos(x, y, z);
                 }
@@ -6344,6 +7805,9 @@ impl Interpreter {
                 }
                 return Ok(Value::Unit);
             },
+            _ => {},
+        } }
+        if __ck <= 5 { __cl.at = 5; match name {
 
             // ── cursor_hide() / cursor_show() — just the OS cursor's visibility,
             // no warp-to-centre or clip region (unlike capture_mouse/release_mouse,
@@ -6396,6 +7860,29 @@ impl Interpreter {
                 return Ok(Value::Unit);
             },
 
+            // set_camera_hyper(R, saddle, px, mid_y, pz): hyperbolic space round a pivot (R 0 = off); the
+            //   saddle mirrors above the mid-plane y
+            "set_camera_hyper" => {
+                let r = self.arg_num(&args, 0, 0.0)? as f32;
+                let sd = self.arg_num(&args, 1, 0.0)? as f32;
+                let (hx, hy, hz) = (self.arg_num(&args, 2, 0.0)? as f32, self.arg_num(&args, 3, 0.0)? as f32, self.arg_num(&args, 4, 0.0)? as f32);
+                let mut g = self.gfx.borrow_mut();
+                g.camera.hyp_r = r.max(0.0);
+                g.camera.hyp_s = sd;
+                g.camera.hx = hx;
+                g.camera.hy = hy;
+                g.camera.hz = hz;
+                return Ok(Value::Unit);
+            },
+            // ── set_camera_roll(angle) — roll the view about its forward axis (radians) ──
+            "set_camera_roll" | "camera_roll" => {
+                let a = self.arg_num(&args, 0, 0.0)? as f32;
+                let mut gfx = self.gfx.borrow_mut();
+                gfx.camera.crz = a.cos();
+                gfx.camera.srz = a.sin();
+                return Ok(Value::Unit);
+            },
+
             // ── set_projection(cx, cy, focal, zdist) — override projection params ──
             // Automatically set when the window opens; override only if needed.
             "set_projection"
@@ -6423,21 +7910,33 @@ impl Interpreter {
             },
 
             // ── mesh_load(path) → handle · loads a glb/gltf (skeleton + skin + animation) ──
+            #[cfg(feature = "game")]
             "gltf_load" => {
                 let path = self.arg_str(&args, 0, "");
-                match ling_physics::gltf::GltfModel::load(&path) {
+                #[cfg(target_arch = "wasm32")]
+                let loaded = match crate::assets::get(&path) {
+                    Some(b) => ling_physics::gltf::GltfModel::load_from_bytes(&b),
+                    None => { crate::assets::request(&path); return Ok(Value::Number(-1.0)); },
+                };
+                #[cfg(not(target_arch = "wasm32"))]
+                let loaded = ling_physics::gltf::GltfModel::load(&path);
+                match loaded {
                     Ok(m) => {
                         self.gltf_models.borrow_mut().push(m);
                         let h = self.gltf_models.borrow().len() - 1;
                         return Ok(Value::Number(h as f64));
                     },
                     Err(e) => {
-                        eprintln!("mesh_load failed ({path}): {e}");
+                        #[cfg(not(target_arch = "wasm32"))]
+                        eprintln!("gltf_load failed ({path}): {e}");
+                        #[cfg(target_arch = "wasm32")]
+                        let _ = e;
                         return Ok(Value::Number(-1.0));
                     },
                 }
             },
             // mesh_anim_count(handle) → number of animation clips
+            #[cfg(feature = "game")]
             "gltf_anim_count" => {
                 let h = self.arg_num(&args, 0, -1.0)? as i64;
                 let n = self
@@ -6449,6 +7948,7 @@ impl Interpreter {
                 return Ok(Value::Number(n as f64));
             },
             // mesh_anim_name(handle, i) → clip name
+            #[cfg(feature = "game")]
             "gltf_anim_name" => {
                 let h = self.arg_num(&args, 0, -1.0)? as i64;
                 let i = self.arg_num(&args, 1, 0.0)? as usize;
@@ -6462,6 +7962,7 @@ impl Interpreter {
                 return Ok(Value::Str(s));
             },
             // mesh_anim_dur(handle, i) → clip duration (seconds)
+            #[cfg(feature = "game")]
             "gltf_anim_dur" => {
                 let h = self.arg_num(&args, 0, -1.0)? as i64;
                 let i = self.arg_num(&args, 1, 0.0)? as usize;
@@ -6475,6 +7976,7 @@ impl Interpreter {
                 return Ok(Value::Number(d as f64));
             },
             // mesh_tris(handle) → total triangle count (perf sanity check)
+            #[cfg(feature = "game")]
             "gltf_tris" => {
                 let h = self.arg_num(&args, 0, -1.0)? as i64;
                 let n: usize = self
@@ -6486,7 +7988,128 @@ impl Interpreter {
                 return Ok(Value::Number(n as f64));
             },
 
+            // gltf_bounds(handle, clip=0, time=0) → [minX,minY,minZ,maxX,maxY,maxZ]
+            // of the model AS DRAWN by gltf_anim_draw(_tex) — i.e. after skinning
+            // with that clip/time — in glTF space (Y up, unscaled). Draw-space top
+            // of a model at ground y `gy` with scale `s` is  gy - maxY * s.
+            // Empty/invalid handle → all zeros.
+            #[cfg(feature = "game")]
+            "gltf_bounds" => {
+                let h = self.arg_num(&args, 0, -1.0)? as i64;
+                let clip = self.arg_num(&args, 1, 0.0)?.max(0.0) as usize;
+                let time = self.arg_num(&args, 2, 0.0)? as f32;
+                let mut lo = [f32::INFINITY; 3];
+                let mut hi = [f32::NEG_INFINITY; 3];
+                if h >= 0 {
+                    if let Some(model) = self.gltf_models.borrow().get(h as usize) {
+                        for mesh in model.skin_animated(clip, time).iter() {
+                            for p in mesh.iter() {
+                                for k in 0..3 {
+                                    lo[k] = lo[k].min(p[k]);
+                                    hi[k] = hi[k].max(p[k]);
+                                }
+                            }
+                        }
+                    }
+                }
+                if !lo[0].is_finite() {
+                    lo = [0.0; 3];
+                    hi = [0.0; 3];
+                }
+                return Ok(return_list(
+                    lo.iter().chain(hi.iter()).map(|v| Value::Number(*v as f64)).collect(),
+                ));
+            },
+
+            // gltf_mesh_count(handle) → number of meshes (primitives) in the model
+            #[cfg(feature = "game")]
+            "gltf_mesh_count" => {
+                let h = self.arg_num(&args, 0, -1.0)? as i64;
+                let n = if h >= 0 { self.gltf_models.borrow().get(h as usize).map(|m| m.meshes.len()).unwrap_or(0) } else { 0 };
+                return Ok(Value::Number(n as f64));
+            },
+            // gltf_mesh_name(handle, i) → that mesh's name ("" if out of range)
+            #[cfg(feature = "game")]
+            "gltf_mesh_name" => {
+                let h = self.arg_num(&args, 0, -1.0)? as i64;
+                let i = self.arg_num(&args, 1, -1.0)? as i64;
+                let s = if h >= 0 && i >= 0 {
+                    self.gltf_models.borrow().get(h as usize).and_then(|m| m.meshes.get(i as usize)).map(|m| m.name.clone()).unwrap_or_default()
+                } else { String::new() };
+                return Ok(Value::Str(s));
+            },
+            // gltf_mesh_show(handle, i, on) — show/hide one mesh for every later
+            // gltf_*draw* of this handle (hidden meshes are not even skinned).
+            // Used for equipment: base body / armor / fashion / weapon variants
+            // are baked into one skinned GLB and toggled by what is worn.
+            #[cfg(feature = "game")]
+            "gltf_mesh_show" => {
+                let h = self.arg_num(&args, 0, -1.0)? as i64;
+                let i = self.arg_num(&args, 1, -1.0)? as i64;
+                let on = self.arg_num(&args, 2, 1.0)? != 0.0;
+                if h >= 0 && i >= 0 {
+                    if let Some(m) = self.gltf_models.borrow_mut().get_mut(h as usize) {
+                        let i = i as usize;
+                        if i < m.meshes.len() {
+                            if m.mesh_hidden.len() < m.meshes.len() { m.mesh_hidden.resize(m.meshes.len(), false); }
+                            m.mesh_hidden[i] = !on;
+                        }
+                    }
+                }
+                return Ok(Value::Unit);
+            },
+
+            // gltf_mesh_show_list(handle, list) — set every mesh's visibility in one call:
+            //   mesh i is shown when list[i] is non-zero (meshes past the list's end are
+            //   left as they are). Replaces a gltf_mesh_show loop per character per frame
+            //   (a dressed character is ~50 meshes). Returns how many meshes were set.
+            #[cfg(feature = "game")]
+            "gltf_mesh_show_list" => {
+                let h = self.arg_num(&args, 0, -1.0)? as i64;
+                let mut set = 0usize;
+                if let (true, Some(Value::List(l))) = (h >= 0, args.get(1)) {
+                    if let Some(m) = self.gltf_models.borrow_mut().get_mut(h as usize) {
+                        let n = m.meshes.len();
+                        if m.mesh_hidden.len() < n {
+                            m.mesh_hidden.resize(n, false);
+                        }
+                        for (i, v) in l.iter().take(n).enumerate() {
+                            let on = match v {
+                                Value::Number(x) => *x != 0.0,
+                                Value::Bool(b) => *b,
+                                Value::Unit => false,
+                                _ => true,
+                            };
+                            m.mesh_hidden[i] = !on;
+                            set += 1;
+                        }
+                    }
+                }
+                return Ok(Value::Number(set as f64));
+            },
+
+            // gltf_mesh_tint(handle, i, 0xRRGGBB) — multiplicative tint for one mesh on
+            // every later gltf_*draw* of this handle (white = none).
+            #[cfg(feature = "game")]
+            "gltf_mesh_tint" => {
+                let h = self.arg_num(&args, 0, -1.0)? as i64;
+                let i = self.arg_num(&args, 1, -1.0)? as i64;
+                let c = self.arg_num(&args, 2, 16777215.0)?;
+                let c = if c >= 0.0 { (c as u32) & 0xFFFFFF } else { 0xFFFFFF };
+                if h >= 0 && i >= 0 {
+                    if let Some(m) = self.gltf_models.borrow_mut().get_mut(h as usize) {
+                        let i = i as usize;
+                        if i < m.meshes.len() {
+                            if m.mesh_tint.len() < m.meshes.len() { m.mesh_tint.resize(m.meshes.len(), 0xFFFFFF); }
+                            m.mesh_tint[i] = c;
+                        }
+                    }
+                }
+                return Ok(Value::Unit);
+            },
+
             // gltf_joint_count(handle) → number of skin joints (bones)
+            #[cfg(feature = "game")]
             "gltf_joint_count" => {
                 let h = self.arg_num(&args, 0, -1.0)? as i64;
                 let n = self
@@ -6499,6 +8122,7 @@ impl Interpreter {
                 return Ok(Value::Number(n as f64));
             },
             // gltf_joint_name(handle, j) → bone name (its node's name)
+            #[cfg(feature = "game")]
             "gltf_joint_name" => {
                 let h = self.arg_num(&args, 0, -1.0)? as i64;
                 let j = self.arg_num(&args, 1, 0.0)? as usize;
@@ -6520,6 +8144,7 @@ impl Interpreter {
             //   glTF is Y-up / -Z-forward; the engine is Y-down, so we flip Y and Z, then
             //   yaw about Y, scale, translate. Per-part colour by mesh name. Lit + depth-queued
             //   exactly like draw_mesh, so it shares the camera + z-buffer.
+            #[cfg(feature = "game")]
             "gltf_draw" => {
                 let hh = self.arg_num(&args, 0, -1.0)? as i64;
                 let ox = self.arg_num(&args, 1, 0.0)? as f32;
@@ -6534,22 +8159,6 @@ impl Interpreter {
                     None => return Ok(Value::Unit),
                 };
                 let mut gfx = self.gfx.borrow_mut();
-                let cp = {
-                    let c = &gfx.camera;
-                    ling_gpu::CameraParams {
-                        cry: c.cry,
-                        sry: c.sry,
-                        crx: c.crx,
-                        srx: c.srx,
-                        cx: c.cx,
-                        cy: c.cy,
-                        focal: c.focal,
-                        zdist: c.zdist,
-                        tx: c.tx,
-                        ty: c.ty,
-                        tz: c.tz,
-                    }
-                };
                 let near = -gfx.camera.zdist + 0.02;
                 let ambient = gfx.ambient;
                 for mesh in &model.meshes {
@@ -6581,7 +8190,8 @@ impl Interpreter {
                         world[i * 3 + 2] = oz + rz;
                     }
                     let mut proj = vec![0.0f32; nv * 3];
-                    ling_gpu::backend().project_points(&world, &cp, &mut proj);
+                    // one batch on the best backend (CUDA / all cores), hyperbolic warp + roll included
+                    gfx.camera.project_batch(&world, &mut proj);
                     let idx = &mesh.indices;
                     let nt = idx.len() / 3;
                     for t in 0..nt {
@@ -6642,6 +8252,7 @@ impl Interpreter {
             },
 
             // ── gltf_autorig(handle) → synthesize a humanoid skeleton + skin weights ──
+            #[cfg(feature = "game")]
             "gltf_autorig" => {
                 let hh = self.arg_num(&args, 0, -1.0)? as i64;
                 let mut models = self.gltf_models.borrow_mut();
@@ -6654,6 +8265,7 @@ impl Interpreter {
             // ── gltf_pose_draw(handle, ox,oy,oz, scale, yaw, poseList) ──
             //   Like gltf_draw, but linear-blend-skins the mesh by `poseList` first.
             //   poseList = flat XYZ-euler radians, 3 per bone (12 bones → 36 values).
+            #[cfg(feature = "game")]
             "gltf_pose_draw" => {
                 let hh = self.arg_num(&args, 0, -1.0)? as i64;
                 let ox = self.arg_num(&args, 1, 0.0)? as f32;
@@ -6676,22 +8288,6 @@ impl Interpreter {
                 };
                 let skinned = model.skin_local(&euler);
                 let mut gfx = self.gfx.borrow_mut();
-                let cp = {
-                    let c = &gfx.camera;
-                    ling_gpu::CameraParams {
-                        cry: c.cry,
-                        sry: c.sry,
-                        crx: c.crx,
-                        srx: c.srx,
-                        cx: c.cx,
-                        cy: c.cy,
-                        focal: c.focal,
-                        zdist: c.zdist,
-                        tx: c.tx,
-                        ty: c.ty,
-                        tz: c.tz,
-                    }
-                };
                 let near = -gfx.camera.zdist + 0.02;
                 let ambient = gfx.ambient;
                 for (mi, mesh) in model.meshes.iter().enumerate() {
@@ -6727,7 +8323,8 @@ impl Interpreter {
                         world[i * 3 + 2] = oz + rz;
                     }
                     let mut proj = vec![0.0f32; nv * 3];
-                    ling_gpu::backend().project_points(&world, &cp, &mut proj);
+                    // one batch on the best backend (CUDA / all cores), hyperbolic warp + roll included
+                    gfx.camera.project_batch(&world, &mut proj);
                     let idx = &mesh.indices;
                     let nt = idx.len() / 3;
                     for t in 0..nt {
@@ -6786,6 +8383,398 @@ impl Interpreter {
                 }
                 return Ok(Value::Unit);
             },
+            _ => {},
+        } }
+        if __ck <= 6 { __cl.at = 6; match name {
+
+            // gltf_pose_draw_tex(handle, ox,oy,oz, scale, yaw, poseList [, litAmb]) —
+            // like gltf_pose_draw but textured: skins the mesh (autorig), then
+            // rasterizes each triangle with the model's base-color texture + UVs
+            // (perspective-correct, optional per-pixel lighting). Textureless meshes
+            // fall back to a flat lit colour.
+            #[cfg(feature = "game")]
+            "gltf_pose_draw_tex" | "글꼴포즈텍스처" | "骨骼姿势纹理绘制" | "スキンポーズ描画"
+            | "วาดสกินมีพื้นผิว" | "رسم_اسکلت_بافت‌دار" | "ارسم_هيكلا_منقوشا"
+            | "צייר_שלד_ממורקם" | "ٹیکسچرڈ_پوز_ڈرا" | "dessiner_pose_texturée"
+            | "texturierte_pose_zeichnen" | "нарисовать_текстурную_позу" => {
+                use crate::gfx::depth::{TexData, TexShade, TexVert};
+                let hh = self.arg_num(&args, 0, -1.0)? as i64;
+                let ox = self.arg_num(&args, 1, 0.0)? as f32;
+                let oy = self.arg_num(&args, 2, 0.0)? as f32;
+                let oz = self.arg_num(&args, 3, 0.0)? as f32;
+                let scale = self.arg_num(&args, 4, 1.0)? as f32;
+                let yaw = self.arg_num(&args, 5, 0.0)? as f32;
+                let euler: Vec<f32> = match args.get(6) {
+                    Some(Value::List(v)) => v.iter().map(|x| self.to_number(x).unwrap_or(0.0) as f32).collect(),
+                    _ => Vec::new(),
+                };
+                let lit_amb = self.arg_num(&args, 7, -1.0)? as f32;
+                let cull_back = self.arg_num(&args, 8, 0.0)? as i64 != 0;  // arg 8: backface cull (0 = double-sided)
+                if hh < 0 {
+                    return Ok(Value::Unit);
+                }
+                let (sy, cyy) = yaw.sin_cos();
+                // build + cache this model's textures
+                {
+                    let models = self.gltf_models.borrow();
+                    if let Some(model) = models.get(hh as usize) {
+                        let mut cache = self.gltf_tex_cache.borrow_mut();
+                        for (mi, mesh) in model.meshes.iter().enumerate() {
+                            if let Some(ti) = mesh.base_tex {
+                                let key = (hh as usize, mi);
+                                if !cache.contains_key(&key) {
+                                    if let Some(img) = model.textures.get(ti) {
+                                        cache.insert(key, std::sync::Arc::new(gltf_img_to_tex(img)));
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        return Ok(Value::Unit);
+                    }
+                }
+                let models = self.gltf_models.borrow();
+                let model = &models[hh as usize];
+                let skinned = model.skin_local(&euler);
+                let cache = self.gltf_tex_cache.borrow();
+                let mut gfx = self.gfx.borrow_mut();
+                let zd = gfx.camera.zdist;
+                let near = -zd + 0.02;
+                let lensn = near + gfx.lens_guard.max(0.1);
+                let shade: Option<std::sync::Arc<TexShade>> = if lit_amb >= 0.0 {
+                    Some(std::sync::Arc::new(TexShade {
+                        amb: lit_amb.max(0.0),
+                        lights: gfx.lights.iter().map(|l| [l.x, l.y, l.z, l.r, l.g, l.b, l.intensity, if l.radius > 0.0 { l.radius } else { 1.0e6 }]).collect(),
+                        fog_start: gfx.fog_start, fog_end: gfx.fog_end, fog_color: gfx.fog_color, lit: true, ripples: Vec::new(),
+                    }))
+                } else {
+                    None
+                };
+                let (pm, pa) = (gfx.blend, gfx.alpha);
+                gfx.depth_queue.set_state(pm, 1.0);
+                for (mi, mesh) in model.meshes.iter().enumerate() {
+                    let sk = match skinned.get(mi) { Some(s) => s, None => continue };
+                    let nv = sk.len();
+                    if nv == 0 { continue; }
+                    let mut world = vec![0.0f32; nv * 3];
+                    for i in 0..nv {
+                        let gx = sk[i][0] * scale;
+                        let gy = -sk[i][1] * scale;
+                        let gz = -sk[i][2] * scale;
+                        let rx = gx * cyy + gz * sy;
+                        let rz = -gx * sy + gz * cyy;
+                        world[i * 3] = ox + rx;
+                        world[i * 3 + 1] = oy + gy;
+                        world[i * 3 + 2] = oz + rz;
+                    }
+                    let mut proj = vec![0.0f32; nv * 3];
+                    // one batch on the best backend (CUDA / all cores), hyperbolic warp + roll included
+                    gfx.camera.project_batch(&world, &mut proj);
+                    let tex = cache.get(&(hh as usize, mi)).cloned();
+                    let idx = &mesh.indices;
+                    let nt = idx.len() / 3;
+                    for t in 0..nt {
+                        let (ia, ib, ic) = (idx[t * 3] as usize, idx[t * 3 + 1] as usize, idx[t * 3 + 2] as usize);
+                        if ia >= nv || ib >= nv || ic >= nv { continue; }
+                        let (da, db, dc) = (proj[ia * 3 + 2], proj[ib * 3 + 2], proj[ic * 3 + 2]);
+                        // skip a triangle with ANY corner behind (or right at) the lens: these
+                        // paths don't near-clip, so a vertex behind the eye projects flipped and
+                        // the triangle smears across the view ("loose fragments" as the camera
+                        // swings past a character/prop). glTF tris are small — dropping is invisible.
+                        if da <= lensn || db <= lensn || dc <= lensn {
+                            // a corner at/behind the lens: NEAR-CLIP it (texmesh push_poly_g)
+                            // instead of dropping the whole triangle — big tiles (block
+                            // hallway walls, room floors) no longer vanish beside the camera
+                            if let Some(tx) = &tex {
+                                let wp = [
+                                    [world[ia * 3], world[ia * 3 + 1], world[ia * 3 + 2]],
+                                    [world[ib * 3], world[ib * 3 + 1], world[ib * 3 + 2]],
+                                    [world[ic * 3], world[ic * 3 + 1], world[ic * 3 + 2]],
+                                ];
+                                let uvs = [
+                                    [mesh.verts[ia].uv.x, mesh.verts[ia].uv.y],
+                                    [mesh.verts[ib].uv.x, mesh.verts[ib].uv.y],
+                                    [mesh.verts[ic].uv.x, mesh.verts[ic].uv.y],
+                                ];
+                                texmesh::push_poly_g(&mut gfx, wp, uvs, tx, 0xFFFFFF, if cull_back { 1 } else { 0 }, shade.as_ref(), false);
+                            }
+                            continue;
+                        }
+                        if cull_back {
+                            // screen-space signed area → winding; skip back faces so a
+                            // solid's inner/occluded tris can't poke through (e.g. a
+                            // monster's white eyeball through its lid).
+                            let area = (proj[ib * 3] - proj[ia * 3]) * (proj[ic * 3 + 1] - proj[ia * 3 + 1])
+                                - (proj[ib * 3 + 1] - proj[ia * 3 + 1]) * (proj[ic * 3] - proj[ia * 3]);
+                            if area >= 0.0 { continue; }
+                        }
+                        match &tex {
+                            Some(tx) => {
+                                let mk = |i: usize, d: f32| -> TexVert {
+                                    let iw = 1.0 / (d + zd).max(1e-4);
+                                    let uv = mesh.verts[i].uv;
+                                    TexVert { x: proj[i * 3], y: proj[i * 3 + 1], z: d, iw, uw: uv.x * iw, vw: uv.y * iw, wx: world[i * 3] * iw, wy: world[i * 3 + 1] * iw, wz: world[i * 3 + 2] * iw }
+                                };
+                                let v = [mk(ia, da), mk(ib, db), mk(ic, dc)];
+                                gfx.depth_queue.push_triangle_tex_shaded(v, tx.clone(), 0xFFFFFF, [0.0; 4], true, shade.clone());
+                            },
+                            None => {
+                                let col = 0xC8B49Bu32;
+                                gfx.depth_queue.push_triangle_zv(col, proj[ia * 3], proj[ia * 3 + 1], da, proj[ib * 3], proj[ib * 3 + 1], db, proj[ic * 3], proj[ic * 3 + 1], dc);
+                            },
+                        }
+                    }
+                }
+                gfx.depth_queue.set_state(pm, pa);
+                return Ok(Value::Unit);
+            },
+
+#[cfg(feature = "game")]
+"gltf_anim_draw_tex" | "글꼴애니텍스처" | "骨骼动画纹理绘制" | "スキンアニメ描画"
+            | "วาดแอนิเมชันมีพื้นผิว" | "رسم_انیمیشن_بافت‌دار" | "ارسم_رسما_متحركا_منقوشا"
+            | "צייר_אנימציה_ממורקמת" | "ٹیکسچرڈ_اینیمیشن_ڈرا" | "dessiner_animation_texturée"
+            | "texturierte_animation_zeichnen" | "нарисовать_текстурную_анимацию" => {
+                use crate::gfx::depth::{TexData, TexShade, TexVert};
+                let hh = self.arg_num(&args, 0, -1.0)? as i64;
+                let ox = self.arg_num(&args, 1, 0.0)? as f32;
+                let oy = self.arg_num(&args, 2, 0.0)? as f32;
+                let oz = self.arg_num(&args, 3, 0.0)? as f32;
+                let scale = self.arg_num(&args, 4, 1.0)? as f32;
+                let yaw = self.arg_num(&args, 5, 0.0)? as f32;
+                let anim_idx = self.arg_num(&args, 6, 0.0)? as usize;
+                let time = self.arg_num(&args, 7, 0.0)? as f32;
+                let lit_amb = self.arg_num(&args, 8, -1.0)? as f32;
+                // arg 9: backface cull. 0 = double-sided (default; keeps thin hair/
+                // cloth on the autorig character). 1 = cull back faces (opaque
+                // solids like monsters, so inner/occluded tris don't poke through).
+                let cull_back = self.arg_num(&args, 9, 0.0)? as i64 != 0;
+                // arg 12: multiplicative colour tint 0xRRGGBB (default white = none) —
+                // colour-codes block hallways / portal arches without new textures
+                let tint = { let v = self.arg_num(&args, 12, 16777215.0)?; if v >= 0.0 { (v as u32) & 0xFFFFFF } else { 0xFFFFFF } };
+                if hh < 0 {
+                    return Ok(Value::Unit);
+                }
+                let (sy, cyy) = yaw.sin_cos();
+                // build + cache this model's textures
+                {
+                    let models = self.gltf_models.borrow();
+                    if let Some(model) = models.get(hh as usize) {
+                        let mut cache = self.gltf_tex_cache.borrow_mut();
+                        for (mi, mesh) in model.meshes.iter().enumerate() {
+                            if let Some(ti) = mesh.base_tex {
+                                let key = (hh as usize, mi);
+                                if !cache.contains_key(&key) {
+                                    if let Some(img) = model.textures.get(ti) {
+                                        cache.insert(key, std::sync::Arc::new(gltf_img_to_tex(img)));
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        return Ok(Value::Unit);
+                    }
+                }
+                let models = self.gltf_models.borrow();
+                let model = &models[hh as usize];
+                // view cull BEFORE skinning (the expensive part): a model whose bounding
+                // sphere (bind-pose radius × 1.6 for limbs in motion) is wholly behind
+                // the lens or off the screen edges draws nothing anyway — skip it.
+                let mut lod_px = f32::MAX;
+                {
+                    let r_model = GLTF_RADIUS.with(|c| {
+                        let mut c = c.borrow_mut();
+                        if let Some(&(n, r)) = c.get(&(hh as usize)) {
+                            if n == model.meshes.len() { return r; }
+                        }
+                        let mut r2 = 0.0f32;
+                        for m in &model.meshes {
+                            for v in &m.verts {
+                                r2 = r2.max(v.pos.x * v.pos.x + v.pos.y * v.pos.y + v.pos.z * v.pos.z);
+                            }
+                        }
+                        let r = r2.sqrt();
+                        c.insert(hh as usize, (model.meshes.len(), r));
+                        r
+                    });
+                    let rw_ = r_model * scale.abs() * 1.6 + 0.5;
+                    let g = self.gfx.borrow();
+                    let (sxp, syp, rz) = g.camera.project(ox, oy, oz);
+                    let lens = -g.camera.zdist + 0.02 + g.lens_guard.max(0.1);
+                    if rz + rw_ < lens {
+                        return Ok(Value::Unit);
+                    }
+                    let dd = rz + g.camera.zdist;
+                    if dd > 0.1 {
+                        lod_px = g.camera.focal * r_model * scale.abs() / dd;
+                    }
+                    if dd > rw_ + 0.5 {
+                        let pr = g.camera.focal * rw_ / (dd - rw_) * 1.15 + 24.0;
+                        if g.camera.hyp_r <= 0.0 {
+                            let (w, h) = (g.width as f32, g.height as f32);
+                            if sxp + pr < 0.0 || sxp - pr > w || syp + pr < 0.0 || syp - pr > h {
+                                return Ok(Value::Unit);
+                            }
+                        } else {
+                            // hyperbolic view: camera.hyper() leaves points beyond 1.8× the
+                            // half-FOV (radially) unwarped, so only a sphere wholly out there
+                            // is certain to stay off-screen
+                            let (ccx, ccy) = (g.camera.cx, g.camera.cy);
+                            let rad = ((sxp - ccx) * (sxp - ccx) + (syp - ccy) * (syp - ccy)).sqrt();
+                            if rad - pr > 1.85 * ccx {
+                                return Ok(Value::Unit);
+                            }
+                        }
+                    }
+                }
+                // arg 10: animation SOURCE model (e.g. the body) — joints matched
+                // by name, so clip-less equipment GLBs move in lockstep with it
+                let src_h = self.arg_num(&args, 10, -1.0)? as i64;
+                // arg 11: procedural pose layers — flat list [bone name, rx, ry, rz, ...]
+                // (local euler radians on top of the clip; "*root*" / "*pivot*" turn
+                // the whole skeleton), e.g. a swim stroke driven from script
+                let mut pose: Vec<(String, [f32; 3])> = Vec::new();
+                if let Some(Value::List(pl)) = args.get(11) {
+                    let num = |v: &Value| match v { Value::Number(n) => *n as f32, _ => 0.0 };
+                    let mut k = 0;
+                    while k + 3 < pl.len() {
+                        pose.push((pl[k].to_string(), [num(&pl[k + 1]), num(&pl[k + 2]), num(&pl[k + 3])]));
+                        k += 4;
+                    }
+                }
+                // LOD: a model only a few pixels tall is not worth drawing; a small one
+                // reuses a cached pose with the clip time snapped to 8 Hz.
+                let (lod_min, lod_cache) = GLTF_LOD.with(|c| c.get());
+                if lod_px < lod_min {
+                    return Ok(Value::Unit);
+                }
+                let src_m = models.get(if src_h >= 0 && src_h != hh { src_h as usize } else { usize::MAX });
+                let compute = |time: f32| -> Vec<Vec<[f32; 3]>> {
+                    if !pose.is_empty() {
+                        model.skin_animated_posed(src_m, anim_idx, time, &pose)
+                    } else {
+                        match src_m {
+                            Some(src) => model.skin_animated_from(src, anim_idx, time),
+                            None => model.skin_animated(anim_idx, time),
+                        }
+                    }
+                };
+                let skinned: std::rc::Rc<Vec<Vec<[f32; 3]>>> = if pose.is_empty() && lod_px < lod_cache {
+                    let qt = (time * 8.0).floor();
+                    let key = (hh as usize, src_h, anim_idx, qt as i64);
+                    GLTF_SKIN_CACHE.with(|c| {
+                        let mut c = c.borrow_mut();
+                        if let Some(s) = c.get(&key) {
+                            return s.clone();
+                        }
+                        if c.len() > 400 {
+                            c.clear();
+                        }
+                        let s = std::rc::Rc::new(compute(qt / 8.0));
+                        c.insert(key, s.clone());
+                        s
+                    })
+                } else {
+                    std::rc::Rc::new(compute(time))
+                };
+                let cache = self.gltf_tex_cache.borrow();
+                let mut gfx = self.gfx.borrow_mut();
+                let zd = gfx.camera.zdist;
+                let near = -zd + 0.02;
+                let lensn = near + gfx.lens_guard.max(0.1);
+                let shade: Option<std::sync::Arc<TexShade>> = if lit_amb >= 0.0 {
+                    Some(std::sync::Arc::new(TexShade {
+                        amb: lit_amb.max(0.0),
+                        lights: gfx.lights.iter().map(|l| [l.x, l.y, l.z, l.r, l.g, l.b, l.intensity, if l.radius > 0.0 { l.radius } else { 1.0e6 }]).collect(),
+                        fog_start: gfx.fog_start, fog_end: gfx.fog_end, fog_color: gfx.fog_color, lit: true, ripples: Vec::new(),
+                    }))
+                } else {
+                    None
+                };
+                let (pm, pa) = (gfx.blend, gfx.alpha);
+                gfx.depth_queue.set_state(pm, 1.0);
+                for (mi, mesh) in model.meshes.iter().enumerate() {
+                    let sk = match skinned.get(mi) { Some(s) => s, None => continue };
+                    let nv = sk.len();
+                    if nv == 0 { continue; }
+                    let mut world = vec![0.0f32; nv * 3];
+                    for i in 0..nv {
+                        let gx = sk[i][0] * scale;
+                        let gy = -sk[i][1] * scale;
+                        let gz = -sk[i][2] * scale;
+                        let rx = gx * cyy + gz * sy;
+                        let rz = -gx * sy + gz * cyy;
+                        world[i * 3] = ox + rx;
+                        world[i * 3 + 1] = oy + gy;
+                        world[i * 3 + 2] = oz + rz;
+                    }
+                    let mut proj = vec![0.0f32; nv * 3];
+                    // one batch on the best backend (CUDA / all cores), hyperbolic warp + roll included
+                    gfx.camera.project_batch(&world, &mut proj);
+                    let tex = cache.get(&(hh as usize, mi)).cloned();
+                    let tint = match model.mesh_tint.get(mi) {
+                        Some(&mt) if mt != 0xFFFFFF => {
+                            let ch = |s: u32| (((tint >> s) & 0xFF) * ((mt >> s) & 0xFF) / 255) << s;
+                            ch(16) | ch(8) | ch(0)
+                        }
+                        _ => tint,
+                    };
+                    let idx = &mesh.indices;
+                    let nt = idx.len() / 3;
+                    for t in 0..nt {
+                        let (ia, ib, ic) = (idx[t * 3] as usize, idx[t * 3 + 1] as usize, idx[t * 3 + 2] as usize);
+                        if ia >= nv || ib >= nv || ic >= nv { continue; }
+                        let (da, db, dc) = (proj[ia * 3 + 2], proj[ib * 3 + 2], proj[ic * 3 + 2]);
+                        // skip a triangle with ANY corner behind (or right at) the lens: these
+                        // paths don't near-clip, so a vertex behind the eye projects flipped and
+                        // the triangle smears across the view ("loose fragments" as the camera
+                        // swings past a character/prop). glTF tris are small — dropping is invisible.
+                        if da <= lensn || db <= lensn || dc <= lensn {
+                            // a corner at/behind the lens: NEAR-CLIP it (texmesh push_poly_g)
+                            // instead of dropping the whole triangle — big tiles (block
+                            // hallway walls, room floors) no longer vanish beside the camera
+                            if let Some(tx) = &tex {
+                                let wp = [
+                                    [world[ia * 3], world[ia * 3 + 1], world[ia * 3 + 2]],
+                                    [world[ib * 3], world[ib * 3 + 1], world[ib * 3 + 2]],
+                                    [world[ic * 3], world[ic * 3 + 1], world[ic * 3 + 2]],
+                                ];
+                                let uvs = [
+                                    [mesh.verts[ia].uv.x, mesh.verts[ia].uv.y],
+                                    [mesh.verts[ib].uv.x, mesh.verts[ib].uv.y],
+                                    [mesh.verts[ic].uv.x, mesh.verts[ic].uv.y],
+                                ];
+                                texmesh::push_poly_g(&mut gfx, wp, uvs, tx, tint, if cull_back { 1 } else { 0 }, shade.as_ref(), false);
+                            }
+                            continue;
+                        }
+                        if cull_back {
+                            // screen-space signed area → winding; skip back faces so a
+                            // solid's inner/occluded tris can't poke through (e.g. a
+                            // monster's white eyeball through its lid).
+                            let area = (proj[ib * 3] - proj[ia * 3]) * (proj[ic * 3 + 1] - proj[ia * 3 + 1])
+                                - (proj[ib * 3 + 1] - proj[ia * 3 + 1]) * (proj[ic * 3] - proj[ia * 3]);
+                            if area >= 0.0 { continue; }
+                        }
+                        match &tex {
+                            Some(tx) => {
+                                let mk = |i: usize, d: f32| -> TexVert {
+                                    let iw = 1.0 / (d + zd).max(1e-4);
+                                    let uv = mesh.verts[i].uv;
+                                    TexVert { x: proj[i * 3], y: proj[i * 3 + 1], z: d, iw, uw: uv.x * iw, vw: uv.y * iw, wx: world[i * 3] * iw, wy: world[i * 3 + 1] * iw, wz: world[i * 3 + 2] * iw }
+                                };
+                                let v = [mk(ia, da), mk(ib, db), mk(ic, dc)];
+                                gfx.depth_queue.push_triangle_tex_shaded(v, tx.clone(), tint, [0.0; 4], true, shade.clone());
+                            },
+                            None => {
+                                let col = 0xC8B49Bu32;
+                                gfx.depth_queue.push_triangle_zv(col, proj[ia * 3], proj[ia * 3 + 1], da, proj[ib * 3], proj[ib * 3 + 1], db, proj[ic * 3], proj[ic * 3 + 1], dc);
+                            },
+                        }
+                    }
+                }
+                gfx.depth_queue.set_state(pm, pa);
+                return Ok(Value::Unit);
+            },
 
             // ── draw_mesh(pos, idx, ox, oy, oz, scale, mode) ──
             //   Native batched triangle mesh. pos = flat [x,y,z,…], idx = flat tri indices.
@@ -6793,6 +8782,7 @@ impl Interpreter {
             //   Vertices are batch-projected via ling-gpu (CPU fallback, or CUDA when the
             //   `cuda` feature is on); the per-triangle loop runs natively (not in the
             //   interpreter) so dense meshes (imported glTF, grids) stay fast.
+            #[cfg(feature = "game")]
             "draw_mesh"
             | "วาดเมช"
             | "رسم_مش"
@@ -6828,27 +8818,12 @@ impl Interpreter {
                         oz + self.to_number(&pos[i * 3 + 2]).unwrap_or(0.0) as f32 * scale;
                 }
                 let mut gfx = self.gfx.borrow_mut();
-                let cp = {
-                    let c = &gfx.camera;
-                    ling_gpu::CameraParams {
-                        cry: c.cry,
-                        sry: c.sry,
-                        crx: c.crx,
-                        srx: c.srx,
-                        cx: c.cx,
-                        cy: c.cy,
-                        focal: c.focal,
-                        zdist: c.zdist,
-                        tx: c.tx,
-                        ty: c.ty,
-                        tz: c.tz,
-                    }
-                };
                 let near = -gfx.camera.zdist + 0.02;
                 let base = gfx.color;
                 let ambient = gfx.ambient;
                 let mut proj = vec![0.0f32; nv * 3]; // (sx, sy, depth) per vertex
-                ling_gpu::backend().project_points(&world, &cp, &mut proj);
+                // one batch on the best backend (CUDA / all cores), hyperbolic warp + roll included
+                gfx.camera.project_batch(&world, &mut proj);
                 let nt = idx.len() / 3;
                 for t in 0..nt {
                     let ia = self.to_number(&idx[t * 3]).unwrap_or(0.0) as usize;
@@ -7223,6 +9198,19 @@ impl Interpreter {
             // frame; flat fills are untouched. Applied last in the present
             // post-chain. (set_antialias smooths wireframe STROKES; this pass
             // smooths the composited IMAGE.)
+            // set_lod(skipPx, cachePx) — model LOD thresholds in projected pixels
+            // (0, 0 = off). Models smaller than skipPx aren't drawn; smaller than
+            // cachePx reuse a cached pose (clip time snapped to 8 Hz).
+            "set_lod" => {
+                let a = self.arg_num(&args, 0, 3.0)?.max(0.0) as f32;
+                let b = self.arg_num(&args, 1, 50.0)?.max(0.0) as f32;
+                GLTF_LOD.with(|c| c.set((a, b)));
+                return Ok(Value::Unit);
+            },
+            _ => {},
+        } }
+        if __ck <= 7 { __cl.at = 7; match name {
+
             "set_fxaa"
             | "ลบรอยหยัก"
             | "屏幕抗锯齿"
@@ -7914,6 +9902,21 @@ impl Interpreter {
                 return Ok(Value::Unit);
             },
 
+            // hyper_warp(x,y,z) -> [x,y,z]: where the hyperbolic lens (set_camera_hyper) DRAWS a
+            // world point -- the same warp every vertex gets -- so scripts can stand things on the
+            // drawn (bent) ground instead of the flat one. The point itself when the lens is off.
+            "hyper_warp" => {
+                let x = self.arg_num(&args, 0, 0.0)? as f32;
+                let y = self.arg_num(&args, 1, 0.0)? as f32;
+                let z = self.arg_num(&args, 2, 0.0)? as f32;
+                let gfx = self.gfx.borrow();
+                let (wx, wy, wz) = if gfx.camera.hyp_r > 0.0 { gfx.camera.hyper(x, y, z) } else { (x, y, z) };
+                return Ok(Value::List(Rc::new(vec![Value::Number(wx as f64), Value::Number(wy as f64), Value::Number(wz as f64)])));
+            },
+            _ => {},
+        } }
+        if __ck <= 8 { __cl.at = 8; match name {
+
             // project_3d(x,y,z) -> [screen_x, screen_y, depth]; behind the camera
             // returns a sentinel ([-99999,-99999, depth]) so scripts can skip it.
             // Lets scripts place 2-D overlays (e.g. filled teardrop flames) onto 3-D points.
@@ -7943,9 +9946,10 @@ impl Interpreter {
                     ])));
                 }
                 let (sx, sy, depth) = gfx.camera.project(x, y, z);
+                let k = ui_scale_now();
                 return Ok(Value::List(Rc::new(vec![
-                    Value::Number(sx as f64),
-                    Value::Number(sy as f64),
+                    Value::Number((sx / k) as f64),
+                    Value::Number((sy / k) as f64),
                     Value::Number(depth as f64),
                 ])));
             },
@@ -7962,7 +9966,12 @@ impl Interpreter {
                 let (mx, my) = gfx
                     .window
                     .as_ref()
-                    .and_then(|w| w.get_mouse_pos(minifb::MouseMode::Clamp))
+                    .filter(|w| {
+                        // minifb panics clamping the mouse into a window with no client area (minimised)
+                        let (sw, sh) = w.get_size();
+                        sw > 0 && sh > 0
+                    })
+                    .and_then(|w| buffer_mouse_pos(w))
                     .unwrap_or((gfx.camera.cx, gfx.camera.cy));
                 let cam = &gfx.camera;
                 // Eye-relative pinhole direction for this pixel, in rotation-space
@@ -8034,10 +10043,256 @@ impl Interpreter {
                     Value::Number(dir_z as f64),
                 ])));
             },
+            // list_cat(a, b) -> a new list; list_iota(n) -> [0, 1, ..., n-1]
+            "list_cat" => {
+                let mut out: Vec<Value> = Vec::new();
+                for a in args.iter().take(2) {
+                    if let Value::List(l) = a {
+                        out.extend(l.iter().cloned());
+                    }
+                }
+                return Ok(Value::List(out.into()));
+            },
+            "list_iota" => {
+                let n = self.arg_num(&args, 0, 0.)?.max(0.0) as usize;
+                return Ok(Value::List((0..n).map(|i| Value::Number(i as f64)).collect::<Vec<_>>().into()));
+            },
+            // mesh3d_project(vx, vy, vz, m12, persp, f_or_s, cx, cy) -> [px, py, pd, pcx, pcy, pcz, hash]
+            // m12 = the first 12 entries (3 rows) of the object-to-camera matrix; camera looks down -Z, d = -z
+            #[cfg(not(target_arch = "wasm32"))]
+            "mesh3d_project" => {
+                let fl = |v: Option<&Value>| -> Vec<f64> {
+                    match v {
+                        Some(Value::List(l)) => l.iter().map(|x| if let Value::Number(n) = x { *n } else { 0.0 }).collect(),
+                        _ => Vec::new(),
+                    }
+                };
+                let (vx, vy, vz, m) = (fl(args.first()), fl(args.get(1)), fl(args.get(2)), fl(args.get(3)));
+                let n = vx.len().min(vy.len()).min(vz.len());
+                if m.len() < 12 {
+                    return Ok(Value::List(Vec::new().into()));
+                }
+                let persp = self.arg_num(&args, 4, 1.)? > 0.5;
+                let fs = self.arg_num(&args, 5, 500.)?;
+                let (cx, cy) = (self.arg_num(&args, 6, 0.)?, self.arg_num(&args, 7, 0.)?);
+                let cap = |_: usize| Vec::<Value>::with_capacity(n);
+                let (mut px, mut py, mut pd, mut pcx, mut pcy, mut pcz) = (cap(0), cap(0), cap(0), cap(0), cap(0), cap(0));
+                let mut vh = n as f64 * 7919.0;
+                for k in 0..n {
+                    let (x, y, z) = (vx[k], vy[k], vz[k]);
+                    vh += (x * 1.31 + y * 2.17 + z * 3.07) * (((k % 13) + 1) as f64);
+                    let xc = m[0] * x + m[1] * y + m[2] * z + m[3];
+                    let yc = m[4] * x + m[5] * y + m[6] * z + m[7];
+                    let zc = m[8] * x + m[9] * y + m[10] * z + m[11];
+                    let d = -zc;
+                    if persp {
+                        let dd = d.max(0.0001);
+                        px.push(Value::Number(cx + xc * fs / dd));
+                        py.push(Value::Number(cy - yc * fs / dd));
+                    } else {
+                        px.push(Value::Number(cx + xc * fs));
+                        py.push(Value::Number(cy - yc * fs));
+                    }
+                    pd.push(Value::Number(d));
+                    pcx.push(Value::Number(xc));
+                    pcy.push(Value::Number(yc));
+                    pcz.push(Value::Number(zc));
+                }
+                let l = |v: Vec<Value>| Value::List(v.into());
+                return Ok(Value::List(vec![l(px), l(py), l(pd), l(pcx), l(pcy), l(pcz), Value::Number(vh)].into()));
+            },
+            // mesh3d_fill(fi, fs, fc, px, py, pcx, pcy, pcz, pd, fcol, fsel, base, flags, sel_col, red_col, o)
+            //   -> [face_ids, depths, object_ids] of the faces drawn, far to near.
+            // Painter's algorithm by average depth, back-face cull, Newell normal, camera-light shading and selection tints:
+            // the same look as LingModeler's interpreted path, in native code. flags: 1 cull, 2 x-ray, 4 edit-mode face
+            // selection tint, 8 object-selected tint. Honours px_clip.
+            #[cfg(not(target_arch = "wasm32"))]
+            "mesh3d_fill" => {
+                let fl = |v: Option<&Value>| -> Vec<f64> {
+                    match v {
+                        Some(Value::List(l)) => l.iter().map(|x| if let Value::Number(n) = x { *n } else { 0.0 }).collect(),
+                        _ => Vec::new(),
+                    }
+                };
+                let (fi, fs, fc) = (fl(args.first()), fl(args.get(1)), fl(args.get(2)));
+                let (px, py) = (fl(args.get(3)), fl(args.get(4)));
+                let (pcx, pcy, pcz, pd) = (fl(args.get(5)), fl(args.get(6)), fl(args.get(7)), fl(args.get(8)));
+                let (fcol, fsel) = (fl(args.get(9)), fl(args.get(10)));
+                let base = self.arg_num(&args, 11, 0.)? as u32;
+                let flags = self.arg_num(&args, 12, 0.)? as u32;
+                let (sel_col, red_col) = (self.arg_num(&args, 13, 0.)? as u32, self.arg_num(&args, 14, 0.)? as u32);
+                let oid = self.arg_num(&args, 15, 0.)?;
+                let gpu_mode = self.arg_num(&args, 16, 0.)? > 0.5;
+                #[cfg(not(feature = "game"))]
+                let _ = gpu_mode; // the z-buffer batch is ling-gpu (`game` profile)
+                let (cull, xray, edit, osel) = (flags & 1 != 0, flags & 2 != 0, flags & 4 != 0, flags & 8 != 0);
+                let unpack = |c: u32| ((c >> 16) & 255, (c >> 8) & 255, c & 255);
+                let pack = |r: f64, g: f64, b: f64| -> u32 {
+                    ((r.clamp(0.0, 255.0).floor() as u32) << 16) | ((g.clamp(0.0, 255.0).floor() as u32) << 8) | (b.clamp(0.0, 255.0).floor() as u32)
+                };
+                let tint = |c: u32, k: f64| {
+                    let (r, g, b) = unpack(c);
+                    pack((r as f64 * k).min(255.0), (g as f64 * k).min(255.0), (b as f64 * k).min(255.0))
+                };
+                let mix = |a: u32, b: u32, t: f64| {
+                    let (ar, ag, ab) = unpack(a);
+                    let (br, bg, bb) = unpack(b);
+                    pack(
+                        ar as f64 + (br as f64 - ar as f64) * t,
+                        ag as f64 + (bg as f64 - ag as f64) * t,
+                        ab as f64 + (bb as f64 - ab as f64) * t,
+                    )
+                };
+                // collect drawable faces (every corner in front of the near plane) with their average depth
+                let nf = fc.len().min(fs.len());
+                let mut faces: Vec<(usize, f64)> = Vec::with_capacity(nf);
+                for f in 0..nf {
+                    let (s, c) = (fs[f] as usize, fc[f] as usize);
+                    if c < 3 || s + c > fi.len() {
+                        continue;
+                    }
+                    let mut z = 0.0;
+                    let mut ok = true;
+                    for k in 0..c {
+                        let v = fi[s + k] as usize;
+                        if v >= pd.len() || v >= px.len() || v >= pcx.len() || pd[v] < 0.05 {
+                            ok = false;
+                            break;
+                        }
+                        z += pd[v];
+                    }
+                    if ok {
+                        faces.push((f, z / c as f64));
+                    }
+                }
+                faces.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                let clip = self.px_clip;
+                let mut gfx = self.gfx.borrow_mut();
+                let (w, h) = (gfx.width, gfx.height);
+                let mut out_f: Vec<Value> = Vec::with_capacity(faces.len());
+                let mut out_z: Vec<Value> = Vec::with_capacity(faces.len());
+                let mut out_o: Vec<Value> = Vec::with_capacity(faces.len());
+                for &(f, z) in &faces {
+                    let (s, c) = (fs[f] as usize, fc[f] as usize);
+                    let (mut nx, mut ny, mut nz) = (0.0f64, 0.0f64, 0.0f64);
+                    for k in 0..c {
+                        let va = fi[s + k] as usize;
+                        let vb = fi[s + (k + 1) % c] as usize;
+                        let (ax, ay, az) = (pcx[va], pcy[va], pcz[va]);
+                        let (bx, by, bz) = (pcx[vb], pcy[vb], pcz[vb]);
+                        nx += (ay - by) * (az + bz);
+                        ny += (az - bz) * (ax + bx);
+                        nz += (ax - bx) * (ay + by);
+                    }
+                    let nl = (nx * nx + ny * ny + nz * nz).sqrt();
+                    if nl <= 1e-9 {
+                        continue;
+                    }
+                    let (mut nx, mut ny, mut nz) = (nx / nl, ny / nl, nz / nl);
+                    let a0 = fi[s] as usize;
+                    let facing = nx * pcx[a0] + ny * pcy[a0] + nz * pcz[a0] < 0.0;
+                    if !facing {
+                        if cull {
+                            continue;
+                        }
+                        nx = -nx;
+                        ny = -ny;
+                        nz = -nz;
+                    }
+                    let mut col = base;
+                    if f < fcol.len() && fcol[f] >= 0.0 {
+                        col = fcol[f] as u32;
+                    }
+                    let l = nx * 0.35 + ny * 0.5 + nz * 0.8;
+                    let inten = 0.32 + 0.68 * l.max(0.0) + 0.08 * (-ny).max(0.0);
+                    col = tint(col, inten.min(1.35));
+                    if edit && f < fsel.len() && fsel[f] > 0.5 {
+                        col = mix(col, sel_col, 0.45);
+                    } else if osel {
+                        col = mix(col, sel_col, 0.08);
+                    }
+                    if !facing {
+                        col = mix(col, red_col, 0.25);
+                    }
+                    let mut pts: Vec<[f32; 2]> = Vec::with_capacity(c + 1);
+                    for k in 0..c {
+                        let v = fi[s + k] as usize;
+                        pts.push([px[v] as f32, py[v] as f32]);
+                    }
+                    #[cfg(feature = "game")]
+                    if gpu_mode {
+                        // z-buffer batch (gpu_raster_begin / gpu_raster_end): no sorting, painting or clipping here
+                        let zs: Vec<f32> = (0..c).map(|k| (1.0 / pd[fi[s + k] as usize]) as f32).collect();
+                        gpuview::push_poly(&pts, &zs, col);
+                        out_f.push(Value::Number(f as f64));
+                        out_z.push(Value::Number(z));
+                        out_o.push(Value::Number(oid));
+                        continue;
+                    }
+                    pts.push(pts[0]);
+                    if let Some([cx0, cy0, cx1, cy1]) = clip {
+                        let (x0, y0, x1, y1) = (cx0 as f32, cy0 as f32, cx1 as f32, cy1 as f32);
+                        let (mut lo_x, mut lo_y, mut hi_x, mut hi_y) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+                        for p in &pts {
+                            lo_x = lo_x.min(p[0]);
+                            hi_x = hi_x.max(p[0]);
+                            lo_y = lo_y.min(p[1]);
+                            hi_y = hi_y.max(p[1]);
+                        }
+                        if hi_x < x0 || lo_x > x1 || hi_y < y0 || lo_y > y1 {
+                            continue;
+                        }
+                        if lo_x < x0 || hi_x > x1 || lo_y < y0 || hi_y > y1 {
+                            for (axis, edge, sign) in [(0usize, x0, 1.0f32), (0, x1, -1.0), (1, y0, 1.0), (1, y1, -1.0)] {
+                                let inp = std::mem::take(&mut pts);
+                                let n = inp.len();
+                                for i in 0..n {
+                                    let (a, b) = (inp[i], inp[(i + 1) % n]);
+                                    let (da, db) = (sign * (a[axis] - edge), sign * (b[axis] - edge));
+                                    if da >= 0.0 {
+                                        pts.push(a);
+                                    }
+                                    if (da >= 0.0) != (db >= 0.0) {
+                                        let t = da / (da - db);
+                                        pts.push([a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]);
+                                    }
+                                }
+                                if pts.len() < 3 {
+                                    break;
+                                }
+                            }
+                            if pts.len() < 3 {
+                                continue;
+                            }
+                            let p0 = pts[0];
+                            pts.push(p0);
+                        }
+                    }
+                    let (color, add) = if xray { (tint(col, 0.45), true) } else { (col, false) };
+                    // tiny faces (finely tessellated skin / printed cloth): a hard-edged fill tiles without seams, whereas
+                    // anti-aliased edges of neighbouring triangles let the background show through as a dark net
+                    let (mut bx0, mut by0, mut bx1, mut by1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+                    for p in &pts {
+                        bx0 = bx0.min(p[0]);
+                        bx1 = bx1.max(p[0]);
+                        by0 = by0.min(p[1]);
+                        by1 = by1.max(p[1]);
+                    }
+                    if !xray && (bx1 - bx0).max(by1 - by0) < 14.0 {
+                        crate::gfx::raster::fill_contours(&mut gfx.buffer, w, h, color, add, std::slice::from_ref(&pts));
+                    } else {
+                        crate::gfx::raster::fill_contours_aa(&mut gfx.buffer, w, h, color, add, std::slice::from_ref(&pts));
+                    }
+                    out_f.push(Value::Number(f as f64));
+                    out_z.push(Value::Number(z));
+                    out_o.push(Value::Number(oid));
+                }
+                let l = |v: Vec<Value>| Value::List(v.into());
+                return Ok(Value::List(vec![l(out_f), l(out_z), l(out_o)].into()));
+            },
             // draw_poly([x0,y0,x1,y1,…]) — filled 2-D polygon in the current colour,
             // honouring the blend mode (additive → translucent glow). Auto-closes.
-            #[cfg(not(target_arch = "wasm32"))]
-            "draw_poly"
+                        "draw_poly"
             | "填充多边形"
             | "ポリゴン塗り"
             | "다각형채우기"
@@ -8064,6 +10319,43 @@ impl Interpreter {
                         let p0 = pts[0];
                         pts.push(p0);
                     } // close
+                    // honour px_clip (UI panels / viewports): Sutherland-Hodgman against the clip rectangle
+                    if let Some([cx0, cy0, cx1, cy1]) = self.px_clip {
+                        let (x0, y0, x1, y1) = (cx0 as f32, cy0 as f32, cx1 as f32, cy1 as f32);
+                        let (mut lo_x, mut lo_y, mut hi_x, mut hi_y) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+                        for p in &pts {
+                            lo_x = lo_x.min(p[0]);
+                            hi_x = hi_x.max(p[0]);
+                            lo_y = lo_y.min(p[1]);
+                            hi_y = hi_y.max(p[1]);
+                        }
+                        if hi_x < x0 || lo_x > x1 || hi_y < y0 || lo_y > y1 {
+                            return Ok(Value::Unit);
+                        }
+                        if lo_x < x0 || hi_x > x1 || lo_y < y0 || hi_y > y1 {
+                            // (axis, edge, keep the side where sign * (coord - edge) >= 0)
+                            for (axis, edge, sign) in [(0usize, x0, 1.0f32), (0, x1, -1.0), (1, y0, 1.0), (1, y1, -1.0)] {
+                                let inp = std::mem::take(&mut pts);
+                                let n = inp.len();
+                                for i in 0..n {
+                                    let (a, b) = (inp[i], inp[(i + 1) % n]);
+                                    let (da, db) = (sign * (a[axis] - edge), sign * (b[axis] - edge));
+                                    if da >= 0.0 {
+                                        pts.push(a);
+                                    }
+                                    if (da >= 0.0) != (db >= 0.0) {
+                                        let t = da / (da - db);
+                                        pts.push([a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]);
+                                    }
+                                }
+                                if pts.len() < 3 {
+                                    return Ok(Value::Unit);
+                                }
+                            }
+                            let p0 = pts[0];
+                            pts.push(p0);
+                        }
+                    }
                     let mut gfx = self.gfx.borrow_mut();
                     let (w, h, color, add) = (gfx.width, gfx.height, gfx.color, gfx.blend == 1);
                     crate::gfx::raster::fill_contours_aa(
@@ -8338,6 +10630,9 @@ impl Interpreter {
                 );
                 return Ok(Value::Unit);
             },
+            _ => {},
+        } }
+        if __ck <= 9 { __cl.at = 9; match name {
 
             // vtex_letter_rain(cx,cy,cz, ux,uy,uz, vx,vy,vz, n_cols,n_vis, col_w,row_h, speed, fr,hue)
             "vtex_letter_rain"
@@ -8858,7 +11153,7 @@ impl Interpreter {
             // ══════════════════════════════════════════════════════════════════
 
             // audio_tone(idx, x, y, z, w, freq, amp, lfo_rate, lfo_depth)
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
             "audio_tone"
             | "เสียงโทน"
             | "音调"
@@ -8883,16 +11178,84 @@ impl Interpreter {
                 let amp = self.arg_num(&args, 6, 0.15)? as f32;
                 let lfo_rate = self.arg_num(&args, 7, 0.5)? as f32;
                 let lfo_depth = self.arg_num(&args, 8, 0.02)? as f32;
+                // optional: waveform name ("sine"|"square"|"saw"|"triangle"|"noise")
+                // and square duty cycle (0.125/0.25/0.5/0.75 — chip pulse widths)
+                let wave = ling_audio::Wave::from_name(&self.arg_str(&args, 9, "sine"));
+                let duty = self.arg_num(&args, 10, 0.5)? as f32;
                 if let Some(audio) = &self.audio {
                     audio.set_tone(
                         idx,
-                        ToneParams { x, y, z, w, freq, amp, lfo_rate, lfo_depth },
+                        ToneParams { x, y, z, w, freq, amp, lfo_rate, lfo_depth, wave, duty },
                     );
                 }
                 return Ok(Value::Unit);
             },
 
-            #[cfg(not(target_arch = "wasm32"))]
+            // audio_glide(amp_ms [, freq_ms]) — smoothing time constants for audio_tone
+            // voices (≤0 = default). Chip-style players that update tones once per
+            // video frame want ≈10 ms so decaying envelopes ramp instead of stepping.
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
+            "audio_glide" => {
+                let a = self.arg_num(&args, 0, 0.0)? as f32;
+                let f = self.arg_num(&args, 1, 0.0)? as f32;
+                if let Some(audio) = &self.audio {
+                    audio.set_glide(a, f);
+                }
+                return Ok(Value::Unit);
+            },
+            // audio_hrtf(on) — binaural HRTF spatialization (ITD, head shadow,
+            // pinna/elevation, rear and air cues) for every positional voice.
+            // 0 = classic equal-power pan. Best on headphones.
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
+            "audio_hrtf" | "双耳音频" | "バイノーラル" | "바이노럴" => {
+                let on = match args.first() {
+                    Some(Value::Bool(b)) => *b,
+                    _ => self.arg_num(&args, 0, 1.0)? > 0.5,
+                };
+                if let Some(audio) = &self.audio {
+                    audio.set_hrtf(on);
+                }
+                return Ok(Value::Unit);
+            },
+            // audio_chime(x, y, z, freq, amp, dur [, kind]) — struck chime at a
+            // world point (listener-relative like audio_sfx).
+            //   kind: 0 wind chime · 1 bell · 2 singing bowl · 3 glockenspiel
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
+            "audio_chime" | "风铃" | "風鈴" | "풍경" => {
+                let x = self.arg_num(&args, 0, 0.0)? as f32;
+                let y = self.arg_num(&args, 1, 0.0)? as f32;
+                let z = self.arg_num(&args, 2, 0.0)? as f32;
+                let freq = self.arg_num(&args, 3, 880.0)? as f32;
+                let amp = self.arg_num(&args, 4, 0.3)? as f32;
+                let dur = self.arg_num(&args, 5, 2.0)? as f32;
+                let kind = self.arg_num(&args, 6, 0.0)?.max(0.0) as usize;
+                if let Some(audio) = &self.audio {
+                    audio.chime(x, y, z, freq, amp, dur, kind);
+                }
+                return Ok(Value::Unit);
+            },
+            // audio_drone(slot, x, y, z, freq, amp [, detune_cents, bright, motion_hz])
+            // — held pad in slot 0..31 (listener-relative position). Call every
+            // frame to move/retune it; amp 0 fades it out.
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
+            "audio_drone" | "持续音" | "ドローン音" | "드론음" => {
+                let idx = self.arg_num(&args, 0, 0.0)?.max(0.0) as usize;
+                let p = ling_audio::DroneParams {
+                    x: self.arg_num(&args, 1, 0.0)? as f32,
+                    y: self.arg_num(&args, 2, 0.0)? as f32,
+                    z: self.arg_num(&args, 3, 0.0)? as f32,
+                    freq: self.arg_num(&args, 4, 55.0)? as f32,
+                    amp: self.arg_num(&args, 5, 0.1)? as f32,
+                    detune: self.arg_num(&args, 6, 7.0)? as f32,
+                    bright: self.arg_num(&args, 7, 0.3)? as f32,
+                    motion: self.arg_num(&args, 8, 0.08)? as f32,
+                };
+                if let Some(audio) = &self.audio {
+                    audio.set_drone(idx, p);
+                }
+                return Ok(Value::Unit);
+            },
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
             "audio_listener"
             | "ผู้ฟัง"
             | "音频监听"
@@ -8915,7 +11278,7 @@ impl Interpreter {
                 return Ok(Value::Unit);
             },
 
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
             "audio_bgm"
             | "เพลงพื้นหลัง"
             | "เพลงประกอบ"
@@ -8940,7 +11303,7 @@ impl Interpreter {
                 return Ok(Value::Unit);
             },
 
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
             "audio_bgm_volume"
             | "ระดับเสียงพื้นหลัง"
             | "ระดับเพลงประกอบ"
@@ -8961,7 +11324,7 @@ impl Interpreter {
                 return Ok(Value::Unit);
             },
 
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
             "audio_volume"
             | "ระดับเสียง"
             | "音量"
@@ -9009,6 +11372,9 @@ impl Interpreter {
                 crate::gfx::audio_web::set_tone(idx, x, y, z, w, freq, amp, lfo_rate, lfo_depth);
                 return Ok(Value::Unit);
             },
+            _ => {},
+        } }
+        if __ck <= 10 { __cl.at = 10; match name {
 
             #[cfg(target_arch = "wasm32")]
             "audio_listener"
@@ -9103,6 +11469,10 @@ impl Interpreter {
             | "загрузить_семпл" => {
                 let path = self.arg_str(&args, 0, "");
                 let resolved = self.wasm_resolve_source_path(&path);
+                // worker host: the page fetches + decodes it (see audio_web remote)
+                if let Some(id) = crate::gfx::audio_web::remote_sample_load(&resolved) {
+                    return Ok(Value::Number(id as f64));
+                }
                 match wasm_fetch_bytes(&resolved)
                     .and_then(|bytes| ling_music::from_bytes(&bytes).map_err(|e| e.to_string()))
                 {
@@ -9207,8 +11577,13 @@ impl Interpreter {
             // ── File I/O ──────────────────────────────────────────────────────
             "read_file" | "อ่านไฟล์" | "خواندن_فایل" | "اقرأ_الملف" | "קרא_קובץ" | "فائل_پڑھو" =>
             {
+                // web: no disk — a file the page / worker registered as an asset
+                // (register_asset) reads back as text (e.g. yt_events.txt), else ""
                 #[cfg(target_arch = "wasm32")]
-                return Ok(Value::Str(String::new()));
+                {
+                    let path = self.arg_str(&args, 0, "");
+                    return Ok(Value::Str(crate::assets::get(&path).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default()));
+                }
                 #[cfg(not(target_arch = "wasm32"))]
                 {
                     let path = self.arg_str(&args, 0, "").replace('\\', "/");
@@ -9216,6 +11591,226 @@ impl Interpreter {
                         .map(Value::Str)
                         .map_err(|e| EvalErr::from(format!("read_file '{path}': {e}")));
                 }
+            },
+            // read_file_bytes(path) → list of byte values (0-255). Binary-safe
+            // twin of read_file, which is UTF-8-only: ROMs, images, save files…
+            // Returns [] when the file can't be read.
+            // ── native console-emulation host (ling-emu, cargo feature `emu`) ──
+            // emu_available is always registered so a .ling program can probe
+            // for the feature without crashing on builds that lack it.
+            "emu_available" => {
+                return Ok(Value::Bool(cfg!(feature = "emu")));
+            },
+            #[cfg(all(not(target_arch = "wasm32"), feature = "emu"))]
+            "emu_load" => {
+                let path = self.arg_str(&args, 0, "").replace('\\', "/");
+                let r = ling_emu::load_file(&path);
+                return Ok(match r {
+                    Ok(_) => Value::Bool(true),
+                    Err(e) => {
+                        eprintln!("emu_load: {e}");
+                        Value::Bool(false)
+                    },
+                });
+            },
+            #[cfg(all(not(target_arch = "wasm32"), feature = "emu"))]
+            "emu_loaded" => {
+                return Ok(Value::Bool(ling_emu::is_loaded()));
+            },
+            #[cfg(all(not(target_arch = "wasm32"), feature = "emu"))]
+            "emu_frame" => {
+                ling_emu::frame();
+                return Ok(Value::Unit);
+            },
+            // emu_blit(x, y, w, h) — nearest-neighbour fit of the core's video
+            // into the window framebuffer.
+            #[cfg(all(not(target_arch = "wasm32"), feature = "emu"))]
+            "emu_blit" => {
+                let x0 = self.arg_num(&args, 0, 0.0)? as i64;
+                let y0 = self.arg_num(&args, 1, 0.0)? as i64;
+                let dw = (self.arg_num(&args, 2, 320.0)? as i64).max(1);
+                let dh = (self.arg_num(&args, 3, 240.0)? as i64).max(1);
+                let mut gfx = self.gfx.borrow_mut();
+                let (gw, gh) = (gfx.width as i64, gfx.height as i64);
+                let ok = ling_emu::with_core(|c| {
+                    let (fb, fw, fh) = c.framebuffer();
+                    if fw == 0 || fh == 0 {
+                        return;
+                    }
+                    // clip the destination once, map columns once
+                    let cx0 = x0.max(0);
+                    let cx1 = (x0 + dw).min(gw);
+                    if cx1 <= cx0 {
+                        return;
+                    }
+                    let xmap: Vec<usize> =
+                        (cx0..cx1).map(|tx| (((tx - x0) as usize) * fw) / dw as usize).collect();
+                    let span = (cx1 - cx0) as usize;
+                    let mut prev: Option<(usize, usize)> = None; // (source row, dest offset)
+                    for dy in 0..dh {
+                        let ty = y0 + dy;
+                        if ty < 0 || ty >= gh {
+                            continue;
+                        }
+                        let sy = (dy as usize * fh) / dh as usize;
+                        let base = (ty * gw + cx0) as usize;
+                        match prev {
+                            Some((psy, pbase)) if psy == sy => {
+                                // duplicate scaled row: one memcpy
+                                gfx.buffer.copy_within(pbase..pbase + span, base);
+                            },
+                            _ => {
+                                let row = &fb[sy * fw..sy * fw + fw];
+                                let dst = &mut gfx.buffer[base..base + span];
+                                for (d, &sx) in dst.iter_mut().zip(xmap.iter()) {
+                                    *d = row[sx];
+                                }
+                            },
+                        }
+                        prev = Some((sy, base));
+                    }
+                })
+                .is_some();
+                return Ok(Value::Bool(ok));
+            },
+            // emu_button(pad, button, down) — indices are system-specific
+            // (N64: 0 A · 1 B · 2 Z · 3 Start · 4-7 D-pad · 8 L · 9 R · 10-13 C)
+            #[cfg(all(not(target_arch = "wasm32"), feature = "emu"))]
+            "emu_button" => {
+                let pad = self.arg_num(&args, 0, 0.0)? as usize;
+                let btn = self.arg_num(&args, 1, 0.0)? as usize;
+                let down = args.get(2).map(|v| self.is_truthy(v)).unwrap_or(false);
+                ling_emu::with_core(|c| c.set_button(pad, btn, down));
+                return Ok(Value::Unit);
+            },
+            #[cfg(all(not(target_arch = "wasm32"), feature = "emu"))]
+            "emu_stick" => {
+                let pad = self.arg_num(&args, 0, 0.0)? as usize;
+                let sx = self.arg_num(&args, 1, 0.0)? as f32;
+                let sy = self.arg_num(&args, 2, 0.0)? as f32;
+                ling_emu::with_core(|c| c.set_stick(pad, sx, sy));
+                return Ok(Value::Unit);
+            },
+            #[cfg(all(not(target_arch = "wasm32"), feature = "emu"))]
+            "emu_flush" => {
+                ling_emu::flush_save();
+                return Ok(Value::Unit);
+            },
+            #[cfg(all(not(target_arch = "wasm32"), feature = "emu"))]
+            "emu_stop" => {
+                ling_emu::unload();
+                return Ok(Value::Unit);
+            },
+            #[cfg(all(not(target_arch = "wasm32"), feature = "emu"))]
+            "emu_status" => {
+                return Ok(Value::Str(ling_emu::status_line()));
+            },
+            #[cfg(all(not(target_arch = "wasm32"), feature = "emu"))]
+            "emu_fb_size" => {
+                let (w, h) = ling_emu::with_core(|c| {
+                    let (_, w, h) = c.framebuffer();
+                    (w, h)
+                })
+                .unwrap_or((0, 0));
+                return Ok(return_list(vec![
+                    Value::Number(w as f64),
+                    Value::Number(h as f64),
+                ]));
+            },
+
+            // read_file_bytes(path [, offset, len]) — omit len (or pass a
+            // negative) to read to EOF. Ranged reads let callers peek headers
+            // of large files without loading them whole.
+            "read_file_bytes" | "读字节" | "바이트읽기" | "อ่านไบต์" => {
+                #[cfg(target_arch = "wasm32")]
+                return Ok(Value::List(Rc::new(vec![])));
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let path = self.arg_str(&args, 0, "").replace('\\', "/");
+                    let off = self.arg_num(&args, 1, 0.0)?.max(0.0) as u64;
+                    let want = self.arg_num(&args, 2, -1.0)?;
+                    let bytes: Vec<u8> = (|| -> std::io::Result<Vec<u8>> {
+                        use std::io::{Read as _, Seek as _};
+                        let mut f = std::fs::File::open(&path)?;
+                        if off > 0 {
+                            f.seek(std::io::SeekFrom::Start(off))?;
+                        }
+                        let mut buf = Vec::new();
+                        if want < 0.0 {
+                            f.read_to_end(&mut buf)?;
+                        } else {
+                            let mut t = f.take(want as u64);
+                            t.read_to_end(&mut buf)?;
+                        }
+                        Ok(buf)
+                    })()
+                    .unwrap_or_default();
+                    let out: Vec<Value> =
+                        bytes.into_iter().map(|b| Value::Number(b as f64)).collect();
+                    return Ok(Value::List(Rc::new(out)));
+                }
+            },
+            // chr(code) → one-character string · ord(s) → first char's code (-1 if empty)
+            "chr" | "字符" | "문자" | "อักขระ" => {
+                let code = self.arg_num(&args, 0, 0.0)? as u32;
+                let c = char::from_u32(code).unwrap_or(char::REPLACEMENT_CHARACTER);
+                return Ok(Value::Str(c.to_string()));
+            },
+            "ord" | "字码" | "문자코드" | "รหัสอักขระ" => {
+                let sv = self.arg_str(&args, 0, "");
+                return Ok(Value::Number(
+                    sv.chars().next().map(|c| c as u32 as f64).unwrap_or(-1.0),
+                ));
+            },
+            // write_file_bytes(path, list) → bool — binary-safe twin of write_file.
+            "write_file_bytes" | "写字节" | "바이트쓰기" | "เขียนไบต์" => {
+                #[cfg(target_arch = "wasm32")]
+                return Ok(Value::Bool(false));
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let path = self.arg_str(&args, 0, "").replace('\\', "/");
+                    let bytes: Vec<u8> = match args.get(1) {
+                        Some(Value::List(v)) => v
+                            .iter()
+                            .map(|x| match x {
+                                Value::Number(n) => *n as i64 as u8,
+                                _ => 0,
+                            })
+                            .collect(),
+                        _ => Vec::new(),
+                    };
+                    return Ok(Value::Bool(std::fs::write(&path, bytes).is_ok()));
+                }
+            },
+            // ── networking on the web: the host page owns a WebSocket (bridged to the
+            // game's TCP tiers); these forward to the worker's __ling_net_* globals ──
+            #[cfg(target_arch = "wasm32")]
+            "net_join" => {
+                let ip = self.arg_str(&args, 0, "127.0.0.1");
+                let port = self.arg_num(&args, 1, 7777.0)?;
+                js_global_call("__ling_net_join", &[ip.into(), port.into()]);
+                return Ok(Value::Unit);
+            },
+            #[cfg(target_arch = "wasm32")]
+            "net_send" => {
+                let s = self.arg_str(&args, 0, "");
+                js_global_call("__ling_net_send", &[s.into()]);
+                return Ok(Value::Unit);
+            },
+            #[cfg(target_arch = "wasm32")]
+            "net_recv" => {
+                let v = js_global_call("__ling_net_recv", &[]);
+                return Ok(Value::Str(v.as_string().unwrap_or_default()));
+            },
+            #[cfg(target_arch = "wasm32")]
+            "net_status" => {
+                let v = js_global_call("__ling_net_status", &[]);
+                return Ok(Value::Number(v.as_f64().unwrap_or(0.0)));
+            },
+            #[cfg(target_arch = "wasm32")]
+            "net_close" | "연결종료" => {
+                js_global_call("__ling_net_close", &[]);
+                return Ok(Value::Unit);
             },
             // ── networking (TCP, 2-peer co-op) ───────────────────────────────
             #[cfg(not(target_arch = "wasm32"))]
@@ -9314,7 +11909,7 @@ impl Interpreter {
                 return Ok(Value::Str(net::test_bind(port)));
             },
             // ── SSH (real SSH2 client + server via `russh`; see runtime::ssh) ──
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "privacy"))]
             "ssh_config" => {
                 let port = self.arg_num(&args, 0, 22.0)? as u16;
                 let user = self.arg_str(&args, 1, "");
@@ -9323,50 +11918,50 @@ impl Interpreter {
                 ssh::configure(port, &user, &password, &host_key_path);
                 return Ok(Value::Unit);
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "privacy"))]
             "ssh_serve" => {
                 return Ok(Value::Bool(ssh::serve()));
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "privacy"))]
             "ssh_stop" => {
                 ssh::stop();
                 return Ok(Value::Unit);
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "privacy"))]
             "ssh_serve_send" => {
                 let id = self.arg_num(&args, 0, 0.0)? as u64;
                 let s = self.arg_str(&args, 1, "");
                 ssh::serve_send(id, &s);
                 return Ok(Value::Unit);
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "privacy"))]
             "ssh_serve_recv" => {
                 return Ok(Value::Str(ssh::serve_recv()));
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "privacy"))]
             "ssh_serve_exit" => {
                 let id = self.arg_num(&args, 0, 0.0)? as u64;
                 let code = self.arg_num(&args, 1, 0.0)? as u32;
                 ssh::serve_exit(id, code);
                 return Ok(Value::Unit);
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "privacy"))]
             "ssh_serve_clients" => {
                 return Ok(Value::Str(ssh::serve_clients()));
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "privacy"))]
             "ssh_serve_client_count" => {
                 return Ok(Value::Number(ssh::serve_client_count() as f64));
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "privacy"))]
             "ssh_serve_events" => {
                 return Ok(Value::Str(ssh::serve_events()));
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "privacy"))]
             "ssh_serve_status" => {
                 return Ok(Value::Number(ssh::serve_status() as f64));
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "privacy"))]
             "ssh_connect" => {
                 let host = self.arg_str(&args, 0, "");
                 let port = self.arg_num(&args, 1, 22.0)? as u16;
@@ -9374,20 +11969,20 @@ impl Interpreter {
                 let password = self.arg_str(&args, 3, "");
                 return Ok(Value::Number(ssh::connect(&host, port, &user, &password)));
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "privacy"))]
             "ssh_exec" => {
                 let cmd = self.arg_str(&args, 0, "");
                 return Ok(Value::Str(ssh::exec(&cmd)));
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "privacy"))]
             "ssh_exit_code" => {
                 return Ok(Value::Number(ssh::exit_code()));
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "privacy"))]
             "ssh_client_status" => {
                 return Ok(Value::Number(ssh::client_status() as f64));
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "privacy"))]
             "ssh_close" => {
                 ssh::close();
                 return Ok(Value::Unit);
@@ -9395,7 +11990,7 @@ impl Interpreter {
             // ── lingtp:// (post-quantum secure transport, see runtime::lingtp) ──
             // Client: fetch one resource, https-style but with an ML-KEM/
             // ML-DSA-87 handshake instead of TLS.
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "privacy"))]
             "lingtp_get" => {
                 let host = self.arg_str(&args, 0, "");
                 let port = self.arg_num(&args, 1, 7780.0)? as u16;
@@ -9404,7 +11999,7 @@ impl Interpreter {
                 self.last_lingtp_status = status;
                 return Ok(Value::Str(body));
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "privacy"))]
             "lingtp_get_status" => {
                 return Ok(Value::Number(self.last_lingtp_status as f64));
             },
@@ -9415,6 +12010,61 @@ impl Interpreter {
             // id immediately. Poll with terrain_grid_poll. Lets a caller
             // keep drawing with the last-good grid instead of blocking the
             // whole frame while a fresh one computes.
+            // terrain_draw_grid(bx, bz, cell, rad, seaY, t, corners) — draw the whole
+            // ground grid (land + biome tint + grain + water) in one call; the exact
+            // Rust port of draw_ground's per-quad loop (see runtime::terrain_bg).
+            "terrain_draw_grid" | "지형그리드그리기" | "绘制地形网格" | "地形グリッド描画" | "วาดกริดภูมิประเทศ" | "رسم_شبکه_زمین" | "ارسم_شبكة_التضاريس" | "צייר_רשת_שטח" | "ٹیرین_گرڈ_کھینچو" | "dessiner_grille_terrain" | "geländegitter_zeichnen" | "нарисовать_сетку_рельефа" => {
+                let bx = self.arg_num(&args, 0, 0.0)?;
+                let bz = self.arg_num(&args, 1, 0.0)?;
+                let cell = self.arg_num(&args, 2, 1.35)?;
+                let rad = self.arg_num(&args, 3, 36.0)?;
+                let sea_y = self.arg_num(&args, 4, 0.08)?;
+                let t = self.arg_num(&args, 5, 0.0)?;
+                let corners: Vec<f64> = match args.get(6) {
+                    Some(Value::List(v)) => v
+                        .iter()
+                        .map(|x| match x {
+                            Value::Number(n) => *n,
+                            _ => 0.0,
+                        })
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                let mut gfx = self.gfx.borrow_mut();
+                terrain_bg::draw_quad_grid(&mut gfx, bx, bz, cell, rad, sea_y, t, &corners);
+                return Ok(Value::Unit);
+            },
+            #[cfg(target_arch = "wasm32")]
+            "terrain_grid_start" => {
+                let bx = self.arg_num(&args, 0, 0.0)?;
+                let bz = self.arg_num(&args, 1, 0.0)?;
+                let cell = self.arg_num(&args, 2, 1.35)?;
+                let rad = self.arg_num(&args, 3, 36.0)?;
+                return Ok(Value::Str(terrain_bg::start_sync(bx, bz, cell, rad)));
+            },
+            #[cfg(target_arch = "wasm32")]
+            "terrain_grid_poll" => {
+                let id = self.arg_str(&args, 0, "");
+                match terrain_bg::poll_sync(&id) {
+                    Some(r) => {
+                        let to_list = |v: Vec<f64>| {
+                            Value::List(v.into_iter().map(Value::Number).collect::<Vec<_>>().into())
+                        };
+                        return Ok(Value::List(
+                            vec![
+                                Value::Number(r.bx),
+                                Value::Number(r.bz),
+                                to_list(r.corners),
+                                to_list(r.norm_nx),
+                                to_list(r.norm_ny),
+                                to_list(r.norm_nz),
+                            ]
+                            .into(),
+                        ));
+                    },
+                    None => return Ok(Value::List(vec![].into())),
+                }
+            },
             #[cfg(not(target_arch = "wasm32"))]
             "terrain_grid_start" => {
                 let bx = self.arg_num(&args, 0, 0.0)?;
@@ -9424,6 +12074,9 @@ impl Interpreter {
                 let id = self.terrain_grid_jobs.start(bx, bz, cell, rad);
                 return Ok(Value::Str(id));
             },
+            _ => {},
+        } }
+        if __ck <= 11 { __cl.at = 11; match name {
             // terrain_grid_poll(jobId) — non-blocking. While the job named
             // by terrain_grid_start is still running (or the id is unknown/
             // already consumed), returns an empty list; a caller checks
@@ -9468,7 +12121,7 @@ impl Interpreter {
             // encode one if a field value has one), so "contains a newline"
             // is an unambiguous, route-safe POST marker for a handler to
             // check before splitting path from body.
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "privacy"))]
             "lingtp_post" => {
                 let host = self.arg_str(&args, 0, "");
                 let port = self.arg_num(&args, 1, 7780.0)? as u16;
@@ -9482,14 +12135,14 @@ impl Interpreter {
             // Server: stage config (port + where to persist the host's
             // ML-DSA-87 identity key — generated once on first serve() and
             // reused after, so returning clients' TOFU pin stays meaningful).
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "privacy"))]
             "lingtp_config" => {
                 let port = self.arg_num(&args, 0, 7780.0)? as u16;
                 let host_key_path = self.arg_str(&args, 1, "");
                 lingtp::configure(port, &host_key_path);
                 return Ok(Value::Unit);
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "privacy"))]
             "lingtp_route" => {
                 let path = self.arg_str(&args, 0, "/");
                 let handler = args.get(1).cloned().unwrap_or(Value::Unit);
@@ -9502,7 +12155,7 @@ impl Interpreter {
             // instead of draining a channel, since a TCP accept loop across
             // many raw std::thread connections (not a Receiver handed back
             // once) is what runtime::lingtp's server side hands us.
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "privacy"))]
             "lingtp_serve" => {
                 if !lingtp::serve() {
                     return Ok(Value::Bool(false));
@@ -9541,20 +12194,20 @@ impl Interpreter {
                 }
                 return Ok(Value::Bool(true));
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "privacy"))]
             "lingtp_stop" => {
                 lingtp::stop();
                 return Ok(Value::Unit);
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "privacy"))]
             "lingtp_status" => {
                 return Ok(Value::Number(lingtp::status() as f64));
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "privacy"))]
             "lingtp_client_count" => {
                 return Ok(Value::Number(lingtp::client_count() as f64));
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "privacy"))]
             "lingtp_events" => {
                 return Ok(Value::Str(lingtp::events()));
             },
@@ -9583,20 +12236,46 @@ impl Interpreter {
                 self.http_static_dirs.push((prefix, dir));
                 return Ok(Value::Unit);
             },
+            // http_vhost(host, dir) — serve a whole directory at the root of a
+            // different hostname (e.g. "docs.example.org" → an mdBook build),
+            // byte for byte like http_static. Matched on the Host header with
+            // the port stripped, case-insensitively; checked before every
+            // http_static prefix and http_route, so that host never reaches
+            // the Ling handlers. A missing file answers 404 with the
+            // directory's own 404.html when it has one. A `dir` that is an
+            // http(s):// URL instead answers 301 to that base + path + query
+            // (retire a subdomain: http_vhost("docs.x.org", "https://x.org/docs")).
+            #[cfg(all(not(target_arch = "wasm32"), feature = "web"))]
+            "http_vhost" => {
+                let host = self.arg_str(&args, 0, "").to_ascii_lowercase();
+                let dir = self.arg_str(&args, 1, "static");
+                if !host.is_empty() {
+                    self.http_vhosts.push((host, dir));
+                }
+                return Ok(Value::Unit);
+            },
+            // http_serve(host, port, workers?) — workers defaults to 1, which is
+            // the classic single-interpreter dispatch loop. With workers = N > 1,
+            // N interpreters (this one + N-1 fresh ones on their own threads) pull
+            // from the one request queue, so a slow handler no longer stalls every
+            // other visitor — see drain_http_requests_pool for the constraints
+            // (handlers must be named top-level functions).
             #[cfg(all(not(target_arch = "wasm32"), feature = "web"))]
             "http_serve" | "เว็บเสิร์ฟ" | "سرویس_HTTP" | "قدّم_HTTP" | "הגש_HTTP" | "HTTP_سرو" =>
             {
                 let host = self.arg_str(&args, 0, "127.0.0.1");
                 let port = self.arg_num(&args, 1, 8080.0)? as u16;
+                let workers = self.arg_num(&args, 2, 1.0)?.max(1.0) as usize;
                 let routes = std::mem::take(&mut self.http_routes);
                 let static_dirs = std::mem::take(&mut self.http_static_dirs);
+                let vhosts = std::mem::take(&mut self.http_vhosts);
                 // No premature "listening" print here: ling_http::serve_http
                 // (called from spawn_server's background thread) now prints
                 // its own banner, but only after the socket is actually
                 // bound — a more honest signal than printing right after
                 // requesting the background thread be spawned.
-                let rx = web::spawn_server(host.clone(), port, static_dirs, web::TlsMode::Plain);
-                return self.drain_http_requests(rx, routes);
+                let rx = web::spawn_server(host.clone(), port, static_dirs, vhosts, web::TlsMode::Plain);
+                return self.drain_http_requests_pool(rx, routes, workers);
             },
             // Real HTTPS: terminates TLS itself using a cert/key PEM pair
             // already on disk (e.g. from Let's Encrypt) — no reverse proxy
@@ -9608,15 +12287,18 @@ impl Interpreter {
                 let port = self.arg_num(&args, 1, 8080.0)? as u16;
                 let cert_pem = self.arg_str(&args, 2, "");
                 let key_pem = self.arg_str(&args, 3, "");
+                let workers = self.arg_num(&args, 4, 1.0)?.max(1.0) as usize;
                 let routes = std::mem::take(&mut self.http_routes);
                 let static_dirs = std::mem::take(&mut self.http_static_dirs);
+                let vhosts = std::mem::take(&mut self.http_vhosts);
                 let rx = web::spawn_server(
                     host.clone(),
                     port,
                     static_dirs,
+                    vhosts,
                     web::TlsMode::Certs { cert_pem, key_pem },
                 );
-                return self.drain_http_requests(rx, routes);
+                return self.drain_http_requests_pool(rx, routes, workers);
             },
             // HTTPS with a throwaway self-signed cert generated at startup —
             // local development only; browsers/curl reject it as untrusted
@@ -9626,10 +12308,12 @@ impl Interpreter {
             "http_serve_dev_tls" => {
                 let host = self.arg_str(&args, 0, "127.0.0.1");
                 let port = self.arg_num(&args, 1, 8080.0)? as u16;
+                let workers = self.arg_num(&args, 2, 1.0)?.max(1.0) as usize;
                 let routes = std::mem::take(&mut self.http_routes);
                 let static_dirs = std::mem::take(&mut self.http_static_dirs);
-                let rx = web::spawn_server(host.clone(), port, static_dirs, web::TlsMode::Dev);
-                return self.drain_http_requests(rx, routes);
+                let vhosts = std::mem::take(&mut self.http_vhosts);
+                let rx = web::spawn_server(host.clone(), port, static_dirs, vhosts, web::TlsMode::Dev);
+                return self.drain_http_requests_pool(rx, routes, workers);
             },
             // Fires a POST request on a background async runtime and returns a job
             // Retrieves `url` (http:// or https://, TLS handled transparently
@@ -9648,6 +12332,36 @@ impl Interpreter {
             // HTTP status of the last http_get call (0 if it never got a
             // response at all — DNS/connect/TLS failure, distinct from a
             // real 4xx/5xx).
+            // http_get_all([url, ...]) — fetch several addresses at once (a page's stylesheets)
+            // and wait for all of them: a list of bodies in the same order ("" for a failure or
+            // an HTTP error).
+            #[cfg(all(not(target_arch = "wasm32"), feature = "web"))]
+            "http_get_all" => {
+                let urls: Vec<String> = match args.first() {
+                    Some(Value::List(l)) => l.iter().map(|v| v.to_string()).collect(),
+                    _ => Vec::new(),
+                };
+                let bodies = web::get_all_blocking(&urls);
+                return Ok(Value::List(std::rc::Rc::new(bodies.into_iter().map(Value::Str).collect())));
+            },
+            // cookie_jar_* / http_fetch / http_last_*: the browser cookie jar (runtime/cookiejar.rs)
+            #[cfg(all(not(target_arch = "wasm32"), feature = "web"))]
+            n if cookiejar::handles(n) => {
+                let mut st = self.last_http_status;
+                let v = cookiejar::call(n, &args, &mut st);
+                self.last_http_status = st;
+                return Ok(v);
+            },
+            // http_request_async / ws_* / json_* / rsa_oaep_*: app clients (runtime/netx.rs)
+            #[cfg(all(not(target_arch = "wasm32"), feature = "web"))]
+            n if netx::handles(n) => {
+                return Ok(netx::call(n, &args));
+            },
+            // lingjs_*: LingJS, Ling's JavaScript engine (runtime/lingjs.rs)
+            #[cfg(all(not(target_arch = "wasm32"), feature = "web"))]
+            n if lingjs::handles(n) => {
+                return Ok(lingjs::call(n, &args));
+            },
             #[cfg(all(not(target_arch = "wasm32"), feature = "web"))]
             "http_get_status" => {
                 return Ok(Value::Number(self.last_http_status as f64));
@@ -9666,6 +12380,15 @@ impl Interpreter {
                 let body = self.arg_str(&args, 1, "");
                 let content_type = self.arg_str(&args, 2, "application/json");
                 let id = self.async_jobs.start_post(url, content_type, body);
+                return Ok(Value::Str(id));
+            },
+            // The GET twin: fire a page fetch on the background runtime and
+            // return a job id at once; http_job_poll returns the body (or an
+            // "ERROR: ..." line) when it lands. Same job table as POST.
+            #[cfg(all(not(target_arch = "wasm32"), feature = "web"))]
+            "http_get_async" => {
+                let url = self.arg_str(&args, 0, "");
+                let id = self.async_jobs.start_get(url);
                 return Ok(Value::Str(id));
             },
             // Non-blocking poll: "" while the job named by http_post_async (or
@@ -9811,7 +12534,14 @@ impl Interpreter {
                 let path = self.arg_str(&args, 0, "app.db");
                 let conn = ling_http::rusqlite::Connection::open(&path)
                     .map_err(|e| EvalErr::from(format!("db_open '{path}': {e}")))?;
-                let _ = conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;");
+                // busy_timeout: with `http_serve` workers several connections
+                // write to this database; a contended write should wait its
+                // turn, not fail with "database is locked". A no-op cost for
+                // the single-connection case.
+                let _ = conn.execute_batch(
+                    "PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;",
+                );
+                self.db_path = Some(path);
                 self.db = Some(conn);
                 return Ok(Value::Unit);
             },
@@ -9885,7 +12615,7 @@ impl Interpreter {
                 return Ok(Value::List(Rc::new(out)));
             },
             // ── gamepad (gilrs) ──
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "game"))]
             "gamepad_poll"
             | "จอยโพล"
             | "بررسی_دسته_بازی"
@@ -9895,7 +12625,7 @@ impl Interpreter {
                 gamepad::poll();
                 return Ok(Value::Unit);
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "game"))]
             "gamepad_button"
             | "จอยปุ่ม"
             | "دکمه_دسته_بازی"
@@ -9909,7 +12639,7 @@ impl Interpreter {
                     0.0
                 }));
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "game"))]
             "gamepad_axis"
             | "จอยแกน"
             | "محور_دسته_بازی"
@@ -9919,7 +12649,7 @@ impl Interpreter {
                 let name = self.arg_str(&args, 0, "");
                 return Ok(Value::Number(gamepad::axis(&name) as f64));
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "game"))]
             "gamepad_rumble"
             | "จอยสั่น"
             | "لرزش_دسته_بازی"
@@ -9932,7 +12662,7 @@ impl Interpreter {
                 gamepad::rumble(low, high, ms);
                 return Ok(Value::Unit);
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "game"))]
             "gamepad_list"
             | "จอยรายการ"
             | "فهرست_دسته‌های_بازی"
@@ -9941,7 +12671,7 @@ impl Interpreter {
             | "گیم_پیڈ_فہرست" => {
                 return Ok(Value::Str(gamepad::list()));
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "game"))]
             "gamepad_any"
             | "จอยใดๆ"
             | "هر_دسته_بازی"
@@ -9987,7 +12717,7 @@ impl Interpreter {
 
             // ── game AI: neural networks ─────────────────────────────────────
             // nn_new(inputs[, seed]) → handle
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "ai"))]
             "nn_new"
             | "建神经网"
             | "ニューラル作成"
@@ -10005,7 +12735,7 @@ impl Interpreter {
                 return Ok(Value::Number(ai::nn_new(n_in, seed) as f64));
             },
             // nn_dense(handle, units[, activation]) — append a layer
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "ai"))]
             "nn_dense"
             | "密集层"
             | "密層追加"
@@ -10025,7 +12755,7 @@ impl Interpreter {
                 return Ok(Value::Unit);
             },
             // nn_forward(handle, [inputs]) → [outputs]
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "ai"))]
             "nn_forward"
             | "神经前向"
             | "順伝播"
@@ -10045,8 +12775,11 @@ impl Interpreter {
                     out.into_iter().map(|v| Value::Number(v as f64)).collect(),
                 )));
             },
+            _ => {},
+        } }
+        if __ck <= 12 { __cl.at = 12; match name {
             // nn_train(handle, [inputs], [targets][, lr]) → loss
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "ai"))]
             "nn_train"
             | "训练网"
             | "ニューラル学習"
@@ -10066,7 +12799,7 @@ impl Interpreter {
                 return Ok(Value::Number(ai::nn_train(id, &input, &target, lr) as f64));
             },
             // nn_save(handle, path) → bool
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "ai"))]
             "nn_save"
             | "保存网"
             | "網保存"
@@ -10084,7 +12817,7 @@ impl Interpreter {
                 return Ok(Value::Bool(ai::nn_save(id, &path)));
             },
             // nn_load(path) → handle (-1 on failure)
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "ai"))]
             "nn_load"
             | "载入网"
             | "網読込"
@@ -10103,7 +12836,7 @@ impl Interpreter {
 
             // ── game AI: behavior trees ──────────────────────────────────────
             // bt_build(dsl_string) → handle
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "ai"))]
             "bt_build"
             | "建行为树"
             | "行動木構築"
@@ -10120,7 +12853,7 @@ impl Interpreter {
                 return Ok(Value::Number(ai::bt_build(&spec) as f64));
             },
             // bt_set(handle, key, value) — set a blackboard fact
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "ai"))]
             "bt_set"
             | "设事实"
             | "事実設定"
@@ -10140,7 +12873,7 @@ impl Interpreter {
                 return Ok(Value::Unit);
             },
             // bt_tick(handle) → chosen action name ("" if none)
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "ai"))]
             "bt_tick"
             | "行为树滴答"
             | "行動木更新"
@@ -10157,7 +12890,7 @@ impl Interpreter {
                 return Ok(Value::Str(ai::bt_tick(id)));
             },
             // bt_status(handle) → 0 fail / 1 success / 2 running
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "ai"))]
             "bt_status"
             | "行为树状态"
             | "行動木状態"
@@ -10176,7 +12909,7 @@ impl Interpreter {
 
             // ── game AI: miniature dialog LLM ────────────────────────────────
             // dialog_new([ctx, embed, hidden, seed]) → handle
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "ai"))]
             "dialog_new"
             | "建对话模型"
             | "対話モデル作成"
@@ -10198,7 +12931,7 @@ impl Interpreter {
                 ));
             },
             // dialog_learn(handle, text) — add one utterance to the corpus
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "ai"))]
             "dialog_learn"
             | "对话学习"
             | "対話学習"
@@ -10217,7 +12950,7 @@ impl Interpreter {
                 return Ok(Value::Unit);
             },
             // dialog_load(handle, path) → lines added (-1 on error)
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "ai"))]
             "dialog_load"
             | "对话载入"
             | "対話読込"
@@ -10235,7 +12968,7 @@ impl Interpreter {
                 return Ok(Value::Number(ai::dialog_load(id, &path) as f64));
             },
             // dialog_train(handle[, epochs, lr]) → loss
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "ai"))]
             "dialog_train"
             | "对话训练"
             | "対話訓練"
@@ -10254,7 +12987,7 @@ impl Interpreter {
                 return Ok(Value::Number(ai::dialog_train(id, epochs, lr) as f64));
             },
             // dialog_say(handle, prompt[, max_tokens, temperature]) → reply text
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "ai"))]
             "dialog_say"
             | "对话生成"
             | "対話生成"
@@ -10274,7 +13007,7 @@ impl Interpreter {
                 return Ok(Value::Str(ai::dialog_say(id, &prompt, max, temp)));
             },
             // dialog_save(handle, path) → bool
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "ai"))]
             "dialog_save"
             | "对话存模"
             | "対話モデル保存"
@@ -10292,7 +13025,7 @@ impl Interpreter {
                 return Ok(Value::Bool(ai::dialog_save(id, &path)));
             },
             // dialog_load_model(path) → handle (-1 on failure)
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "ai"))]
             "dialog_load_model"
             | "对话载模"
             | "対話モデル読込"
@@ -10382,6 +13115,120 @@ impl Interpreter {
                 let job_id = self.arg_str(&args, 0, "");
                 llm::llm_job_cancel(&job_id);
                 return Ok(Value::Unit);
+            },
+
+            // ── in-process Stable Diffusion (crates/ling-diffusion, LingDiffusion) ──
+            // A worker thread owns the GPU and the loaded checkpoint; these only queue,
+            // poll and steer jobs, so http_serve keeps answering while an image renders.
+            // Requests and replies are JSON strings (the AUTOMATIC1111 API shapes) — the
+            // JSON work happens in Rust, sd_json_get reads a field back out for .ling code.
+            // sd_config(json_patch) → the whole configuration as JSON
+            #[cfg(all(not(target_arch = "wasm32"), feature = "sd"))]
+            "sd_config" => {
+                let patch = self.arg_str(&args, 0, "{}");
+                return Ok(Value::Str(ling_diffusion::set_config(&patch)));
+            },
+            // sd_submit(params_json) → job id ("ERROR: ..." for unreadable JSON)
+            #[cfg(all(not(target_arch = "wasm32"), feature = "sd"))]
+            "sd_submit" => {
+                let params = self.arg_str(&args, 0, "{}");
+                return Ok(Value::Str(ling_diffusion::submit(&params)));
+            },
+            // sd_status(job) → JSON: state, step/steps, batch/batches, progress, eta, images, seeds, infotexts, error
+            #[cfg(all(not(target_arch = "wasm32"), feature = "sd"))]
+            "sd_status" => {
+                let id = self.arg_str(&args, 0, "");
+                return Ok(Value::Str(ling_diffusion::status(&id)));
+            },
+            // sd_preview(job) → the newest live preview as base64 PNG ("" until there is one)
+            #[cfg(all(not(target_arch = "wasm32"), feature = "sd"))]
+            "sd_preview" => {
+                let id = self.arg_str(&args, 0, "");
+                return Ok(Value::Str(ling_diffusion::preview(&id)));
+            },
+            // sd_wait(job, timeout_ms) → true once finished (blocks the caller: API-compat routes only)
+            #[cfg(all(not(target_arch = "wasm32"), feature = "sd"))]
+            "sd_wait" => {
+                let id = self.arg_str(&args, 0, "");
+                let ms = self.arg_num(&args, 1, 600000.0)?.max(0.0) as u64;
+                return Ok(Value::Bool(ling_diffusion::wait(&id, ms)));
+            },
+            // sd_result(job) → {"images": [base64...], "parameters": {...}, "info": "..."} (the WebUI reply)
+            #[cfg(all(not(target_arch = "wasm32"), feature = "sd"))]
+            "sd_result" => {
+                let id = self.arg_str(&args, 0, "");
+                return Ok(Value::Str(ling_diffusion::result_a1111(&id)));
+            },
+            // sd_progress() → the WebUI's /sdapi/v1/progress JSON for the running job
+            #[cfg(all(not(target_arch = "wasm32"), feature = "sd"))]
+            "sd_progress" => {
+                return Ok(Value::Str(ling_diffusion::progress_a1111()));
+            },
+            // sd_interrupt(job) / sd_skip(job) — "" means the running job
+            #[cfg(all(not(target_arch = "wasm32"), feature = "sd"))]
+            "sd_interrupt" => {
+                let id = self.arg_str(&args, 0, "");
+                ling_diffusion::interrupt(&id);
+                return Ok(Value::Unit);
+            },
+            #[cfg(all(not(target_arch = "wasm32"), feature = "sd"))]
+            "sd_skip" => {
+                let id = self.arg_str(&args, 0, "");
+                ling_diffusion::skip(&id);
+                return Ok(Value::Unit);
+            },
+            // sd_inspect(path) → {"kind": "sd15"|"sdxl"|"lora"|"vae"|..., "label", "size_mb"} (header only)
+            #[cfg(all(not(target_arch = "wasm32"), feature = "sd"))]
+            "sd_inspect" => {
+                let path = self.arg_str(&args, 0, "");
+                return Ok(Value::Str(ling_diffusion::inspect(&path)));
+            },
+            // sd_loaded() → {"checkpoint", "arch", "device", "vae", "loras", "queue", "cuda"}
+            #[cfg(all(not(target_arch = "wasm32"), feature = "sd"))]
+            "sd_loaded" => {
+                return Ok(Value::Str(ling_diffusion::loaded()));
+            },
+            #[cfg(all(not(target_arch = "wasm32"), feature = "sd"))]
+            "sd_unload" => {
+                ling_diffusion::unload();
+                return Ok(Value::Unit);
+            },
+            #[cfg(all(not(target_arch = "wasm32"), feature = "sd"))]
+            "sd_queue" => {
+                return Ok(Value::Number(ling_diffusion::queue_len() as f64));
+            },
+            // sd_samplers() / sd_schedulers() → JSON lists in the WebUI API shape
+            #[cfg(all(not(target_arch = "wasm32"), feature = "sd"))]
+            "sd_samplers" => {
+                return Ok(Value::Str(ling_diffusion::samplers_json()));
+            },
+            // sd_upscalers() → the WebUI's /sdapi/v1/upscalers list (Lanczos, Nearest, ESRGAN files)
+            #[cfg(all(not(target_arch = "wasm32"), feature = "sd"))]
+            "sd_upscalers" => {
+                return Ok(Value::Str(ling_diffusion::upscalers_json()));
+            },
+            #[cfg(all(not(target_arch = "wasm32"), feature = "sd"))]
+            "sd_schedulers" => {
+                return Ok(Value::Str(ling_diffusion::schedulers_json()));
+            },
+            // sd_png_info(path | base64 | data: URL) → the "parameters" text a PNG carries
+            #[cfg(all(not(target_arch = "wasm32"), feature = "sd"))]
+            "sd_png_info" => {
+                let src = self.arg_str(&args, 0, "");
+                return Ok(Value::Str(ling_diffusion::png_info(&src)));
+            },
+            // sd_tokens(prompt) → {"tokens": n, "max": 75|150|...}
+            #[cfg(all(not(target_arch = "wasm32"), feature = "sd"))]
+            "sd_tokens" => {
+                let text = self.arg_str(&args, 0, "");
+                return Ok(Value::Str(ling_diffusion::count_tokens(&text)));
+            },
+            // sd_json_get(json, "a.b.0") → that field as a string ("" if absent)
+            #[cfg(all(not(target_arch = "wasm32"), feature = "sd"))]
+            "sd_json_get" => {
+                let src = self.arg_str(&args, 0, "");
+                let path = self.arg_str(&args, 1, "");
+                return Ok(Value::Str(ling_diffusion::json_get(&src, &path)));
             },
 
             // ── Google OAuth sign-in (chat.ling-lang.org) ──────────────────
@@ -10626,6 +13473,297 @@ impl Interpreter {
                     .unwrap_or_default();
                 return Ok(Value::Str(ext));
             },
+            _ => {},
+        } }
+        if __ck <= 13 { __cl.at = 13; match name {
+            // ── user scripts: plain Ling files loaded and run while the program runs ──
+            // script_load(path) -> [ok, message, stem]: parses the file and registers its functions. A script named `arp.ling` may only define
+            // functions that start with `arp_` (so scripts cannot replace the program's own functions); loading it again replaces them.
+            #[cfg(not(target_arch = "wasm32"))]
+            "script_load" => {
+                let path = self.arg_str(&args, 0, "");
+                let stem: String = std::path::Path::new(&path).file_stem().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default().chars().map(|c| if c.is_alphanumeric() { c } else { '_' }).collect();
+                let fail = |m: String, stem: &str| return_list(vec![Value::Bool(false), Value::Str(m), Value::Str(stem.to_string())]);
+                if stem.is_empty() {
+                    return Ok(fail("not a script file".into(), ""));
+                }
+                let source = match std::fs::read_to_string(&path) {
+                    Ok(t) => t,
+                    Err(e) => return Ok(fail(format!("{path}: {e}"), &stem)),
+                };
+                let program = match crate::parser::parse(&source) {
+                    Ok(p) => p,
+                    Err(e) => return Ok(fail(format!("parse error: {e}"), &stem)),
+                };
+                let prefix = format!("{stem}_");
+                let mut defs: Vec<FnDef> = vec![];
+                for item in &program.items {
+                    match item {
+                        Item::Fn(def) => {
+                            if !def.name.starts_with(&prefix) {
+                                return Ok(fail(format!("function '{}' must start with '{prefix}' (every function in {stem}.ling does)", def.name), &stem));
+                            }
+                            if self.functions.contains_key(&def.name) && !self.script_fns.contains(&def.name) {
+                                return Ok(fail(format!("'{}' is already a function of the program", def.name), &stem));
+                            }
+                            defs.push(def.clone());
+                        },
+                        _ => return Ok(fail("a script may only contain fn definitions".into(), &stem)),
+                    }
+                }
+                // a reload replaces what the script had before
+                let old: Vec<String> = self.script_fns.iter().filter(|n| n.starts_with(&prefix)).cloned().collect();
+                for n in old {
+                    self.functions.remove(&n);
+                    self.script_fns.remove(&n);
+                }
+                for def in defs {
+                    self.script_fns.insert(def.name.clone());
+                    self.functions.insert(def.name.clone(), Rc::new(def));
+                }
+                return Ok(return_list(vec![Value::Bool(true), Value::Str(String::new()), Value::Str(stem)]));
+            },
+            // script_call(name, [args]) -> [ok, value or error text]: runs a function a script defined
+            #[cfg(not(target_arch = "wasm32"))]
+            "script_call" => {
+                let fname = self.arg_str(&args, 0, "");
+                if !self.script_fns.contains(&fname) {
+                    return Ok(return_list(vec![Value::Bool(false), Value::Str(format!("no script function '{fname}'"))]));
+                }
+                let fargs: Vec<Value> = match args.get(1) {
+                    Some(Value::List(l)) => l.as_ref().clone(),
+                    _ => vec![],
+                };
+                let env: Env = FxHashMap::default();
+                return match self.call_named(&fname, fargs, &env) {
+                    Ok(v) => Ok(return_list(vec![Value::Bool(true), v])),
+                    Err(EvalErr::Runtime(m)) => Ok(return_list(vec![Value::Bool(false), Value::Str(m)])),
+                    Err(EvalErr::Return(v)) => Ok(return_list(vec![Value::Bool(true), v])),
+                    Err(EvalErr::Break) => Ok(return_list(vec![Value::Bool(false), Value::Str("break outside a loop".into())])),
+                };
+            },
+            // script_functions() -> the names of every loaded script function
+            #[cfg(not(target_arch = "wasm32"))]
+            "script_functions" => {
+                let mut v: Vec<String> = self.script_fns.iter().cloned().collect();
+                v.sort();
+                return Ok(return_list(v.into_iter().map(Value::Str).collect()));
+            },
+            // ── speech to text through faster-whisper, locally (see runtime/stt.rs) ──
+            #[cfg(all(not(target_arch = "wasm32"), feature = "ai"))]
+            "stt_available" => return Ok(Value::Bool(stt::stt_available())),
+            // stt_models() -> [name, size_mb, ...]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "ai"))]
+            "stt_models" => {
+                let mut v = Vec::new();
+                for (n, mb) in stt::stt_models() {
+                    v.push(Value::Str(n));
+                    v.push(Value::Number(mb));
+                }
+                return Ok(Value::List(Rc::new(v)));
+            },
+            // stt_start(audio_path, model, lang, words) -> job id ("" when it cannot start)
+            #[cfg(all(not(target_arch = "wasm32"), feature = "ai"))]
+            "stt_start" => {
+                let audio = self.arg_str(&args, 0, "").replace('\\', "/");
+                let model = self.arg_str(&args, 1, "small");
+                let lang = self.arg_str(&args, 2, "auto");
+                let words = !matches!(args.get(3), Some(Value::Bool(false))) && !matches!(args.get(3), Some(Value::Number(n)) if *n < 0.5);
+                return Ok(Value::Str(stt::stt_start(&audio, &model, &lang, words)));
+            },
+            #[cfg(all(not(target_arch = "wasm32"), feature = "ai"))]
+            "stt_poll" => return Ok(Value::Number(stt::stt_poll(&self.arg_str(&args, 0, "")))),
+            #[cfg(all(not(target_arch = "wasm32"), feature = "ai"))]
+            "stt_done" => return Ok(Value::Bool(stt::stt_done(&self.arg_str(&args, 0, "")))),
+            #[cfg(all(not(target_arch = "wasm32"), feature = "ai"))]
+            "stt_error" => return Ok(Value::Str(stt::stt_error(&self.arg_str(&args, 0, "")))),
+            #[cfg(all(not(target_arch = "wasm32"), feature = "ai"))]
+            "stt_info" => return Ok(Value::Str(stt::stt_info(&self.arg_str(&args, 0, "")))),
+            #[cfg(all(not(target_arch = "wasm32"), feature = "ai"))]
+            "stt_language" => return Ok(Value::Str(stt::stt_language(&self.arg_str(&args, 0, "")))),
+            // stt_segments(job) -> [start, end, text, ...]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "ai"))]
+            "stt_segments" => {
+                let mut v = Vec::new();
+                for (a, b, t) in stt::stt_segments(&self.arg_str(&args, 0, "")) {
+                    v.push(Value::Number(a));
+                    v.push(Value::Number(b));
+                    v.push(Value::Str(t));
+                }
+                return Ok(Value::List(Rc::new(v)));
+            },
+            // stt_words(job) -> [start, end, word, probability, ...]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "ai"))]
+            "stt_words" => {
+                let mut v = Vec::new();
+                for (a, b, w, p) in stt::stt_words(&self.arg_str(&args, 0, "")) {
+                    v.push(Value::Number(a));
+                    v.push(Value::Number(b));
+                    v.push(Value::Str(w));
+                    v.push(Value::Number(p));
+                }
+                return Ok(Value::List(Rc::new(v)));
+            },
+            // stt_srt(job, max_chars) -> SubRip text
+            #[cfg(all(not(target_arch = "wasm32"), feature = "ai"))]
+            "stt_srt" => {
+                let n = self.arg_num(&args, 1, 42.0)?.max(0.0) as usize;
+                return Ok(Value::Str(stt::stt_srt(&self.arg_str(&args, 0, ""), n)));
+            },
+            // stt_align(job, lyrics) -> [start, end, line, ...]: pasted lyrics timed against what was heard
+            #[cfg(all(not(target_arch = "wasm32"), feature = "ai"))]
+            "stt_align" => {
+                let mut v = Vec::new();
+                for (a, b, t) in stt::stt_align(&self.arg_str(&args, 0, ""), &self.arg_str(&args, 1, "")) {
+                    v.push(Value::Number(a));
+                    v.push(Value::Number(b));
+                    v.push(Value::Str(t));
+                }
+                return Ok(Value::List(Rc::new(v)));
+            },
+            #[cfg(all(not(target_arch = "wasm32"), feature = "ai"))]
+            "stt_align_srt" => return Ok(Value::Str(stt::stt_align_srt(&self.arg_str(&args, 0, ""), &self.arg_str(&args, 1, "")))),
+            #[cfg(all(not(target_arch = "wasm32"), feature = "ai"))]
+            "stt_cancel" => {
+                stt::stt_cancel(&self.arg_str(&args, 0, ""));
+                return Ok(Value::Bool(true));
+            },
+            // file_write_bytes(path, [0..255, ...], append?) -> bool: raw bytes (the other file builtins are text only)
+            #[cfg(not(target_arch = "wasm32"))]
+            "file_write_bytes" => {
+                use std::io::Write;
+                let path = self.arg_str(&args, 0, "").replace('\\', "/");
+                let bytes: Vec<u8> = match args.get(1) {
+                    Some(Value::List(v)) => v
+                        .iter()
+                        .map(|x| match x {
+                            Value::Number(n) if n.is_finite() => n.clamp(0.0, 255.0) as u8,
+                            _ => 0,
+                        })
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                let append = matches!(args.get(2), Some(Value::Bool(true))) || matches!(args.get(2), Some(Value::Number(n)) if *n > 0.5);
+                if let Some(parent) = std::path::Path::new(&path).parent() {
+                    if !parent.as_os_str().is_empty() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                }
+                let f = if append { std::fs::OpenOptions::new().create(true).append(true).open(&path) } else { std::fs::File::create(&path) };
+                let ok = f.and_then(|mut f| f.write_all(&bytes)).is_ok();
+                return Ok(Value::Bool(ok));
+            },
+            // lmesh_bin_read(path) -> [] when the file is not a binary 'LMSH' mesh, else [height, vx, vy, vz, tri_indices, tri_rgb]:
+            // the engine's triangle-soup format ('LMSH', u32 ver, f32 height, u32 ntri, ntri x (9 f32 + 3 u8)) with equal positions welded
+            #[cfg(not(target_arch = "wasm32"))]
+            "lmesh_bin_read" => {
+                let path = self.arg_str(&args, 0, "").replace('\\', "/");
+                let b = std::fs::read(&path).unwrap_or_default();
+                if b.len() < 16 || &b[0..4] != b"LMSH" {
+                    return Ok(Value::List(Vec::new().into()));
+                }
+                let rd = |o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+                let ntri = (rd(12) as usize).min((b.len() - 16) / 39);
+                let height = f32::from_bits(rd(8));
+                let mut map: std::collections::HashMap<[u32; 3], usize> = std::collections::HashMap::new();
+                let (mut vx, mut vy, mut vz) = (Vec::new(), Vec::new(), Vec::new());
+                let (mut idx, mut rgb) = (Vec::with_capacity(ntri * 3), Vec::with_capacity(ntri));
+                for t in 0..ntri {
+                    let o = 16 + t * 39;
+                    for c in 0..3 {
+                        let k = [rd(o + c * 12), rd(o + c * 12 + 4), rd(o + c * 12 + 8)];
+                        let n = map.len();
+                        let i = *map.entry(k).or_insert_with(|| {
+                            vx.push(Value::Number(f32::from_bits(k[0]) as f64));
+                            vy.push(Value::Number(f32::from_bits(k[1]) as f64));
+                            vz.push(Value::Number(f32::from_bits(k[2]) as f64));
+                            n
+                        });
+                        idx.push(Value::Number(i as f64));
+                    }
+                    rgb.push(Value::Number(b[o + 36] as f64 * 65536.0 + b[o + 37] as f64 * 256.0 + b[o + 38] as f64));
+                }
+                let l = |v: Vec<Value>| Value::List(v.into());
+                return Ok(l(vec![Value::Number(height as f64), l(vx), l(vy), l(vz), l(idx), l(rgb)]));
+            },
+            // glb_read(path) -> [] on failure (see glb_error), else a list of objects
+            // [name, vx, vy, vz, tri_indices, face_starts, face_counts, face_rgb, uv] read from a .glb / .gltf (positions in world space,
+            // one colour per triangle sampled from the base-colour texture, vertex colours or the colour factor)
+            #[cfg(not(target_arch = "wasm32"))]
+            "glb_read" => {
+                let path = self.arg_str(&args, 0, "").replace('\\', "/");
+                let l = |v: Vec<Value>| Value::List(v.into());
+                match glb::read(&path) {
+                    Ok(objs) => {
+                        let mut res = Vec::with_capacity(objs.len());
+                        for o in objs {
+                            let nf = o.fcol.len();
+                            res.push(l(vec![
+                                Value::Str(o.name),
+                                l(o.vx.iter().map(|&x| Value::Number(x as f64)).collect()),
+                                l(o.vy.iter().map(|&x| Value::Number(x as f64)).collect()),
+                                l(o.vz.iter().map(|&x| Value::Number(x as f64)).collect()),
+                                l(o.fi.iter().map(|&x| Value::Number(x as f64)).collect()),
+                                l((0..nf).map(|i| Value::Number((i * 3) as f64)).collect()),
+                                l((0..nf).map(|_| Value::Number(3.0)).collect()),
+                                l(o.fcol.iter().map(|&x| Value::Number(x as f64)).collect()),
+                                l(o.uv.iter().map(|&x| Value::Number(x as f64)).collect()),
+                            ]));
+                        }
+                        return Ok(l(res));
+                    },
+                    Err(e) => {
+                        glb::set_error(e);
+                        return Ok(l(Vec::new()));
+                    },
+                }
+            },
+            #[cfg(not(target_arch = "wasm32"))]
+            "glb_error" => return Ok(Value::Str(glb::last_error())),
+            // code_normalize(source, lang) -> source with Ling keywords and
+            // method spellings rewritten into `lang` — the same engine as
+            // `lingfu normalize`, exposed for chat.ling-lang.org's per-snippet
+            // language dropdown. `lang` accepts codes or names (en, zh, ja,
+            // ko, th, fa, ar, he, ur, fr, de, ru / "english", "中文", ...).
+            #[cfg(all(not(target_arch = "wasm32"), feature = "web"))]
+            "code_normalize" => {
+                let source = self.arg_str(&args, 0, "");
+                let lang = self.arg_str(&args, 1, "en");
+                let target = lingfu::normalize::Lang::from_name(&lang)
+                    .ok_or_else(|| EvalErr::from(format!("code_normalize: unknown language '{lang}'")))?;
+                return Ok(Value::Str(lingfu::normalize::normalize_content(&source, target)));
+            },
+            // gpu_active() -> bool: a CUDA device is driving ling-gpu (always false on aarch64 / Raspberry Pi builds, no
+            // `cuda` feature, or LING_NO_GPU=1). gpu_name() -> device description.
+            #[cfg(all(not(target_arch = "wasm32"), feature = "game"))]
+            "gpu_active" => return Ok(Value::Bool(ling_gpu::gpu_active())),
+            #[cfg(all(not(target_arch = "wasm32"), feature = "game"))]
+            "gpu_name" => return Ok(Value::Str(ling_gpu::device_name().to_string())),
+            // gpu_raster_begin() starts a frame batch; mesh3d_fill(.., gpu = 1) adds shaded faces to it
+            #[cfg(all(not(target_arch = "wasm32"), feature = "game"))]
+            "gpu_raster_begin" => {
+                gpuview::begin();
+                return Ok(Value::Bool(true));
+            },
+            // gpu_raster_end(x, y, w, h) -> triangles drawn: one z-buffered pass over the batch, composited into the
+            // framebuffer inside the rectangle and the current px_clip
+            #[cfg(all(not(target_arch = "wasm32"), feature = "game"))]
+            "gpu_raster_end" => {
+                let (x, y, w, h) = (self.arg_num(&args, 0, 0.)? as i32, self.arg_num(&args, 1, 0.)? as i32, self.arg_num(&args, 2, 0.)? as i32, self.arg_num(&args, 3, 0.)? as i32);
+                let clip = self.px_clip;
+                let mut gfx = self.gfx.borrow_mut();
+                let (bw, bh) = (gfx.width, gfx.height);
+                let n = gpuview::end(x, y, w, h, clip, &mut gfx.buffer, bw, bh);
+                return Ok(Value::Number(n as f64));
+            },
+            // file_append_file(dst, src) -> bytes copied, -1 when either file cannot be used: streams src onto the end of dst
+            #[cfg(not(target_arch = "wasm32"))]
+            "file_append_file" => {
+                let dst = self.arg_str(&args, 0, "").replace('\\', "/");
+                let src = self.arg_str(&args, 1, "").replace('\\', "/");
+                let n = std::fs::File::open(&src).and_then(|mut i| std::fs::OpenOptions::new().create(true).append(true).open(&dst).and_then(|mut o| std::io::copy(&mut i, &mut o)));
+                return Ok(Value::Number(n.map(|n| n as f64).unwrap_or(-1.0)));
+            },
             #[cfg(not(target_arch = "wasm32"))]
             "file_size" | "ขนาดไฟล์" | "اندازه_فایل" | "حجم_الملف" | "גודל_קובץ" | "فائل_سائز" =>
             {
@@ -10849,7 +13987,7 @@ impl Interpreter {
             // `docker run` for sandboxed package builds — never exposed to uploaded content.
             // stdout+stderr both append to log_path (two independent opens of the same
             // file — an approximation of 2>&1, fine for a build log, not byte-interleaved).
-            #[cfg(all(not(target_arch = "wasm32"), feature = "web"))]
+            #[cfg(all(not(target_arch = "wasm32"), any(feature = "web", feature = "proc")))]
             "run_process" | "รันโปรเซส" => {
                 let cmd = self.arg_str(&args, 0, "");
                 let argv = self.arg_list_str(&args, 1);
@@ -10898,6 +14036,68 @@ impl Interpreter {
                         },
                         Err(_) => return Ok(Value::Number(-1.0)),
                     }
+                }
+            },
+            // proc_start(cmd, args_list, log_path) -> id (-1 = spawn failure). The non-blocking
+            // run_process: no shell, stdout+stderr append to log_path; proc_poll(id) -> -2 while
+            // running, else the exit code (-1 unknown id); proc_kill(id) stops it.
+            #[cfg(all(not(target_arch = "wasm32"), any(feature = "web", feature = "proc")))]
+            "proc_start" => {
+                let cmd = self.arg_str(&args, 0, "");
+                let argv = self.arg_list_str(&args, 1);
+                let log_path = self.arg_str(&args, 2, "");
+                let make_stdio = || -> std::process::Stdio {
+                    if log_path.is_empty() {
+                        std::process::Stdio::null()
+                    } else {
+                        std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(&log_path)
+                            .map(std::process::Stdio::from)
+                            .unwrap_or_else(|_| std::process::Stdio::null())
+                    }
+                };
+                let mut c = std::process::Command::new(&cmd);
+                c.args(&argv).stdin(std::process::Stdio::null()).stdout(make_stdio()).stderr(make_stdio());
+                #[cfg(windows)]
+                {
+                    use std::os::windows::process::CommandExt;
+                    c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+                }
+                match c.spawn() {
+                    Ok(child) => {
+                        let mut reg = procs().lock().unwrap();
+                        reg.0 += 1;
+                        let id = reg.0;
+                        reg.1.insert(id, (child, None));
+                        return Ok(Value::Number(id as f64));
+                    },
+                    Err(_) => return Ok(Value::Number(-1.0)),
+                }
+            },
+            #[cfg(all(not(target_arch = "wasm32"), any(feature = "web", feature = "proc")))]
+            "proc_poll" | "proc_kill" => {
+                let id = self.arg_num(&args, 0, 0.0)? as u32;
+                let mut reg = procs().lock().unwrap();
+                let Some(entry) = reg.1.get_mut(&id) else { return Ok(Value::Number(-1.0)) };
+                if name == "proc_kill" {
+                    let _ = entry.0.kill();
+                    let _ = entry.0.wait();
+                    reg.1.remove(&id);
+                    return Ok(Value::Number(0.0));
+                }
+                if let Some(code) = entry.1 {
+                    return Ok(Value::Number(code));
+                }
+                match entry.0.try_wait() {
+                    Ok(Some(st)) => {
+                        let code = st.code().unwrap_or(-1) as f64;
+                        entry.1 = Some(code);
+                        return Ok(Value::Number(code));
+                    },
+                    Ok(None) => return Ok(Value::Number(-2.0)),
+                    Err(_) => return Ok(Value::Number(-1.0)),
                 }
             },
             // tar_gz_extract_to(tar_path, entry_name, out_path) -> bool. Byte-perfect
@@ -11008,6 +14208,9 @@ impl Interpreter {
                 .is_ok();
                 return Ok(Value::Bool(ok));
             },
+            _ => {},
+        } }
+        if __ck <= 14 { __cl.at = 14; match name {
             // icon_convert_to_png(src_path, out_path, size) -> bool. Rasterizes any
             // ling-icon-supported source (.svg/.png/.jpg/.bmp/.ico) to a single
             // size×size PNG — used to turn a package manifest's icon into a web avatar.
@@ -11073,7 +14276,7 @@ impl Interpreter {
                 return Ok(Value::Str(totp_code(&secret, step).unwrap_or_default()));
             },
             // BLAKE3 hex of a file's bytes (binary-safe content fingerprint).
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "crypto"))]
             "file_hash" | "แฮชไฟล์" | "درهم_فایل" | "بصمة_الملف" | "גיבוב_קובץ" | "فائل_ہیش" =>
             {
                 let path = self.arg_str(&args, 0, "");
@@ -11085,6 +14288,7 @@ impl Interpreter {
                 }
             },
             // BLAKE3 hex of an arbitrary string (deterministic id/colour/role seed).
+            #[cfg(feature = "crypto")]
             "hash_hex"
             | "แฮชสตริง"
             | "درهم_هگزادسیمال"
@@ -11110,241 +14314,6 @@ impl Interpreter {
             },
 
             // ── String utilities ──────────────────────────────────────────────
-            // Parses a string to a number (0 on failure — degrades gracefully,
-            // like the other filesystem/parsing builtins in this file).
-            "to_number" | "转数字" => {
-                let s = self.arg_str(&args, 0, "");
-                return Ok(Value::Number(s.trim().parse().unwrap_or(0.0)));
-            },
-            // Plain SHA-256 hex — matches the browser's native SubtleCrypto
-            // digest("SHA-256", ...), which is what proof-of-work mining uses
-            // client-side (Web Crypto has no Blake3/SHA-3, so this is the one
-            // hash both sides can compute natively and fast).
-            "sha256_hex" | "SHA256哈希" => {
-                use sha2::Digest;
-                let s = self.arg_str(&args, 0, "");
-                let mut h = sha2::Sha256::new();
-                h.update(s.as_bytes());
-                return Ok(Value::Str(hex_encode(&h.finalize())));
-            },
-            // Parses a hex string (no "0x" prefix) to a number — `to_number`
-            // uses Rust's plain f64 parser, which doesn't understand hex.
-            "hex_to_number" | "十六进制转数字" => {
-                let s = self.arg_str(&args, 0, "");
-                let v = u64::from_str_radix(s.trim(), 16).unwrap_or(0);
-                return Ok(Value::Number(v as f64));
-            },
-            "split" | "str_split" | "แยก" | "جداسازی" | "قسّم" | "פצל" | "تقسیم_کرو" =>
-            {
-                let s = self.arg_str(&args, 0, "");
-                let sep = self.arg_str(&args, 1, "\n");
-                let sep = if sep.is_empty() { "\n".into() } else { sep };
-                let parts: Vec<Value> = s
-                    .split(sep.as_str())
-                    .map(|p| Value::Str(p.to_string()))
-                    .collect();
-                return Ok(Value::List(Rc::new(parts)));
-            },
-            "trim"
-            | "str_trim"
-            | "ตัดช่องว่าง"
-            | "حذف_فاصله"
-            | "اقتطع_الفراغات"
-            | "חתוך_רווחים"
-            | "خالی_جگہ_کاٹو" => {
-                let s = self.arg_str(&args, 0, "");
-                return Ok(Value::Str(s.trim().to_string()));
-            },
-            "starts_with"
-            | "str_starts_with"
-            | "เริ่มด้วย"
-            | "شروع_می‌شود_با"
-            | "يبدأ_بـ"
-            | "מתחיל_ב"
-            | "شروع_ہوتا_ہے" => {
-                let s = self.arg_str(&args, 0, "");
-                let prefix = self.arg_str(&args, 1, "");
-                return Ok(Value::Bool(s.starts_with(prefix.as_str())));
-            },
-            "ends_with"
-            | "str_ends_with"
-            | "ลงท้ายด้วย"
-            | "پایان_می‌یابد_با"
-            | "ينتهي_بـ"
-            | "מסתיים_ב"
-            | "ختم_ہوتا_ہے" => {
-                let s = self.arg_str(&args, 0, "");
-                let suffix = self.arg_str(&args, 1, "");
-                return Ok(Value::Bool(s.ends_with(suffix.as_str())));
-            },
-            "str_replace"
-            | "แทนสตริง"
-            | "جایگزینی_رشته"
-            | "استبدل_النص"
-            | "החלף_מחרוזת"
-            | "اسٹرنگ_تبدیل" => {
-                let s = self.arg_str(&args, 0, "");
-                let from = self.arg_str(&args, 1, "");
-                let to = self.arg_str(&args, 2, "");
-                return Ok(Value::Str(s.replace(from.as_str(), to.as_str())));
-            },
-            "str_find"
-            | "หาในสตริง"
-            | "جستجوی_رشته"
-            | "ابحث_في_النص"
-            | "חפש_מחרוזת"
-            | "اسٹرنگ_تلاش" => {
-                let s = self.arg_str(&args, 0, "");
-                let needle = self.arg_str(&args, 1, "");
-                // Return char index (not byte index) for consistency with substr
-                let pos = s
-                    .find(needle.as_str())
-                    .map(|byte_i| s[..byte_i].chars().count() as f64)
-                    .unwrap_or(-1.0);
-                return Ok(Value::Number(pos));
-            },
-            "substr"
-            | "str_slice"
-            | "ส่วนสตริง"
-            | "زیررشته"
-            | "جزء_النص"
-            | "תת_מחרוזת"
-            | "ذیلی_اسٹرنگ" => {
-                let s = self.arg_str(&args, 0, "");
-                let start = self.arg_num(&args, 1, 0.0)? as usize;
-                let len = args
-                    .get(2)
-                    .map(|v| self.to_number(v).unwrap_or(999999.0) as usize)
-                    .unwrap_or_else(|| s.chars().count().saturating_sub(start));
-                let chars: Vec<char> = s.chars().collect();
-                let end = (start + len).min(chars.len());
-                let slice: String = chars.get(start..end).unwrap_or(&[]).iter().collect();
-                return Ok(Value::Str(slice));
-            },
-            "to_str"
-            | "str"
-            | "num_str"
-            | "แปลงสตริง"
-            | "تبدیل_به_رشته"
-            | "حوّل_لنص"
-            | "המר_למחרוזת"
-            | "اسٹرنگ_میں_بدلو" => {
-                let v = args.into_iter().next().unwrap_or(Value::Unit);
-                return Ok(Value::Str(v.to_string()));
-            },
-            "str_repeat"
-            | "ทำซ้ำสตริง"
-            | "تکرار_رشته"
-            | "كرّر_النص"
-            | "חזור_על_מחרוזת"
-            | "اسٹرنگ_دہراؤ" => {
-                let s = self.arg_str(&args, 0, "");
-                let n = self.arg_num(&args, 1, 1.0)? as usize;
-                return Ok(Value::Str(s.repeat(n)));
-            },
-            "str_upper" => {
-                let s = self.arg_str(&args, 0, "");
-                return Ok(Value::Str(s.to_uppercase()));
-            },
-            "str_lower" => {
-                let s = self.arg_str(&args, 0, "");
-                return Ok(Value::Str(s.to_lowercase()));
-            },
-            "str_len"
-            | "len"
-            | "ความยาว"
-            | "长度"
-            | "長さ"
-            | "길이"
-            | "طول_رشته"
-            | "طول_النص"
-            | "אורך_מחרוזת"
-            | "اسٹرنگ_لمبائی" => match args.first() {
-                Some(Value::Str(s)) => return Ok(Value::Number(s.chars().count() as f64)),
-                Some(Value::List(v)) => return Ok(Value::Number(v.len() as f64)),
-                _ => return Ok(Value::Number(0.0)),
-            },
-
-            // ── FNV-1a hash (deterministic, normalized 0.0–1.0) ──────────────
-            "hash_str" | "แฮช" | "درهم_رشته" | "بصمة_نص" | "גיבוב_מחרוזת" | "اسٹرنگ_ہیش" =>
-            {
-                let s = self.arg_str(&args, 0, "");
-                let mut h: u64 = 14695981039346656037_u64;
-                for b in s.bytes() {
-                    h ^= b as u64;
-                    h = h.wrapping_mul(1099511628211);
-                }
-                return Ok(Value::Number((h & 0xFFFFFF) as f64 / 16777215.0));
-            },
-            "hash_int" | "แฮชจำนวน" | "درهم_عدد" | "بصمة_عدد" | "גיבוב_מספר" | "نمبر_ہیش" =>
-            {
-                let s = self.arg_str(&args, 0, "");
-                let n = self.arg_num(&args, 1, 100.0)? as u64;
-                let mut h: u64 = 14695981039346656037_u64;
-                for b in s.bytes() {
-                    h ^= b as u64;
-                    h = h.wrapping_mul(1099511628211);
-                }
-                return Ok(Value::Number((h % n.max(1)) as f64));
-            },
-
-            // ── List utilities ────────────────────────────────────────────────
-            "list_new"
-            | "รายการใหม่"
-            | "新建列表"
-            | "新規リスト"
-            | "새목록"
-            | "فهرست_جدید"
-            | "قائمة_جديدة"
-            | "רשימה_חדשה"
-            | "نئی_فہرست"
-            | "nouvelle_liste"
-            | "neue_liste"
-            | "новый_список" => {
-                return Ok(Value::List(Rc::new(Vec::new())));
-            },
-            "list_push"
-            | "เพิ่มรายการ"
-            | "列表添加"
-            | "リスト追加"
-            | "목록추가"
-            | "افزودن_به_فهرست"
-            | "أضف_للقائمة"
-            | "הוסף_לרשימה"
-            | "فہرست_میں_شامل_کرو"
-            | "ajouter_liste"
-            | "liste_anhängen"
-            | "добавить_в_список" => {
-                let lst = args
-                    .first()
-                    .cloned()
-                    .unwrap_or(Value::List(Rc::new(vec![])));
-                let val = args.get(1).cloned().unwrap_or(Value::Unit);
-                if let Value::List(mut v) = lst {
-                    Rc::make_mut(&mut v).push(val);
-                    return Ok(Value::List(v));
-                }
-                return Ok(Value::List(Rc::new(vec![val])));
-            },
-            "list_get"
-            | "รับรายการ"
-            | "取元素"
-            | "要素取得"
-            | "요소가져오기"
-            | "دریافت_از_فهرست"
-            | "اجلب_من_القائمة"
-            | "קבל_מרשימה"
-            | "فہرست_سے_حاصل_کرو"
-            | "obtenir_liste"
-            | "liste_abrufen"
-            | "получить_из_списка" => {
-                // Borrow the list; clone only the element (was cloning the whole list).
-                let i = self.arg_num(&args, 1, 0.0)? as usize;
-                if let Some(Value::List(v)) = args.first() {
-                    return Ok(v.get(i).cloned().unwrap_or(Value::Str(String::new())));
-                }
-                return Ok(Value::Str(String::new()));
-            },
             // list_max(numbers, default) / list_min(numbers, default) — `default`
             // is returned for an empty list (there's no numeric identity element
             // to fall back to otherwise).
@@ -11683,7 +14652,7 @@ impl Interpreter {
             // ══════════════════════════════════════════════════════════════════
 
             // fft_push(samples_list) — feed raw audio samples and run FFT
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
             "fft_push"
             | "วิเคราะห์เสียง"
             | "频谱输入"
@@ -11713,7 +14682,7 @@ impl Interpreter {
             },
 
             // fft_bands(n) → list of n log-spaced magnitude bands (0..1)
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
             "fft_bands"
             | "แถบความถี่"
             | "频段"
@@ -11735,7 +14704,7 @@ impl Interpreter {
             },
 
             // fft_beat() → bool
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
             "fft_beat"
             | "จังหวะเสียง"
             | "节拍检测"
@@ -11752,7 +14721,7 @@ impl Interpreter {
             },
 
             // fft_beat_ratio() → f64  (1.0 = at threshold, >1 = strong beat)
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
             "fft_beat_ratio"
             | "อัตราจังหวะ"
             | "节拍比"
@@ -11766,7 +14735,7 @@ impl Interpreter {
             },
 
             // fft_rms() → f64
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
             "fft_rms"
             | "ระดับRMS"
             | "均方根"
@@ -11780,7 +14749,7 @@ impl Interpreter {
             },
 
             // fft_dominant_freq() → f64  in Hz
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
             "fft_dominant_freq"
             | "ความถี่หลัก"
             | "主频"
@@ -11924,6 +14893,9 @@ impl Interpreter {
                 }
                 return Ok(Value::Unit);
             },
+            _ => {},
+        } }
+        if __ck <= 15 { __cl.at = 15; match name {
 
             // tex_gradient(x, y, w, h, angle_deg, r1,g1,b1, r2,g2,b2)
             "tex_gradient"
@@ -12321,7 +15293,7 @@ impl Interpreter {
             // CRYPTOGRAPHY (ling-crypto) — geo suite, hybrid PQ KEM, holographic
             // Bytes cross the language boundary as lowercase hex strings.
             // ══════════════════════════════════════════════════════════════════
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "crypto"))]
             "crypto_hash"
             | "แฮชเข้ารหัส"
             | "几何哈希"
@@ -12358,7 +15330,7 @@ impl Interpreter {
                 ))));
             },
             // 3-D torus-knot fingerprint of any text/key → flat [x,y,z, x,y,z, …]
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "crypto"))]
             "knot_points"
             | "จุดปม"
             | "结点坐标"
@@ -12404,7 +15376,7 @@ impl Interpreter {
                 }
                 return Ok(Value::List(out.into()));
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "crypto"))]
             "knot_label"
             | "ป้ายปม"
             | "结点标签"
@@ -12441,7 +15413,7 @@ impl Interpreter {
                 ));
             },
             // KEM keypair (hybrid X25519+ML-KEM-768) → integer handle
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "crypto"))]
             "knot_keygen"
             | "hybrid_keygen"
             | "สร้างกุญแจปม"
@@ -12458,7 +15430,7 @@ impl Interpreter {
                 self.crypto_ids.push(ling_crypto::KnotIdentity::generate());
                 return Ok(Value::Number((self.crypto_ids.len() - 1) as f64));
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "crypto"))]
             "knot_public"
             | "hybrid_public"
             | "กุญแจสาธารณะปม"
@@ -12481,7 +15453,7 @@ impl Interpreter {
                 return Ok(Value::Str(pk));
             },
             // encapsulate(pubkey_hex) → [ciphertext_hex, shared_secret_hex]
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "crypto"))]
             "knot_encapsulate"
             | "hybrid_encapsulate"
             | "ห่อกุญแจปม"
@@ -12507,7 +15479,7 @@ impl Interpreter {
                 }
             },
             // decapsulate(handle, ciphertext_hex) → shared_secret_hex
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "crypto"))]
             "knot_decapsulate"
             | "hybrid_decapsulate"
             | "แกะกุญแจปม"
@@ -12532,7 +15504,7 @@ impl Interpreter {
                 return Ok(Value::Str(ss));
             },
             // Authenticated encryption (XChaCha20-Poly1305) — seal(key_hex, text) → ct_hex
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "crypto"))]
             "crypto_seal"
             | "ผนึก"
             | "封印"
@@ -12552,7 +15524,7 @@ impl Interpreter {
                     Err(e) => return Ok(Value::Err(Box::new(Value::Str(e.to_string())))),
                 }
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "crypto"))]
             "crypto_open"
             | "เปิดผนึก"
             | "解封"
@@ -12573,7 +15545,7 @@ impl Interpreter {
                 }
             },
             // Holographic all-or-nothing transform — 4-D fragment coords [a,b,c,d, …]
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "crypto"))]
             "holo_points"
             | "จุดโฮโลแกรม"
             | "全息点"
@@ -12596,7 +15568,7 @@ impl Interpreter {
                 }
                 return Ok(Value::List(Rc::new(out)));
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "crypto"))]
             "holo_fragment_count"
             | "จำนวนชิ้นโฮโลแกรม"
             | "全息碎片数"
@@ -12616,7 +15588,7 @@ impl Interpreter {
             },
             // SHAKE-256 XOF, squeezed to an arbitrary output length in bytes
             // (`shake_hex(s, 128)` = a 1024-bit seal digest).
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "crypto"))]
             "shake_hex" | "SHAKE哈希" => {
                 let s = self.arg_str(&args, 0, "");
                 let len = self.arg_num(&args, 1, 32.0)?.max(0.0) as usize;
@@ -12625,8 +15597,11 @@ impl Interpreter {
                     len,
                 ))));
             },
+            _ => {},
+        } }
+        if __ck <= 16 { __cl.at = 16; match name {
             // Ed25519 signing keypair (issuer identity) → integer handle.
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "crypto"))]
             "ed25519_keygen"
             | "생성서명키"
             | "สร้างกุญแจลายเซ็น"
@@ -12647,7 +15622,7 @@ impl Interpreter {
             // always yields the same keypair, so a program can persist just the
             // seed (e.g. a bank's issuer identity) and rederive identical keys
             // across restarts instead of every run minting a fresh, unrelated one.
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "crypto"))]
             "ed25519_keygen_from_seed"
             | "씨앗에서생성서명키"
             | "สร้างกุญแจลายเซ็นจากเมล็ด"
@@ -12665,7 +15640,7 @@ impl Interpreter {
                     .push(ling_crypto::Ed25519Keypair::from_seed(seed));
                 return Ok(Value::Number((self.ed25519_ids.len() - 1) as f64));
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "crypto"))]
             "ed25519_public"
             | "서명공개키"
             | "กุญแจสาธารณะลายเซ็น"
@@ -12687,7 +15662,7 @@ impl Interpreter {
                 return Ok(Value::Str(pk));
             },
             // ed25519_sign(handle, message) → signature hex (64 bytes)
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "crypto"))]
             "ed25519_sign"
             | "서명하다"
             | "เซ็นชื่อ"
@@ -12710,7 +15685,7 @@ impl Interpreter {
                 return Ok(Value::Str(sig));
             },
             // ed25519_verify(pubkey_hex, message, signature_hex) → bool
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "crypto"))]
             "ed25519_verify"
             | "서명확인"
             | "ยืนยันลายเซ็น"
@@ -12742,7 +15717,7 @@ impl Interpreter {
             // not as a replacement for Ed25519 on its own. Aliases below mirror
             // the ed25519_* ones with each language's word for "quantum" folded
             // in, the same way knot_keygen/hybrid_keygen distinguish themselves.
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "crypto"))]
             "mldsa_keygen"
             | "양자서명키생성"
             | "สร้างกุญแจลายเซ็นควอนตัม"
@@ -12760,7 +15735,7 @@ impl Interpreter {
             },
             // Deterministic keypair from a 32-byte hex seed — same rederive-
             // from-seed contract as ed25519_keygen_from_seed.
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "crypto"))]
             "mldsa_keygen_from_seed"
             | "씨앗에서양자서명키생성"
             | "สร้างกุญแจลายเซ็นควอนตัมจากเมล็ด"
@@ -12779,7 +15754,7 @@ impl Interpreter {
                     .push(ling_crypto::MlDsa65Keypair::from_seed(seed));
                 return Ok(Value::Number((self.mldsa_ids.len() - 1) as f64));
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "crypto"))]
             "mldsa_public"
             | "양자서명공개키"
             | "กุญแจสาธารณะลายเซ็นควอนตัม"
@@ -12801,7 +15776,7 @@ impl Interpreter {
                 return Ok(Value::Str(pk));
             },
             // mldsa_sign(handle, message) → signature hex (~3309 bytes)
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "crypto"))]
             "mldsa_sign"
             | "양자서명하다"
             | "เซ็นชื่อควอนตัม"
@@ -12824,7 +15799,7 @@ impl Interpreter {
                 return Ok(Value::Str(sig));
             },
             // mldsa_verify(pubkey_hex, message, signature_hex) → bool
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "crypto"))]
             "mldsa_verify"
             | "양자서명확인"
             | "ยืนยันลายเซ็นควอนตัม"
@@ -12846,9 +15821,46 @@ impl Interpreter {
                     .is_ok();
                 return Ok(Value::Bool(ok));
             },
+            // ML-DSA-87 (FIPS 204, NIST category 5): the same four calls as mldsa_* (which are ML-DSA-65), for signatures that
+            // must hold the longest - license files, release manifests. Compose with ed25519_* for a hybrid (both must verify).
+            // mldsa87_keygen_from_seed(seed hex 32 bytes) -> handle; mldsa87_keygen() -> handle (random)
+            #[cfg(all(not(target_arch = "wasm32"), feature = "crypto"))]
+            "mldsa87_keygen_from_seed" => {
+                let seed = hex_to_32(&self.arg_str(&args, 0, ""));
+                self.mldsa87_ids.push(ling_crypto::MlDsa87Keypair::from_seed(seed));
+                return Ok(Value::Number((self.mldsa87_ids.len() - 1) as f64));
+            },
+            #[cfg(all(not(target_arch = "wasm32"), feature = "crypto"))]
+            "mldsa87_keygen" => {
+                self.mldsa87_ids.push(ling_crypto::MlDsa87Keypair::generate());
+                return Ok(Value::Number((self.mldsa87_ids.len() - 1) as f64));
+            },
+            // mldsa87_public(handle) -> verifying key hex (2592 bytes)
+            #[cfg(all(not(target_arch = "wasm32"), feature = "crypto"))]
+            "mldsa87_public" => {
+                let h = self.arg_num(&args, 0, 0.0)? as usize;
+                let pk = self.mldsa87_ids.get(h).map(|kp| hex_encode(&kp.public_key())).unwrap_or_default();
+                return Ok(Value::Str(pk));
+            },
+            // mldsa87_sign(handle, message) -> signature hex (4627 bytes)
+            #[cfg(all(not(target_arch = "wasm32"), feature = "crypto"))]
+            "mldsa87_sign" => {
+                let h = self.arg_num(&args, 0, 0.0)? as usize;
+                let msg = self.arg_str(&args, 1, "");
+                let sig = self.mldsa87_ids.get(h).map(|kp| hex_encode(&kp.sign(msg.as_bytes()))).unwrap_or_default();
+                return Ok(Value::Str(sig));
+            },
+            // mldsa87_verify(pubkey hex, message, signature hex) -> bool
+            #[cfg(all(not(target_arch = "wasm32"), feature = "crypto"))]
+            "mldsa87_verify" => {
+                let pk = hex_decode(&self.arg_str(&args, 0, ""));
+                let msg = self.arg_str(&args, 1, "");
+                let sig = hex_decode(&self.arg_str(&args, 2, ""));
+                return Ok(Value::Bool(ling_crypto::MlDsa87Keypair::verify(&pk, msg.as_bytes(), &sig).is_ok()));
+            },
             // Argon2id password hashing — password_hash(pw) → PHC string,
             // password_verify(pw, phc_string) → bool.
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "crypto"))]
             "password_hash" | "비밀번호해시" => {
                 let pw = self.arg_str(&args, 0, "");
                 let hash = ling_crypto::Argon2idParams::default()
@@ -12856,7 +15868,7 @@ impl Interpreter {
                     .unwrap_or_default();
                 return Ok(Value::Str(hash));
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "crypto"))]
             "password_verify" | "비밀번호확인" => {
                 let pw = self.arg_str(&args, 0, "");
                 let hash = self.arg_str(&args, 1, "");
@@ -12974,11 +15986,14 @@ impl Interpreter {
                 return Ok(Value::Bool(ok));
             },
             // pdf_from_images(png_paths_list, out_path) — one page per image,
-            // sized to its pixel dimensions. No PDF crate dependency: `image`
-            // (decode) and `flate2` (deflate the page's raw RGB stream) are
-            // already unconditional deps, so this hand-writes the handful of
-            // PDF objects (Catalog/Pages/Page/Contents/Image XObject) directly.
-            // `build_pdf_from_images` itself only exists under this same gate.
+            // sized to its pixel dimensions (i.e. an implied 72 DPI — see
+            // pdf_from_images_sized below for a real physical page size
+            // independent of the source resolution). No PDF crate
+            // dependency: `image` (decode) and `flate2` (deflate the page's
+            // raw RGB stream) are already unconditional deps, so this
+            // hand-writes the handful of PDF objects (Catalog/Pages/Page/
+            // Contents/Image XObject) directly. `build_pdf_from_images`
+            // itself only exists under this same gate.
             #[cfg(all(not(target_arch = "wasm32"), feature = "web"))]
             "pdf_from_images" | "PDF来自图片" => {
                 let paths = match args.first() {
@@ -12986,13 +16001,34 @@ impl Interpreter {
                     _ => Vec::new(),
                 };
                 let out_path = self.arg_str(&args, 1, "out.pdf");
-                let ok = build_pdf_from_images(&paths, &out_path).is_ok();
+                let ok = build_pdf_from_images(&paths, &out_path, None).is_ok();
+                return Ok(Value::Bool(ok));
+            },
+            // pdf_from_images_sized(png_paths_list, out_path, page_w_pt, page_h_pt)
+            // — same page-per-image bundling as pdf_from_images, but every
+            // page's MediaBox is fixed to (page_w_pt, page_h_pt) PDF points
+            // (1/72in) regardless of the source image's pixel dimensions —
+            // e.g. a real banknote's physical size in points — while each
+            // image keeps embedding at its own native resolution (so a
+            // high-res source still renders crisp, just scaled onto that
+            // physical page instead of a page sized 1:1 to its pixel count).
+            #[cfg(all(not(target_arch = "wasm32"), feature = "web"))]
+            "pdf_from_images_sized" | "PDF来自图片_定尺" => {
+                let paths = match args.first() {
+                    Some(Value::List(l)) => l.iter().map(|v| v.to_string()).collect::<Vec<_>>(),
+                    _ => Vec::new(),
+                };
+                let out_path = self.arg_str(&args, 1, "out.pdf");
+                let page_w_pt = self.arg_num(&args, 2, 0.0)?;
+                let page_h_pt = self.arg_num(&args, 3, 0.0)?;
+                let ok = build_pdf_from_images(&paths, &out_path, Some((page_w_pt, page_h_pt))).is_ok();
                 return Ok(Value::Bool(ok));
             },
 
             // ══════════════════════════════════════════════════════════════════
             // ling-ui — animation easings + holographic vector widgets + text I/O
             // ══════════════════════════════════════════════════════════════════
+            #[cfg(feature = "ui")]
             "ease" => {
                 let name = self.arg_str(&args, 0, "ease");
                 let t = self.arg_num(&args, 1, 0.0)? as f32;
@@ -13020,6 +16056,7 @@ impl Interpreter {
                 let t = self.arg_num(&args, 2, 0.0)?.clamp(0.0, 1.0);
                 return Ok(Value::Number(a + (b - a) * t));
             },
+            #[cfg(feature = "game")]
             "tween_ease"
             | "缓动补间"
             | "緩和補間"
@@ -13042,6 +16079,7 @@ impl Interpreter {
                 ));
             },
             // ── Organic 灵 ──
+            #[cfg(feature = "game")]
             "breathe" | "呼吸" | "호흡" | "หายใจ" | "تنفس" | "נשימה" | "سانس" | "respirer"
             | "atmen" | "дышать" => {
                 let t = self.arg_num(&args, 0, 0.0)? as f32;
@@ -13051,6 +16089,7 @@ impl Interpreter {
                     ling_animation::scalar::breathe(t, rate, depth) as f64,
                 ));
             },
+            #[cfg(feature = "game")]
             "wobble"
             | "摆动"
             | "揺れ"
@@ -13071,6 +16110,7 @@ impl Interpreter {
                     ling_animation::scalar::wobble(t, freq, amp, phase) as f64,
                 ));
             },
+            #[cfg(feature = "game")]
             "gait_phase"
             | "步相"
             | "歩相"
@@ -13089,6 +16129,7 @@ impl Interpreter {
                     ling_animation::scalar::gait_phase(t, speed) as f64
                 ));
             },
+            #[cfg(feature = "game")]
             "gait_swing"
             | "步摆"
             | "歩振り"
@@ -13108,6 +16149,7 @@ impl Interpreter {
                     ling_animation::scalar::gait_swing(t, speed, stride) as f64,
                 ));
             },
+            #[cfg(feature = "game")]
             "gait_lift"
             | "抬脚"
             | "足上げ"
@@ -13127,6 +16169,7 @@ impl Interpreter {
                     ling_animation::scalar::gait_lift(t, speed, height) as f64,
                 ));
             },
+            #[cfg(feature = "game")]
             "spring_to"
             | "弹向"
             | "バネ寄せ"
@@ -13152,6 +16195,7 @@ impl Interpreter {
                     Value::Number(nv as f64),
                 ])));
             },
+            #[cfg(feature = "game")]
             "ik2"
             | "反解"
             | "逆運動"
@@ -13175,6 +16219,7 @@ impl Interpreter {
                 ])));
             },
             // ── Mechanical 机 ──
+            #[cfg(feature = "game")]
             "gear_couple"
             | "齿轮联动"
             | "歯車連動"
@@ -13194,6 +16239,7 @@ impl Interpreter {
                     ling_animation::scalar::gear(angle, ti, to) as f64
                 ));
             },
+            #[cfg(feature = "game")]
             "gear_train"
             | "齿轮组"
             | "歯車列"
@@ -13225,6 +16271,7 @@ impl Interpreter {
                     out.into_iter().map(|a| Value::Number(a as f64)).collect(),
                 )));
             },
+            #[cfg(feature = "game")]
             "cam_lift"
             | "凸轮升程"
             | "カム揚程"
@@ -13243,6 +16290,7 @@ impl Interpreter {
                     ling_animation::scalar::cam_lift(angle, lift) as f64
                 ));
             },
+            #[cfg(feature = "game")]
             "piston" | "活塞" | "ピストン" | "피스톤" | "ลูกสูบ" | "پیستون" | "مكبس" | "בוכנה"
             | "پسٹن" | "kolben" | "поршень" => {
                 let angle = self.arg_num(&args, 0, 0.0)? as f32;
@@ -13252,6 +16300,10 @@ impl Interpreter {
                     ling_animation::scalar::piston(angle, crank, rod) as f64,
                 ));
             },
+            _ => {},
+        } }
+        if __ck <= 17 { __cl.at = 17; match name {
+            #[cfg(feature = "game")]
             "rack"
             | "齿条"
             | "ラック"
@@ -13276,14 +16328,19 @@ impl Interpreter {
                 let v = gfx
                     .window
                     .as_ref()
-                    .and_then(|w| w.get_mouse_pos(minifb::MouseMode::Clamp))
+                    .filter(|w| {
+                        // minifb panics clamping the mouse into a window with no client area (minimised)
+                        let (sw, sh) = w.get_size();
+                        sw > 0 && sh > 0
+                    })
+                    .and_then(|w| buffer_mouse_pos(w))
                     .map(|p| p.0 as f64)
                     .unwrap_or(0.0);
-                return Ok(Value::Number(v));
+                return Ok(Value::Number(v / ui_scale_now() as f64));
             },
             #[cfg(target_arch = "wasm32")]
             "mouse_x" => {
-                return Ok(Value::Number(crate::gfx::wasm_mouse_x() as f64));
+                return Ok(Value::Number((crate::gfx::wasm_mouse_x() / ui_scale_now()) as f64));
             },
             #[cfg(not(target_arch = "wasm32"))]
             "mouse_y" => {
@@ -13291,14 +16348,19 @@ impl Interpreter {
                 let v = gfx
                     .window
                     .as_ref()
-                    .and_then(|w| w.get_mouse_pos(minifb::MouseMode::Clamp))
+                    .filter(|w| {
+                        // minifb panics clamping the mouse into a window with no client area (minimised)
+                        let (sw, sh) = w.get_size();
+                        sw > 0 && sh > 0
+                    })
+                    .and_then(|w| buffer_mouse_pos(w))
                     .map(|p| p.1 as f64)
                     .unwrap_or(0.0);
-                return Ok(Value::Number(v));
+                return Ok(Value::Number(v / ui_scale_now() as f64));
             },
             #[cfg(target_arch = "wasm32")]
             "mouse_y" => {
-                return Ok(Value::Number(crate::gfx::wasm_mouse_y() as f64));
+                return Ok(Value::Number((crate::gfx::wasm_mouse_y() / ui_scale_now()) as f64));
             },
             #[cfg(not(target_arch = "wasm32"))]
             "mouse_down" => {
@@ -13365,7 +16427,7 @@ impl Interpreter {
             | "درمیانی_ماؤس_دبا_ہوا" => {
                 return Ok(Value::Bool(crate::gfx::wasm_mouse_down_middle()));
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "ui"))]
             "ui_hot"
             | "热区"
             | "ホットエリア"
@@ -13386,7 +16448,11 @@ impl Interpreter {
                 let (mx, my) = gfx
                     .window
                     .as_ref()
-                    .and_then(|win| win.get_mouse_pos(minifb::MouseMode::Clamp))
+                    .filter(|win| {
+                        let (sw, sh) = win.get_size();
+                        sw > 0 && sh > 0
+                    })
+                    .and_then(|win| buffer_mouse_pos(win))
                     .unwrap_or((0.0, 0.0));
                 return Ok(Value::Bool(ling_ui::holo::hit_rect(mx, my, x, y, w, h)));
             },
@@ -13406,6 +16472,7 @@ impl Interpreter {
                 return Ok(Value::Bool(false));
             },
             // ui_text(x, y, scale, "string") — holographic vector text
+            #[cfg(feature = "ui")]
             "ui_text"
             | "界面文字"
             | "UI文字"
@@ -13432,8 +16499,7 @@ impl Interpreter {
             },
             // font_load("path.ttf") — load a vector font (outlines cached lazily as
             // cache/fonts/<stem>/<codepoint>.ling). Returns a handle, or -1 on failure.
-            #[cfg(not(target_arch = "wasm32"))]
-            "font_load"
+                        "font_load"
             | "โหลดฟอนต์"
             | "加载字体"
             | "フォント読込"
@@ -13452,6 +16518,19 @@ impl Interpreter {
                     _ => None,
                 };
                 // Try the path as given, then relative to the script's directory.
+                let mut resolved = path.clone();
+                #[cfg(target_arch = "wasm32")]
+                let mut loaded: Result<ling_graphics::VectorFont, String> = match crate::assets::get(&path) {
+                    Some(bytes) => {
+                        let name = path.rsplit(['/', '\\']).next().unwrap_or("font").trim_end_matches(".ttf").to_string();
+                        ling_graphics::VectorFont::from_bytes(bytes, &name, weight)
+                    },
+                    None => {
+                        crate::assets::request(&path);
+                        Err(format!("{path}: not streamed yet"))
+                    },
+                };
+                #[cfg(not(target_arch = "wasm32"))]
                 let mut loaded = ling_graphics::VectorFont::from_path_weight(&path, weight);
                 if loaded.is_err() {
                     if let Some(dir) = &self.source_dir {
@@ -13460,12 +16539,17 @@ impl Interpreter {
                             &joined.to_string_lossy(),
                             weight,
                         );
+                        if loaded.is_ok() {
+                            resolved = joined.to_string_lossy().into_owned();
+                        }
                     }
                 }
                 match loaded {
                     Ok(f) => {
                         let id = self.fonts.len();
                         self.fonts.push(f);
+                        self.font_paths.push(resolved);
+                        self.glyph_fonts.push(None);
                         return Ok(Value::Number(id as f64));
                     },
                     Err(e) => {
@@ -13474,30 +16558,257 @@ impl Interpreter {
                     },
                 }
             },
-            #[cfg(target_arch = "wasm32")]
-            "font_load"
-            | "โหลดฟอนต์"
-            | "加载字体"
-            | "フォント読込"
-            | "글꼴로드"
-            | "بارگذاری_فونت"
-            | "تحميل_الخط"
-            | "טעינת_גופן"
-            | "فونٹ_لوڈ"
-            | "charger_police"
-            | "schriftart_laden"
-            | "загрузить_шрифт" => {
-                // Web runtime does not load host TTF/OTF files yet.
-                // Return -1 so scripts can fall back to ui_text.
-                return Ok(Value::Number(-1.0));
+            // ── shared key/value store (LingDev-style widget state; portable) ──
+            "st_set" | "상태설정" | "设状态" | "状態設定" | "ตั้งสถานะ" => {
+                let key = args.first().map(|v| v.to_string()).unwrap_or_default();
+                let v = args.get(1).cloned().unwrap_or(Value::Unit);
+                self.gstore.insert(key, v);
+                return Ok(Value::Unit);
+            },
+            "st_get" | "상태얻기" | "取状态" | "状態取得" | "รับสถานะ" => {
+                let key = match args.first() {
+                    Some(Value::Str(k)) => std::borrow::Cow::Borrowed(k.as_str()),
+                    Some(v) => std::borrow::Cow::Owned(v.to_string()),
+                    None => std::borrow::Cow::Borrowed(""),
+                };
+                return Ok(self
+                    .gstore
+                    .get(key.as_ref())
+                    .cloned()
+                    .or_else(|| args.get(1).cloned())
+                    .unwrap_or(Value::Number(0.0)));
+            },
+            "st_has" => {
+                let key = args.first().map(|v| v.to_string()).unwrap_or_default();
+                return Ok(Value::Number(self.gstore.contains_key(&key) as i32 as f64));
+            },
+            // ── asset streaming (web) ─────────────────────────────────────────
+            // asset_request(path) asks the host to stream a file in (no-op if present);
+            // asset_ready(path) -> 1 once usable (natively: the file exists);
+            // asset_free(path) lets the host drop it; asset_stats() -> [count, bytes].
+            "asset_request" => {
+                let path = self.arg_str(&args, 0, "");
+                crate::assets::request(&path);
+                return Ok(Value::Unit);
+            },
+            "asset_ready" => {
+                let path = self.arg_str(&args, 0, "");
+                #[cfg(target_arch = "wasm32")]
+                let ok = crate::assets::has(&path);
+                #[cfg(not(target_arch = "wasm32"))]
+                let ok = std::path::Path::new(&path).exists();
+                return Ok(Value::Number(if ok { 1.0 } else { 0.0 }));
+            },
+            "asset_free" => {
+                let path = self.arg_str(&args, 0, "");
+                crate::assets::remove(&path);
+                return Ok(Value::Unit);
+            },
+            "asset_stats" => {
+                return Ok(Value::List(std::rc::Rc::new(vec![
+                    Value::Number(crate::assets::count() as f64),
+                    Value::Number(crate::assets::bytes_total() as f64),
+                ])));
+            },
+            // font_text_px(handle, x, y, px, "string") — bitmap text: fontdue
+            // coverage bitmaps cached per (char, px), alpha-blended in the pen
+            // colour. ~1000× faster than font_text_fill for per-frame UI text;
+            // use the vector builtins when text must scale/rotate/extrude.
+                        "font_text_px" | "字体像素" | "글꼴픽셀" | "ฟอนต์พิกเซล" => {
+                let id = self.arg_num(&args, 0, 0.0)? as i64;
+                let x = self.arg_num(&args, 1, 0.0)? as f32;
+                let y = self.arg_num(&args, 2, 0.0)? as f32;
+                let px = self.arg_num(&args, 3, 16.0)? as f32;
+                let s = self.arg_str(&args, 4, "");
+                if id >= 0 && (id as usize) < self.glyph_fonts.len() && px > 0.0 {
+                    let id = id as usize;
+                    if self.glyph_fonts[id].is_none() {
+                        match ling_graphics::GlyphFont::from_path(&self.font_paths[id]) {
+                            Ok(gf) => self.glyph_fonts[id] = Some(gf),
+                            Err(e) => eprintln!("font_text_px: {e}"),
+                        }
+                    }
+                    if let Some(gf) = self.glyph_fonts[id].as_mut() {
+                        let mut gfx = self.gfx.borrow_mut();
+                        let (w, h, color) = (gfx.width, gfx.height, gfx.color);
+                        gf.draw_text(&mut gfx.buffer, w, h, x, y, px, color, &s);
+                    }
+                }
+                return Ok(Value::Unit);
+            },
+            // font_width_px(handle, px, "string") — advance width of the bitmap twin.
+                        "font_width_px" | "字体像素宽" | "글꼴픽셀폭" | "ฟอนต์พิกเซลกว้าง" => {
+                let id = self.arg_num(&args, 0, 0.0)? as i64;
+                let px = self.arg_num(&args, 1, 16.0)? as f32;
+                let s = self.arg_str(&args, 2, "");
+                if id >= 0 && (id as usize) < self.glyph_fonts.len() && px > 0.0 {
+                    let id = id as usize;
+                    if self.glyph_fonts[id].is_none() {
+                        if let Ok(gf) = ling_graphics::GlyphFont::from_path(&self.font_paths[id]) {
+                            self.glyph_fonts[id] = Some(gf);
+                        }
+                    }
+                    if let Some(gf) = self.glyph_fonts[id].as_mut() {
+                        return Ok(Value::Number(gf.measure(&s, px) as f64));
+                    }
+                }
+                return Ok(Value::Number(0.0));
             },
             // image_load("path.png") — decode a raster image (via the `image` crate)
             // for pixel sampling (image_width/image_height/image_pixel_r/g/b/a) —
             // used by the coin-stamp mosaic tool to read a source photo's
             // colour/darkness. Returns a handle, or -1 on failure.
+            // image_fetch(url) — start fetching + decoding a picture off this thread (http/https,
+            // data: URIs, paths; PNG JPEG GIF WebP BMP ICO SVG); returns a job id at once.
+            // image_job(job) — -2 while it runs, -1 when it failed, else the image handle.
+            // image_svg(markup, w, h) — rasterise SVG text now (0 = its own size); handle or -1.
+            // image_resized(id, w, h) — a smoothly resampled copy (a new handle).
+            // image_free(id) — drop a picture's pixels (the handle stays, empty).
+            // image_fetch_cancel() — forget fetches that have not started.
+            // re_compile(pattern, flags) / re_exec(id, text, start) / re_error() / re_names(id):
+            // JavaScript-style regular expressions for a page-script sandbox (see jsre.rs).
             #[cfg(not(target_arch = "wasm32"))]
-            "image_load" => {
+            "re_compile" => {
+                let p = self.arg_str(&args, 0, "");
+                let f = self.arg_str(&args, 1, "");
+                return Ok(Value::Number(jsre::compile(&p, &f)));
+            },
+            #[cfg(not(target_arch = "wasm32"))]
+            "re_exec" => {
+                let id = self.arg_num(&args, 0, -1.0)?;
+                let t = self.arg_str(&args, 1, "");
+                let at = self.arg_num(&args, 2, 0.0)?.max(0.0) as usize;
+                if id < 0.0 {
+                    return Ok(Value::List(std::rc::Rc::new(Vec::new())));
+                }
+                let out = jsre::exec(id as usize, &t, at).unwrap_or_default();
+                return Ok(Value::List(std::rc::Rc::new(out)));
+            },
+            #[cfg(not(target_arch = "wasm32"))]
+            "re_error" => {
+                return Ok(Value::Str(jsre::error()));
+            },
+            #[cfg(not(target_arch = "wasm32"))]
+            "re_names" => {
+                let id = self.arg_num(&args, 0, -1.0)?;
+                let names = if id < 0.0 { Vec::new() } else { jsre::names(id as usize) };
+                return Ok(Value::List(std::rc::Rc::new(names.into_iter().map(Value::Str).collect())));
+            },
+            // file_fetch(url, path) — save an address (http / https / data: / a path) to a file off
+            // this thread; a job id. file_job(job) — -2 running, -1 failed, else the bytes written.
+            #[cfg(all(not(target_arch = "wasm32"), feature = "svg"))]
+            "file_fetch" => {
+                let u = self.arg_str(&args, 0, "");
+                let p = self.arg_str(&args, 1, "");
+                return Ok(Value::Number(webimg::file_fetch(&u, &p) as f64));
+            },
+            #[cfg(all(not(target_arch = "wasm32"), feature = "svg"))]
+            "file_job" => {
+                let id = self.arg_num(&args, 0, -1.0)?;
+                return Ok(Value::Number(if id < 0.0 { -1.0 } else { webimg::file_job(id as usize) }));
+            },
+            #[cfg(all(not(target_arch = "wasm32"), feature = "svg"))]
+            "image_fetch" => {
+                let url = self.arg_str(&args, 0, "");
+                return Ok(Value::Number(webimg::fetch(&url) as f64));
+            },
+            #[cfg(all(not(target_arch = "wasm32"), feature = "svg"))]
+            "image_job" => {
+                let id = self.arg_num(&args, 0, -1.0)?;
+                if id < 0.0 {
+                    return Ok(Value::Number(-1.0));
+                }
+                return Ok(Value::Number(webimg::poll(id as usize, &mut self.images)));
+            },
+            #[cfg(all(not(target_arch = "wasm32"), feature = "svg"))]
+            "image_fetch_cancel" => {
+                webimg::cancel_waiting();
+                return Ok(Value::Unit);
+            },
+            #[cfg(all(not(target_arch = "wasm32"), feature = "svg"))]
+            "image_svg" => {
+                let src = self.arg_str(&args, 0, "");
+                let w = self.arg_num(&args, 1, 0.0)?.max(0.0) as u32;
+                let h = self.arg_num(&args, 2, 0.0)?.max(0.0) as u32;
+                return Ok(Value::Number(match webimg::svg(src.as_bytes(), w, h) {
+                    Ok(img) => {
+                        self.images.push(img);
+                        (self.images.len() - 1) as f64
+                    },
+                    Err(_) => -1.0,
+                }));
+            },
+            #[cfg(all(not(target_arch = "wasm32"), feature = "svg"))]
+            "image_resized" => {
+                let id = self.arg_num(&args, 0, -1.0)? as i64;
+                let w = self.arg_num(&args, 1, 0.0)?.max(1.0) as u32;
+                let h = self.arg_num(&args, 2, 0.0)?.max(1.0) as u32;
+                if id < 0 || id as usize >= self.images.len() || self.images[id as usize].width() == 0 {
+                    return Ok(Value::Number(-1.0));
+                }
+                let img = webimg::resized(&self.images[id as usize], w, h);
+                self.images.push(img);
+                return Ok(Value::Number((self.images.len() - 1) as f64));
+            },
+            // image_tint(id, 0xRRGGBB) — a copy in one colour, shaped by the picture's alpha (CSS
+            // mask-image: an icon shown in the box's colour). A new handle, or -1.
+            #[cfg(not(target_arch = "wasm32"))]
+            "image_tint" => {
+                let id = self.arg_num(&args, 0, -1.0)? as i64;
+                let c = self.arg_num(&args, 1, 0.0)?.max(0.0) as u32;
+                if id < 0 || id as usize >= self.images.len() || self.images[id as usize].width() == 0 {
+                    return Ok(Value::Number(-1.0));
+                }
+                let (r, g, b) = ((c >> 16) as u8 & 0xff, (c >> 8) as u8 & 0xff, c as u8);
+                let mut img = self.images[id as usize].clone();
+                for p in img.pixels_mut() {
+                    *p = image::Rgba([r, g, b, p[3]]);
+                }
+                self.images.push(img);
+                return Ok(Value::Number((self.images.len() - 1) as f64));
+            },
+                        "image_free" => {
+                let id = self.arg_num(&args, 0, -1.0)? as i64;
+                if id >= 0 && (id as usize) < self.images.len() {
+                    self.images[id as usize] = image::RgbaImage::new(0, 0);
+                }
+                return Ok(Value::Unit);
+            },
+            #[cfg(target_arch = "wasm32")]
+            "image_load" | "이미지로드" | "加载图像" | "画像読込" | "โหลดภาพ" | "بارگذاری_تصویر" | "تحميل_الصورة" | "טעינת_תמונה" | "تصویر_لوڈ" | "charger_image" | "bild_laden" | "загрузить_изображение" => {
+                // Web runtime: decode from the streamed-asset registry (src/assets.rs).
                 let path = self.arg_str(&args, 0, "").replace('\\', "/");
+                if let Some(&cached) = self.image_cache.get(&path) {
+                    return Ok(Value::Number(cached as f64));
+                }
+                match crate::assets::get(&path) {
+                    Some(bytes) => match image::load_from_memory(&bytes) {
+                        Ok(img) => {
+                            let id = self.images.len();
+                            self.images.push(img.to_rgba8());
+                            self.image_cache.insert(path.clone(), id);
+                            return Ok(Value::Number(id as f64));
+                        },
+                        Err(e) => {
+                            web_sys::console::warn_1(&wasm_bindgen::JsValue::from_str(&format!(
+                                "image_load failed ({path}): {e}"
+                            )));
+                            return Ok(Value::Number(-1.0));
+                        },
+                    },
+                    None => {
+                        // Not streamed in yet: ask the host; the caller retries until ready.
+                        crate::assets::request(&path);
+                        return Ok(Value::Number(-1.0));
+                    },
+                }
+            },
+            #[cfg(not(target_arch = "wasm32"))]
+            "image_load" | "이미지로드" | "加载图像" | "画像読込" | "โหลดภาพ" | "بارگذاری_تصویر" | "تحميل_الصورة" | "טעינת_תמונה" | "تصویر_لوڈ" | "charger_image" | "bild_laden" | "загрузить_изображение" => {
+                let path = self.arg_str(&args, 0, "").replace('\\', "/");
+                if let Some(&cached) = self.image_cache.get(&path) {
+                    return Ok(Value::Number(cached as f64));
+                }
                 let mut loaded = image::open(&path);
                 if loaded.is_err() {
                     if let Some(dir) = &self.source_dir {
@@ -13509,6 +16820,7 @@ impl Interpreter {
                     Ok(img) => {
                         let id = self.images.len();
                         self.images.push(img.to_rgba8());
+                        self.image_cache.insert(path.clone(), id);
                         return Ok(Value::Number(id as f64));
                     },
                     Err(e) => {
@@ -13517,59 +16829,43 @@ impl Interpreter {
                     },
                 }
             },
-            #[cfg(target_arch = "wasm32")]
-            "image_load" => {
-                // Web runtime does not load host image files yet.
+            // image_replace(id, "path.png") — decode a raster image into an existing handle (so a picture that is redrawn
+            // often, like a score page, does not grow the table). Returns 1, or -1 on a bad handle / unreadable file.
+                        "image_replace" => {
+                let id = self.arg_num(&args, 0, -1.0)? as i64;
+                let path = self.arg_str(&args, 1, "").replace('\\', "/");
+                if id >= 0 && (id as usize) < self.images.len() {
+                    if let Ok(img) = image::open(&path) {
+                        self.images[id as usize] = img.to_rgba8();
+                        return Ok(Value::Number(1.0));
+                    }
+                }
                 return Ok(Value::Number(-1.0));
             },
-            #[cfg(not(target_arch = "wasm32"))]
-            "image_width" => {
+            
+            
+                        "image_width" => {
                 let id = self.arg_num(&args, 0, -1.0)? as i64;
                 if id >= 0 && (id as usize) < self.images.len() {
                     return Ok(Value::Number(self.images[id as usize].width() as f64));
                 }
                 return Ok(Value::Number(0.0));
             },
-            #[cfg(target_arch = "wasm32")]
-            "image_width" => return Ok(Value::Number(0.0)),
-            #[cfg(not(target_arch = "wasm32"))]
-            "image_height" => {
+            
+                        "image_height" => {
                 let id = self.arg_num(&args, 0, -1.0)? as i64;
                 if id >= 0 && (id as usize) < self.images.len() {
                     return Ok(Value::Number(self.images[id as usize].height() as f64));
                 }
                 return Ok(Value::Number(0.0));
             },
-            #[cfg(target_arch = "wasm32")]
-            "image_height" => return Ok(Value::Number(0.0)),
+            
             // image_load never succeeds on wasm32 (see its own wasm32 stub, always -1),
             // so any id here is always out-of-range there too — 0.0 matches exactly what
             // the native bounds-check-failure path below already returns for a bad id.
-            #[cfg(target_arch = "wasm32")]
-            "image_pixel_r" | "image_pixel_g" | "image_pixel_b" | "image_pixel_a" => {
-                return Ok(Value::Number(0.0));
-            },
-            #[cfg(not(target_arch = "wasm32"))]
-            "image_pixel_r" | "image_pixel_g" | "image_pixel_b" | "image_pixel_a" => {
-                let id = self.arg_num(&args, 0, -1.0)? as i64;
-                let px = self.arg_num(&args, 1, 0.0)? as i64;
-                let py = self.arg_num(&args, 2, 0.0)? as i64;
-                if id >= 0 && (id as usize) < self.images.len() {
-                    let img = &self.images[id as usize];
-                    if px >= 0 && py >= 0 && (px as u32) < img.width() && (py as u32) < img.height()
-                    {
-                        let p = img.get_pixel(px as u32, py as u32);
-                        let ch = match name {
-                            "image_pixel_r" => p[0],
-                            "image_pixel_g" => p[1],
-                            "image_pixel_b" => p[2],
-                            _ => p[3],
-                        };
-                        return Ok(Value::Number(ch as f64));
-                    }
-                }
-                return Ok(Value::Number(0.0));
-            },
+            
+            // image_pixel_r/g/b/a and image_pixel_u16 live in the hot table near the top of
+            // call_named_inner (a game reads thousands of height-map pixels a frame).
             // image_new(w, h) — a new blank (fully transparent) RGBA image the
             // script can paint into with image_set_pixel and write out with
             // image_save. Lives in the same self.images table as image_load,
@@ -13578,8 +16874,7 @@ impl Interpreter {
             // (mm x DPI) PNG exports — something a raw window screenshot()
             // can't do, since it always captures the whole on-screen
             // framebuffer at whatever size the window happens to be.
-            #[cfg(not(target_arch = "wasm32"))]
-            "image_new" => {
+                        "image_new" => {
                 let w = self.arg_num(&args, 0, 1.0)?.max(1.0) as u32;
                 let h = self.arg_num(&args, 1, 1.0)?.max(1.0) as u32;
                 let id = self.images.len();
@@ -13587,14 +16882,12 @@ impl Interpreter {
                 return Ok(Value::Number(id as f64));
             },
             // Matches image_load's own wasm32 stub convention (-1 = failure/unavailable).
-            #[cfg(target_arch = "wasm32")]
-            "image_new" => return Ok(Value::Number(-1.0)),
+            
             // image_set_pixel(id, x, y, r, g, b, a) — paint one pixel of an
             // image created with image_new (0..255 channels; out-of-bounds is
             // a silent no-op, matching image_pixel_*'s own out-of-bounds
             // behaviour).
-            #[cfg(not(target_arch = "wasm32"))]
-            "image_set_pixel" => {
+                        "image_set_pixel" => {
                 let id = self.arg_num(&args, 0, -1.0)? as i64;
                 let px = self.arg_num(&args, 1, 0.0)? as i64;
                 let py = self.arg_num(&args, 2, 0.0)? as i64;
@@ -13613,8 +16906,7 @@ impl Interpreter {
             },
             // image_new always fails on wasm32, so there's never a valid id to set a
             // pixel on — no-op, matching the native code's own bad-id no-op behaviour.
-            #[cfg(target_arch = "wasm32")]
-            "image_set_pixel" => return Ok(Value::Unit),
+            
             // image_save(id, "path.png") — encode an image (from image_new or
             // image_load) to disk, alpha preserved. Returns 1 on success, -1
             // on failure (bad id or write error), mirroring image_load's own
@@ -13651,42 +16943,60 @@ impl Interpreter {
             // small mosaic tiles hang the UI (see mosaic.ling's
             // xform_glyph_pts_fit fix) — this is the "read the framebuffer
             // out" direction's counterpart to screenshot().
-            #[cfg(not(target_arch = "wasm32"))]
-            "image_draw" => {
+                        "image_draw" | "이미지그리기" | "绘制图像" | "画像描画" | "วาดภาพ" | "رسم_تصویر" | "ارسم_الصورة" | "ציור_תמונה" | "تصویر_ڈرا" | "dessiner_image" | "bild_zeichnen" | "нарисовать_изображение" => {
                 let id = self.arg_num(&args, 0, -1.0)? as i64;
                 let dx = self.arg_num(&args, 1, 0.0)? as i32;
                 let dy = self.arg_num(&args, 2, 0.0)? as i32;
                 let dw = self.arg_num(&args, 3, 0.0)?.max(0.0) as i32;
                 let dh = self.arg_num(&args, 4, 0.0)?.max(0.0) as i32;
-                if id >= 0 && (id as usize) < self.images.len() && dw > 0 && dh > 0 {
+                // optional clip rectangle (x, y, w, h) as arguments 5..8: nothing is drawn outside it
+                let (kx0, ky0, kx1, ky1) = if args.len() >= 9 {
+                    let (a, b, c, d) = (self.arg_num(&args, 5, 0.0)? as i32, self.arg_num(&args, 6, 0.0)? as i32, self.arg_num(&args, 7, 0.0)? as i32, self.arg_num(&args, 8, 0.0)? as i32);
+                    (a, b, a.saturating_add(c), b.saturating_add(d))
+                } else {
+                    (i32::MIN, i32::MIN, i32::MAX, i32::MAX)
+                };
+                // optional opacity 0..1 as argument 9 (after the clip rectangle): the image's own alpha is multiplied by it
+                let opacity = if args.len() >= 10 { (self.arg_num(&args, 9, 1.0)?.clamp(0.0, 1.0) * 255.0).round() as u32 } else { 255 };
+                if id >= 0 && (id as usize) < self.images.len() && dw > 0 && dh > 0 && opacity > 0 {
                     let img = &self.images[id as usize];
                     let sw = img.width() as i32;
                     let sh = img.height() as i32;
                     if sw > 0 && sh > 0 {
                         let mut gfx = self.gfx.borrow_mut();
                         let (fw, fh) = (gfx.width as i32, gfx.height as i32);
-                        for py in 0..dh {
+                        // iterate ONLY the destination span inside frame ∩ clip
+                        // (a zoomed map image can be 10k+ px wide — scanning the full
+                        // row and `continue`-ing was O(rows × full width)).
+                        let px0 = 0i32.max(fw.min(kx0.max(0)).saturating_sub(dx)).max(0);
+                        let px1 = dw.min(kx1.min(fw).saturating_sub(dx)).max(px0);
+                        let py0 = 0i32.max(fh.min(ky0.max(0)).saturating_sub(dy)).max(0);
+                        let py1 = dh.min(ky1.min(fh).saturating_sub(dy)).max(py0);
+                        // i64 math for the source index: px*sw can overflow i32 when dw is huge
+                        for py in py0..py1 {
                             let ty = dy + py;
-                            if ty < 0 || ty >= fh {
+                            if ty < 0 || ty >= fh || ty < ky0 || ty >= ky1 {
                                 continue;
                             }
-                            let sy = (py * sh / dh).clamp(0, sh - 1) as u32;
-                            for px in 0..dw {
+                            let sy = ((py as i64 * sh as i64 / dh as i64) as i32).clamp(0, sh - 1) as u32;
+                            for px in px0..px1 {
                                 let tx = dx + px;
-                                if tx < 0 || tx >= fw {
+                                if tx < 0 || tx >= fw || tx < kx0 || tx >= kx1 {
                                     continue;
                                 }
-                                let sx = (px * sw / dw).clamp(0, sw - 1) as u32;
+                                let sx = ((px as i64 * sw as i64 / dw as i64) as i32).clamp(0, sw - 1) as u32;
                                 let p = img.get_pixel(sx, sy);
-                                let a = p[3] as u32;
+                                let a = p[3] as u32 * opacity / 255;
                                 if a == 0 {
                                     continue;
                                 }
                                 let idx = ty as usize * gfx.width + tx as usize;
                                 if a >= 255 {
+                                    // tagged UNLIT: a picture is shown as it is, not toon-quantised by present()
                                     gfx.buffer[idx] = ((p[0] as u32) << 16)
                                         | ((p[1] as u32) << 8)
-                                        | (p[2] as u32);
+                                        | (p[2] as u32)
+                                        | crate::gfx::UNLIT;
                                 } else {
                                     let bg = gfx.buffer[idx];
                                     let br = (bg >> 16) & 0xff;
@@ -13695,7 +17005,7 @@ impl Interpreter {
                                     let r = (p[0] as u32 * a + br * (255 - a)) / 255;
                                     let g = (p[1] as u32 * a + bg_g * (255 - a)) / 255;
                                     let b = (p[2] as u32 * a + bb * (255 - a)) / 255;
-                                    gfx.buffer[idx] = (r << 16) | (g << 8) | b;
+                                    gfx.buffer[idx] = (r << 16) | (g << 8) | b | crate::gfx::UNLIT;
                                 }
                             }
                         }
@@ -13703,14 +17013,13 @@ impl Interpreter {
                 }
                 return Ok(Value::Unit);
             },
-            #[cfg(target_arch = "wasm32")]
-            "image_draw" => {
-                return Ok(Value::Unit);
-            },
+            _ => {},
+        } }
+        if __ck <= 18 { __cl.at = 18; match name {
+            
             // font_text(handle, x, y, px, "string") — anti-aliased *stroked* vector outline
             // in the current set_color / set_blend. (x,y) is the text box top-left.
-            #[cfg(not(target_arch = "wasm32"))]
-            "font_text"
+                        "font_text"
             | "ข้อความฟอนต์"
             | "字体文本"
             | "フォント文字"
@@ -13768,25 +17077,9 @@ impl Interpreter {
                 }
                 return Ok(Value::Unit);
             },
-            #[cfg(target_arch = "wasm32")]
-            "font_text"
-            | "ข้อความฟอนต์"
-            | "字体文本"
-            | "フォント文字"
-            | "글꼴텍스트"
-            | "متن_فونت"
-            | "نص_الخط"
-            | "טקסט_גופן"
-            | "فونٹ_متن"
-            | "texte_police"
-            | "schriftart_text"
-            | "текст_шрифт" => {
-                return Ok(Value::Unit);
-            },
             // font_text_fill(handle, x, y, px, "string") — filled vector glyphs;
             // anti-aliased when `set_font_antialias(1)` is on (default off = crisp).
-            #[cfg(not(target_arch = "wasm32"))]
-            "font_text_fill"
+                        "font_text_fill"
             | "เติมฟอนต์"
             | "填充字体"
             | "フォント塗り"
@@ -13838,21 +17131,6 @@ impl Interpreter {
                 }
                 return Ok(Value::Unit);
             },
-            #[cfg(target_arch = "wasm32")]
-            "font_text_fill"
-            | "เติมฟอนต์"
-            | "填充字体"
-            | "フォント塗り"
-            | "글꼴채움"
-            | "پرکردن_متن_فونت"
-            | "تعبئة_نص_الخط"
-            | "מילוי_טקסט_גופן"
-            | "فونٹ_متن_بھرو"
-            | "remplir_texte_police"
-            | "schriftart_text_füllen"
-            | "заполнить_текст_шрифт" => {
-                return Ok(Value::Unit);
-            },
             // font_text_3d(handle, cx,cy,cz, ux,uy,uz, vx,vy,vz, size, "string")
             // — stroked vector text on a 3D plane: u = advance dir, v = up dir, size = world/em.
             //   Flows through the depth-sorted line pipeline, so it rotates with the camera (and 4D).
@@ -13887,12 +17165,11 @@ impl Interpreter {
                 let fill_rows = self.arg_num(&args, 12, 0.0)? as i32;
                 if id >= 0 && (id as usize) < self.fonts.len() && size > 0.0 {
                     // Build world-space polylines: world = C + (pen+ex)*size*U + ey*size*V
-                    let font = &mut self.fonts[id as usize];
-                    let asc = font.ascent();
+                    let asc = self.fonts[id as usize].ascent();
                     let mut pen = 0.0f32;
                     let mut lines: Vec<[f32; 6]> = Vec::new();
                     for ch in s.chars() {
-                        let go = font.glyph_outline(ch, 0.01);
+                        let go = self.font_glyph_fb(id as usize, ch, 0.01);
                         let map = |p: [f32; 2], pen: f32| {
                             let a = pen + p[0];
                             let b = p[1] - asc; // shift so the top of the cap sits near C
@@ -14006,42 +17283,28 @@ impl Interpreter {
             | "текст_шрифт_3d" => {
                 return Ok(Value::Unit);
             },
-            // font_width(handle, px, "string") — pixel width of a string in a loaded font.
-            #[cfg(not(target_arch = "wasm32"))]
-            "font_width"
-            | "ความกว้างฟอนต์"
-            | "字体宽度"
-            | "フォント幅"
-            | "글꼴너비"
-            | "عرض_فونت"
-            | "عرض_الخط"
-            | "רוחב_גופן"
-            | "فونٹ_چوڑائی"
-            | "largeur_police"
-            | "schriftart_breite"
-            | "ширина_шрифта" => {
-                let id = self.arg_num(&args, 0, 0.0)? as i64;
-                let px = self.arg_num(&args, 1, 16.0)? as f32;
-                let s = self.arg_str(&args, 2, "");
-                if id >= 0 && (id as usize) < self.fonts.len() {
-                    return Ok(Value::Number(self.fonts[id as usize].measure(&s, px) as f64));
+            // font_fallback(primary, fallback [, scale]) — chars `primary` has no glyph for are drawn
+            // and measured with `fallback` (e.g. a wide-coverage Unicode font behind a UI font),
+            // at `scale` times its size (to match the two fonts' cap heights); fallback -1 removes
+            // it. Used by px_text, px_fit, font_width, font_text*, font_advance, font_glyph_outline
+            // and tm_glyph. Returns the primary handle.
+            "font_fallback" | "字体后备" | "フォント代替" | "글꼴대체" => {
+                let id = self.arg_num(&args, 0, -1.0)? as i64;
+                let fb = self.arg_num(&args, 1, -1.0)? as i64;
+                let scale = self.arg_num(&args, 2, 1.0)? as f32;
+                if id < 0 || id as usize >= self.fonts.len() {
+                    return Ok(Value::Number(-1.0));
                 }
-                return Ok(Value::Number(0.0));
-            },
-            #[cfg(target_arch = "wasm32")]
-            "font_width"
-            | "ความกว้างฟอนต์"
-            | "字体宽度"
-            | "フォント幅"
-            | "글꼴너비"
-            | "عرض_فونت"
-            | "عرض_الخط"
-            | "רוחב_גופן"
-            | "فونٹ_چوڑائی"
-            | "largeur_police"
-            | "schriftart_breite"
-            | "ширина_шрифта" => {
-                return Ok(Value::Number(0.0));
+                let id = id as usize;
+                if self.font_fallbacks.len() < self.fonts.len() {
+                    self.font_fallbacks.resize(self.fonts.len(), None);
+                }
+                self.font_fallbacks[id] = if fb >= 0 && (fb as usize) < self.fonts.len() && fb as usize != id {
+                    Some((fb as usize, if scale > 0.0 { scale } else { 1.0 }))
+                } else {
+                    None
+                };
+                return Ok(Value::Number(id as f64));
             },
             // font_glyph_outline(handle, "char", tol_em) — flattened vector outline of
             // ONE glyph in normalized em space (x→right, y→up, baseline at 0). Returns a
@@ -14063,7 +17326,7 @@ impl Interpreter {
                 let tol = self.arg_num(&args, 2, 0.01)? as f32;
                 let ch = s.chars().next().unwrap_or(' ');
                 if id >= 0 && (id as usize) < self.fonts.len() {
-                    let go = self.fonts[id as usize].glyph_outline(ch, tol.max(1e-4));
+                    let go = self.font_glyph_fb(id as usize, ch, tol.max(1e-4));
                     let mut contours: Vec<Value> = Vec::with_capacity(go.polylines.len());
                     for pl in &go.polylines {
                         let mut flat: Vec<Value> = Vec::with_capacity(pl.len() * 2);
@@ -14092,8 +17355,7 @@ impl Interpreter {
             },
             // font_advance(handle, "char") — normalized em advance width of ONE glyph
             // (baseline metric, ignores side bearings). Multiply by px for pixels.
-            #[cfg(not(target_arch = "wasm32"))]
-            "font_advance"
+                        "font_advance"
             | "ระยะฟอนต์"
             | "字体步进"
             | "フォント送り"
@@ -14106,24 +17368,13 @@ impl Interpreter {
                 let s = self.arg_str(&args, 1, "");
                 let ch = s.chars().next().unwrap_or(' ');
                 if id >= 0 && (id as usize) < self.fonts.len() {
-                    return Ok(Value::Number(self.fonts[id as usize].advance(ch) as f64));
+                    return Ok(Value::Number(self.font_advance_fb(id as usize, ch) as f64));
                 }
-                return Ok(Value::Number(0.0));
-            },
-            #[cfg(target_arch = "wasm32")]
-            "font_advance"
-            | "ระยะฟอนต์"
-            | "字体步进"
-            | "フォント送り"
-            | "글꼴전진"
-            | "پیشروی_فونت"
-            | "تقدم_الخط"
-            | "קידום_גופן"
-            | "فونٹ_ایڈوانس" => {
                 return Ok(Value::Number(0.0));
             },
 
             // ui_frame(x,y,w,h, bracketLen) — sci-fi corner brackets
+            #[cfg(feature = "ui")]
             "ui_frame"
             | "边框"
             | "フレーム枠"
@@ -14150,6 +17401,7 @@ impl Interpreter {
                 return Ok(Value::Unit);
             },
             // ui_bevel(x,y,w,h, bevel) — beveled holographic panel outline
+            #[cfg(feature = "ui")]
             "ui_bevel"
             | "斜角框"
             | "ベベル枠"
@@ -14181,8 +17433,7 @@ impl Interpreter {
             // All widgets are vector + theme-coloured with an optional trailing
             // r,g,b override; interactive ones read the mouse and return state.
             // ══════════════════════════════════════════════════════════════════
-            #[cfg(not(target_arch = "wasm32"))]
-            "ui_theme"
+                        "ui_theme"
             | "界面主题"
             | "UIテーマ"
             | "인터페이스테마"
@@ -14222,8 +17473,8 @@ impl Interpreter {
             },
 
             // ── HUD ──────────────────────────────────────────────────────────
-            #[cfg(not(target_arch = "wasm32"))]
-            "ui_radar"
+                        #[cfg(feature = "ui")]
+                        "ui_radar"
             | "雷达"
             | "レーダー"
             | "레이더"
@@ -14245,8 +17496,8 @@ impl Interpreter {
                 ));
                 return Ok(Value::Unit);
             },
-            #[cfg(not(target_arch = "wasm32"))]
-            "ui_compass"
+                        #[cfg(feature = "ui")]
+                        "ui_compass"
             | "罗盘"
             | "コンパス"
             | "나침반"
@@ -14270,8 +17521,8 @@ impl Interpreter {
                 ));
                 return Ok(Value::Unit);
             },
-            #[cfg(not(target_arch = "wasm32"))]
-            "ui_reticle"
+                        #[cfg(feature = "ui")]
+                        "ui_reticle"
             | "准星"
             | "照準"
             | "조준선"
@@ -14292,8 +17543,8 @@ impl Interpreter {
                 self.draw_ui(&ling_ui::widgets::reticle(cx, cy, r, spread, prim));
                 return Ok(Value::Unit);
             },
-            #[cfg(not(target_arch = "wasm32"))]
-            "ui_target"
+                        #[cfg(feature = "ui")]
+                        "ui_target"
             | "锁定框"
             | "ターゲット"
             | "표적"
@@ -14317,8 +17568,8 @@ impl Interpreter {
                 ));
                 return Ok(Value::Unit);
             },
-            #[cfg(not(target_arch = "wasm32"))]
-            "ui_panel"
+                        #[cfg(feature = "ui")]
+                        "ui_panel"
             | "面板"
             | "パネル"
             | "패널"
@@ -14340,8 +17591,8 @@ impl Interpreter {
                 self.draw_ui(&ling_ui::widgets::panel(x, y, w0, h0, bv, prim, th.bg));
                 return Ok(Value::Unit);
             },
-            #[cfg(not(target_arch = "wasm32"))]
-            "ui_scanlines"
+                        #[cfg(feature = "ui")]
+                        "ui_scanlines"
             | "扫描线"
             | "走査線"
             | "스캔라인"
@@ -14363,10 +17614,13 @@ impl Interpreter {
                 self.draw_ui(&ling_ui::widgets::scanlines(x, y, w0, h0, dens, line));
                 return Ok(Value::Unit);
             },
+            _ => {},
+        } }
+        if __ck <= 19 { __cl.at = 19; match name {
 
             // ── Meters ───────────────────────────────────────────────────────
-            #[cfg(not(target_arch = "wasm32"))]
-            "ui_bar"
+                        #[cfg(feature = "ui")]
+                        "ui_bar"
             | "进度条"
             | "バー"
             | "막대"
@@ -14397,8 +17651,8 @@ impl Interpreter {
                 ));
                 return Ok(Value::Unit);
             },
-            #[cfg(not(target_arch = "wasm32"))]
-            "ui_segbar"
+                        #[cfg(feature = "ui")]
+                        "ui_segbar"
             | "分段条"
             | "分割バー"
             | "분할막대"
@@ -14431,8 +17685,8 @@ impl Interpreter {
                 ));
                 return Ok(Value::Unit);
             },
-            #[cfg(not(target_arch = "wasm32"))]
-            "ui_gauge"
+                        #[cfg(feature = "ui")]
+                        "ui_gauge"
             | "仪表"
             | "ゲージ"
             | "게이지"
@@ -14462,8 +17716,8 @@ impl Interpreter {
                 ));
                 return Ok(Value::Unit);
             },
-            #[cfg(not(target_arch = "wasm32"))]
-            "ui_ring"
+                        #[cfg(feature = "ui")]
+                        "ui_ring"
             | "环表"
             | "リングメーター"
             | "링미터"
@@ -14491,8 +17745,8 @@ impl Interpreter {
                 ));
                 return Ok(Value::Unit);
             },
-            #[cfg(not(target_arch = "wasm32"))]
-            "ui_vu"
+                        #[cfg(feature = "ui")]
+                        "ui_vu"
             | "音量条"
             | "VUメーター"
             | "음량막대"
@@ -14514,8 +17768,8 @@ impl Interpreter {
                 self.draw_ui(&ling_ui::widgets::vu(x, y, w0, h0, &levels, fill, th.warn));
                 return Ok(Value::Unit);
             },
-            #[cfg(not(target_arch = "wasm32"))]
-            "ui_spark"
+                        #[cfg(feature = "ui")]
+                        "ui_spark"
             | "迷你图"
             | "スパークライン"
             | "스파크라인"
@@ -14537,8 +17791,8 @@ impl Interpreter {
                 self.draw_ui(&ling_ui::widgets::spark(x, y, w0, h0, &vals, line));
                 return Ok(Value::Unit);
             },
-            #[cfg(not(target_arch = "wasm32"))]
-            "ui_battery"
+                        #[cfg(feature = "ui")]
+                        "ui_battery"
             | "电池"
             | "バッテリー"
             | "배터리"
@@ -14572,8 +17826,8 @@ impl Interpreter {
             },
 
             // ── Interface controls (interactive → return state) ──────────────
-            #[cfg(not(target_arch = "wasm32"))]
-            "ui_button"
+                        #[cfg(feature = "ui")]
+                        "ui_button"
             | "按钮"
             | "ボタン"
             | "버튼"
@@ -14606,8 +17860,8 @@ impl Interpreter {
                 ));
                 return Ok(Value::Number(if clicked { 1.0 } else { 0.0 }));
             },
-            #[cfg(not(target_arch = "wasm32"))]
-            "ui_toggle"
+                        #[cfg(feature = "ui")]
+                        "ui_toggle"
             | "开关"
             | "トグル"
             | "토글"
@@ -14634,8 +17888,8 @@ impl Interpreter {
                 self.draw_ui(&ling_ui::widgets::toggle(x, y, w0, h0, state, on, th.track));
                 return Ok(Value::Number(if state { 1.0 } else { 0.0 }));
             },
-            #[cfg(not(target_arch = "wasm32"))]
-            "ui_slider"
+                        #[cfg(feature = "ui")]
+                        "ui_slider"
             | "滑块"
             | "スライダー"
             | "슬라이더"
@@ -14667,8 +17921,8 @@ impl Interpreter {
                 ));
                 return Ok(Value::Number(val as f64));
             },
-            #[cfg(not(target_arch = "wasm32"))]
-            "ui_checkbox"
+                        #[cfg(feature = "ui")]
+                        "ui_checkbox"
             | "复选框"
             | "チェックボックス"
             | "체크박스"
@@ -14696,8 +17950,8 @@ impl Interpreter {
                 ));
                 return Ok(Value::Number(if checked { 1.0 } else { 0.0 }));
             },
-            #[cfg(not(target_arch = "wasm32"))]
-            "ui_tabs"
+                        #[cfg(feature = "ui")]
+                        "ui_tabs"
             | "标签页"
             | "タブ"
             | "탭"
@@ -14740,8 +17994,8 @@ impl Interpreter {
                 ));
                 return Ok(Value::Number(active as f64));
             },
-            #[cfg(not(target_arch = "wasm32"))]
-            "ui_progress"
+                        #[cfg(feature = "ui")]
+                        "ui_progress"
             | "进度"
             | "プログレス"
             | "진행바"
@@ -14765,8 +18019,8 @@ impl Interpreter {
                 ));
                 return Ok(Value::Unit);
             },
-            #[cfg(not(target_arch = "wasm32"))]
-            "ui_tooltip"
+                        #[cfg(feature = "ui")]
+                        "ui_tooltip"
             | "提示框"
             | "ツールチップ"
             | "툴팁"
@@ -14786,8 +18040,8 @@ impl Interpreter {
                 self.draw_ui(&ling_ui::widgets::tooltip(x, y, w0, h0, prim, th.bg));
                 return Ok(Value::Unit);
             },
-            #[cfg(not(target_arch = "wasm32"))]
-            "ui_stepper"
+                        #[cfg(feature = "ui")]
+                        "ui_stepper"
             | "步进器"
             | "ステッパー"
             | "스테퍼"
@@ -14825,8 +18079,8 @@ impl Interpreter {
             },
 
             // ── Game UI ──────────────────────────────────────────────────────
-            #[cfg(not(target_arch = "wasm32"))]
-            "ui_healthbar"
+                        #[cfg(feature = "ui")]
+                        "ui_healthbar"
             | "血条"
             | "体力バー"
             | "체력바"
@@ -14860,8 +18114,8 @@ impl Interpreter {
                 ));
                 return Ok(Value::Unit);
             },
-            #[cfg(not(target_arch = "wasm32"))]
-            "ui_cooldown"
+                        #[cfg(feature = "ui")]
+                        "ui_cooldown"
             | "冷却"
             | "クールダウン"
             | "쿨다운"
@@ -14882,8 +18136,8 @@ impl Interpreter {
                 self.draw_ui(&ling_ui::widgets::cooldown(cx, cy, r, frac, fill, th.track));
                 return Ok(Value::Unit);
             },
-            #[cfg(not(target_arch = "wasm32"))]
-            "ui_counter"
+                        #[cfg(feature = "ui")]
+                        "ui_counter"
             | "计数器"
             | "カウンター"
             | "카운터"
@@ -14909,8 +18163,8 @@ impl Interpreter {
                 ));
                 return Ok(Value::Unit);
             },
-            #[cfg(not(target_arch = "wasm32"))]
-            "ui_minimap"
+                        #[cfg(feature = "ui")]
+                        "ui_minimap"
             | "小地图"
             | "ミニマップ"
             | "미니맵"
@@ -14931,8 +18185,8 @@ impl Interpreter {
                 self.draw_ui(&ling_ui::widgets::minimap(x, y, w0, h0, prim, th.bg));
                 return Ok(Value::Unit);
             },
-            #[cfg(not(target_arch = "wasm32"))]
-            "ui_dpad"
+                        #[cfg(feature = "ui")]
+                        "ui_dpad"
             | "方向键"
             | "方向パッド"
             | "방향패드"
@@ -14964,8 +18218,8 @@ impl Interpreter {
                 self.draw_ui(&ling_ui::widgets::dpad(cx, cy, r, dir, prim, th.track));
                 return Ok(Value::Number(dir as f64));
             },
-            #[cfg(not(target_arch = "wasm32"))]
-            "ui_slotgrid"
+                        #[cfg(feature = "ui")]
+                        "ui_slotgrid"
             | "物品格"
             | "スロットグリッド"
             | "슬롯격자"
@@ -14990,8 +18244,8 @@ impl Interpreter {
                 ));
                 return Ok(Value::Unit);
             },
-            #[cfg(not(target_arch = "wasm32"))]
-            "ui_vignette"
+                        #[cfg(feature = "ui")]
+                        "ui_vignette"
             | "暗角"
             | "ビネット"
             | "비네트"
@@ -15014,8 +18268,8 @@ impl Interpreter {
             },
 
             // ── Faux-3D in 2D space ──────────────────────────────────────────
-            #[cfg(not(target_arch = "wasm32"))]
-            "ui_gauge3d"
+                        #[cfg(feature = "ui")]
+                        "ui_gauge3d"
             | "立体仪表"
             | "立体ゲージ"
             | "입체게이지"
@@ -15046,8 +18300,8 @@ impl Interpreter {
                 ));
                 return Ok(Value::Unit);
             },
-            #[cfg(not(target_arch = "wasm32"))]
-            "ui_panel3d"
+                        #[cfg(feature = "ui")]
+                        "ui_panel3d"
             | "立体面板"
             | "立体パネル"
             | "입체패널"
@@ -15069,8 +18323,8 @@ impl Interpreter {
                 self.draw_ui(&ling_ui::widgets::panel3d(x, y, w0, h0, depth, prim, th.bg));
                 return Ok(Value::Unit);
             },
-            #[cfg(not(target_arch = "wasm32"))]
-            "ui_radar3d"
+                        #[cfg(feature = "ui")]
+                        "ui_radar3d"
             | "立体雷达"
             | "立体レーダー"
             | "입체레이더"
@@ -15096,7 +18350,29 @@ impl Interpreter {
             },
 
             // ── Interface sounds ─────────────────────────────────────────────
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(target_arch = "wasm32")]
+            "audio_blip" => {
+                let freq = self.arg_num(&args, 0, 660.)? as f32;
+                let dur = self.arg_num(&args, 1, 0.08)? as f32;
+                let wave = self.arg_str(&args, 2, "sine");
+                let amp = self.arg_num(&args, 3, 0.25)? as f32;
+                crate::gfx::audio_web::blip(freq, dur, &wave, amp);
+                return Ok(Value::Unit);
+            },
+            #[cfg(target_arch = "wasm32")]
+            "audio_sample_play_flat" => {
+                let id = self.arg_num(&args, 0, 0.0)?;
+                let vol = self.arg_num(&args, 1, 1.0)? as f32;
+                let looping = self.arg_num(&args, 2, 0.0)? > 0.5;
+                let pitch = self.arg_num(&args, 3, 1.0)? as f32;
+                let offset = self.arg_num(&args, 4, 0.0)? as f32;
+                let dur = self.arg_num(&args, 5, 0.0)? as f32;
+                if id >= 0.0 {
+                    crate::gfx::audio_web::play_sample_flat(id as usize, vol, looping, pitch, offset, dur);
+                }
+                return Ok(Value::Number(0.0));
+            },
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
             "audio_blip"
             | "提示音"
             | "ビープ音"
@@ -15117,7 +18393,7 @@ impl Interpreter {
                 }
                 return Ok(Value::Unit);
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
             "ui_sound"
             | "界面音"
             | "UI音"
@@ -15149,6 +18425,9 @@ impl Interpreter {
                 }
                 return Ok(Value::Unit);
             },
+            _ => {},
+        } }
+        if __ck <= 20 { __cl.at = 20; match name {
 
             // ══════════════════════════════════════════════════════════════════
             // MUSIC TOOLKIT  (crates/ling-music) — decode · analysis · GM synth ·
@@ -15157,7 +18436,7 @@ impl Interpreter {
             // ══════════════════════════════════════════════════════════════════
 
             // music_load(path) -> track handle (decodes WAV/FLAC/OGG/MP3/AAC)
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
             "music_load"
             | "载入音乐"
             | "音楽読込"
@@ -15190,7 +18469,7 @@ impl Interpreter {
                     },
                 }
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
             "music_duration"
             | "音乐时长"
             | "音楽長さ"
@@ -15211,7 +18490,7 @@ impl Interpreter {
                     .unwrap_or(0.0);
                 return Ok(Value::Number(d as f64));
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
             "music_bpm"
             | "节拍速度"
             | "テンポ"
@@ -15232,7 +18511,7 @@ impl Interpreter {
                     .unwrap_or(0.0);
                 return Ok(Value::Number(b as f64));
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
             "music_key"
             | "调性"
             | "調性"
@@ -15253,7 +18532,7 @@ impl Interpreter {
                     .unwrap_or_default();
                 return Ok(Value::Str(k));
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
             "music_onsets"
             | "音符起点"
             | "オンセット"
@@ -15276,7 +18555,7 @@ impl Interpreter {
                     v.into_iter().map(|x| Value::Number(x as f64)).collect(),
                 )));
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
             "music_beat_grid"
             | "节拍网格"
             | "ビートグリッド"
@@ -15304,7 +18583,7 @@ impl Interpreter {
             },
 
             // ── playback ──
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
             "music_play"
             | "播放音乐"
             | "音楽再生"
@@ -15332,7 +18611,7 @@ impl Interpreter {
                 }
                 return Ok(Value::Unit);
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
             "music_pause"
             | "暂停音乐"
             | "音楽一時停止"
@@ -15350,7 +18629,7 @@ impl Interpreter {
                 }
                 return Ok(Value::Unit);
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
             "music_stop"
             | "停止音乐"
             | "音楽停止"
@@ -15368,7 +18647,7 @@ impl Interpreter {
                 }
                 return Ok(Value::Unit);
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
             "music_seek"
             | "定位音乐"
             | "音楽シーク"
@@ -15387,7 +18666,7 @@ impl Interpreter {
                 }
                 return Ok(Value::Unit);
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
             "music_pos"
             | "音乐位置"
             | "音楽位置"
@@ -15403,7 +18682,7 @@ impl Interpreter {
                 let p = self.music.as_ref().map(|m| m.position()).unwrap_or(0.0);
                 return Ok(Value::Number(p as f64));
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
             "music_volume"
             | "音乐音量"
             | "音楽音量"
@@ -15426,7 +18705,7 @@ impl Interpreter {
             },
 
             // ── synthesis (GM-capable, patches from .ling files) ──
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
             "music_patch"
             | "乐器音色"
             | "音色読込"
@@ -15461,7 +18740,7 @@ impl Interpreter {
                     },
                 }
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
             "music_note"
             | "弹音符"
             | "音符演奏"
@@ -15485,7 +18764,7 @@ impl Interpreter {
                 }
                 return Ok(Value::Unit);
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
             "music_note_on"
             | "音符开始"
             | "音符オン"
@@ -15508,7 +18787,7 @@ impl Interpreter {
                 }
                 return Ok(Value::Unit);
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
             "music_note_off"
             | "音符结束"
             | "音符オフ"
@@ -15530,7 +18809,7 @@ impl Interpreter {
             },
 
             // ── rhythm-game judging ──
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
             "music_judge"
             | "判定"
             | "判定する"
@@ -15548,7 +18827,7 @@ impl Interpreter {
                     ling_music::Grade::judge(delta_ms).index() as f64
                 ));
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
             "music_grade_name"
             | "判定名"
             | "判定名称"
@@ -15568,7 +18847,7 @@ impl Interpreter {
             },
 
             // ── karaoke ──
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
             "music_lrc"
             | "载入歌词"
             | "歌詞読込"
@@ -15601,7 +18880,7 @@ impl Interpreter {
                     },
                 }
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
             "music_lyric"
             | "当前歌词"
             | "現在歌詞"
@@ -15623,7 +18902,7 @@ impl Interpreter {
                     .unwrap_or_default();
                 return Ok(Value::Str(line));
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
             "music_mic_pitch"
             | "麦克风音高"
             | "マイク音程"
@@ -15645,7 +18924,7 @@ impl Interpreter {
                 };
                 return Ok(Value::Number(hz as f64));
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
             "music_note_name"
             | "音名"
             | "音名称"
@@ -15661,7 +18940,7 @@ impl Interpreter {
                 let hz = self.arg_num(&args, 0, 0.0)? as f32;
                 return Ok(Value::Str(ling_music::note::hz_to_name(hz)));
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
             "music_hz"
             | "音符频率"
             | "音符周波数"
@@ -15679,7 +18958,7 @@ impl Interpreter {
                     ling_music::note::midi_to_hz(midi as f32) as f64
                 ));
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
             "music_pitch_score"
             | "音准评分"
             | "音程スコア"
@@ -15700,7 +18979,7 @@ impl Interpreter {
             },
 
             // ── MIDI (inaudible note source: drive coins, cues, etc.) ──
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
             "music_midi_load"
             | "载入MIDI"
             | "MIDI読込"
@@ -15733,7 +19012,7 @@ impl Interpreter {
                     },
                 }
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
             "music_midi_count"
             | "MIDI数量"
             | "MIDI数"
@@ -15755,7 +19034,7 @@ impl Interpreter {
                 return Ok(Value::Number(n as f64));
             },
             // music_midi_notes(id) -> flat [time, midi, time, midi, …]
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
             "music_midi_notes"
             | "MIDI音符"
             | "MIDIノート"
@@ -15779,7 +19058,7 @@ impl Interpreter {
                 return Ok(Value::List(Rc::new(out)));
             },
             // music_midi_bars(id) -> flat [time, midi, dur, …] (for karaoke note bars)
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
             "music_midi_bars"
             | "MIDI音条"
             | "MIDIバー"
@@ -15805,7 +19084,7 @@ impl Interpreter {
             },
 
             // music_fft(track_id, nbands) -> spectrum at the current playback position
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
             "music_fft"
             | "音乐频谱"
             | "音楽スペクトル"
@@ -15833,9 +19112,28 @@ impl Interpreter {
                     bands.into_iter().map(|x| Value::Number(x as f64)).collect(),
                 )));
             },
+            _ => {},
+        } }
+        if __ck <= 21 { __cl.at = 21; match name {
+
+            // music_fft_groups(track_id, size=8192, groups=7) -> `groups` log-spaced loudness values
+            // from a `size`-point FFT (size/2 frequency bands, 4096 for 8192) at the current playback
+            // position: one FFT per call, summed in Rust so a script reads a handful of numbers.
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
+            "music_fft_groups" => {
+                let id = self.arg_num(&args, 0, 0.0)? as i64;
+                let size = self.arg_num(&args, 1, 8192.0)?.max(64.0) as usize;
+                let groups = self.arg_num(&args, 2, 7.0)?.clamp(1.0, 256.0) as usize;
+                let pos = self.music.as_ref().map(|m| m.position()).unwrap_or(0.0);
+                let out = match self.tracks.get(id.max(0) as usize) {
+                    Some(t) if id >= 0 => ling_music::analysis::fft_groups_at_pos(&t.mono, t.rate, pos as f32, size, groups),
+                    _ => vec![0.0; groups],
+                };
+                return Ok(Value::List(Rc::new(out.into_iter().map(|x| Value::Number(x as f64)).collect())));
+            },
 
             // ── stop every one-shot SFX/morph/sample voice (scene cleanup) ──
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
             "audio_stop_sfx"
             | "停止音效"
             | "効果音停止"
@@ -15851,7 +19149,7 @@ impl Interpreter {
                 return Ok(Value::Unit);
             },
             // ── spatial (2D/3D/4D) one-shot SFX ──
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
             "audio_sfx"
             | "音效"
             | "空間効果音"
@@ -15881,7 +19179,7 @@ impl Interpreter {
             // โน้ตมอร์ฟ(x,y,z,w, freq, amp, dur, material, morph)
             //   material: 0 bowed-string · 1 plucked · 2 blown · 3 struck-metal
             //   morph:    0.0 light/acoustic .. 1.0 dark/digital
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
             "morph_note"
             | "โน้ตมอร์ฟ"
             | "变形音"
@@ -15906,7 +19204,7 @@ impl Interpreter {
                 return Ok(Value::Unit);
             },
             // ── sample load / positional play / loop / stop ──
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
             "audio_sample_load"
             | "载入采样"
             | "サンプル読込"
@@ -15940,7 +19238,7 @@ impl Interpreter {
                     },
                 }
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
             "audio_sample_play"
             | "播放采样"
             | "サンプル再生"
@@ -15976,7 +19274,7 @@ impl Interpreter {
             // stereo pan, same level regardless of listener position. For
             // VO/narration/UI cues, as opposed to audio_sample_play's
             // world-space sound effects (which fall off with camera distance).
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
             "audio_sample_play_flat"
             | "播放采样平"
             | "サンプル再生平"
@@ -15986,14 +19284,17 @@ impl Interpreter {
                 let vol = self.arg_num(&args, 1, 1.0)? as f32;
                 let looping = self.arg_num(&args, 2, 0.0)? > 0.5;
                 let pitch = self.arg_num(&args, 3, 1.0)? as f32;
+                // args 4/5: start offset + duration (seconds of source audio; 0 = all)
+                let offset = self.arg_num(&args, 4, 0.0)? as f32;
+                let dur = self.arg_num(&args, 5, 0.0)? as f32;
                 let v = self
                     .audio
                     .as_ref()
-                    .map(|a| a.play_sample_flat(id, vol, looping, pitch))
+                    .map(|a| a.play_sample_flat_ex(id, vol, looping, pitch, offset, dur))
                     .unwrap_or(0);
                 return Ok(Value::Number(v as f64));
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
             "audio_sample_stop"
             | "停止采样"
             | "サンプル停止"
@@ -16016,7 +19317,7 @@ impl Interpreter {
             // is invalid. Lets a cutscene pace itself off the real length of
             // whichever language's VO clip actually got loaded, instead of a
             // hand-measured constant that only covers one language.
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
             "audio_sample_duration"
             | "采样时长"
             | "サンプル長さ"
@@ -16031,7 +19332,7 @@ impl Interpreter {
                 return Ok(Value::Number(dur as f64));
             },
             // ── master FX: delay / reverb / low-pass (underwater) ──
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
             "audio_fx_delay"
             | "回声"
             | "ディレイ効果"
@@ -16052,7 +19353,7 @@ impl Interpreter {
                 }
                 return Ok(Value::Unit);
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
             "audio_fx_reverb"
             | "混响"
             | "リバーブ"
@@ -16071,7 +19372,7 @@ impl Interpreter {
                 }
                 return Ok(Value::Unit);
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
             "audio_fx_lowpass"
             | "低通滤波"
             | "ローパス"
@@ -16097,7 +19398,7 @@ impl Interpreter {
             // ══════════════════════════════════════════════════════════════════
 
             // ── soft bodies (deformable bouncy balls) ──
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "game"))]
             "soft_ball"
             | "软球"
             | "ソフトボール"
@@ -16125,7 +19426,7 @@ impl Interpreter {
                 self.soft_bodies.push(b);
                 return Ok(Value::Number(id as f64));
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "game"))]
             "soft_step"
             | "软体步进"
             | "ソフト更新"
@@ -16146,7 +19447,7 @@ impl Interpreter {
                 }
                 return Ok(Value::Unit);
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "game"))]
             "soft_bounce"
             | "软体落地"
             | "ソフト着地"
@@ -16167,7 +19468,7 @@ impl Interpreter {
                 }
                 return Ok(Value::Unit);
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "game"))]
             "soft_contain"
             | "软体边界"
             | "ソフト箱"
@@ -16197,7 +19498,7 @@ impl Interpreter {
                 }
                 return Ok(Value::Unit);
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "game"))]
             "soft_kick"
             | "软体踢"
             | "ソフト衝撃"
@@ -16222,7 +19523,7 @@ impl Interpreter {
             },
             // soft_spin(id, ax, ay, az, rate) — add angular velocity about the axis
             // through the centroid (rate = rad/step; ≈ surface_speed / radius to roll)
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "game"))]
             "soft_spin"
             | "软体自旋"
             | "ソフト回転"
@@ -16245,7 +19546,7 @@ impl Interpreter {
                 }
                 return Ok(Value::Unit);
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "game"))]
             "soft_deform"
             | "形变量"
             | "変形量"
@@ -16268,7 +19569,7 @@ impl Interpreter {
             },
             // soft_angular_speed(id) -> magnitude of the body's angular velocity
             // (how fast it is tumbling/rolling), derived from its node velocities.
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "game"))]
             "soft_angular_speed"
             | "软体角速"
             | "ソフト角速度"
@@ -16289,7 +19590,7 @@ impl Interpreter {
                     .unwrap_or(0.0);
                 return Ok(Value::Number(w as f64));
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "game"))]
             "soft_centroid"
             | "软体质心"
             | "ソフト重心"
@@ -16315,7 +19616,7 @@ impl Interpreter {
                 ])));
             },
             // soft_nodes(id) -> flat [x,y,z, x,y,z, …] for rendering the deformed mesh
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "game"))]
             "soft_nodes"
             | "软体节点"
             | "ソフト節点"
@@ -16341,7 +19642,7 @@ impl Interpreter {
             },
 
             // ── rigid bodies with angular dynamics ──
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "game"))]
             "rb_add"
             | "刚体添加"
             | "剛体追加"
@@ -16363,7 +19664,7 @@ impl Interpreter {
                 b.restitution = 0.6;
                 return Ok(Value::Number(self.rigid_world.add(b) as f64));
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "game"))]
             "rb_torque"
             | "扭矩"
             | "トルク"
@@ -16385,7 +19686,7 @@ impl Interpreter {
                 }
                 return Ok(Value::Unit);
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "game"))]
             "rb_spin"
             | "自旋"
             | "スピン"
@@ -16407,7 +19708,7 @@ impl Interpreter {
                 }
                 return Ok(Value::Unit);
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "game"))]
             "rb_impulse"
             | "刚体冲量"
             | "剛体インパルス"
@@ -16429,7 +19730,7 @@ impl Interpreter {
                 }
                 return Ok(Value::Unit);
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "game"))]
             "rb_floor"
             | "刚体落地"
             | "剛体着地"
@@ -16451,7 +19752,7 @@ impl Interpreter {
                 }
                 return Ok(Value::Unit);
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "game"))]
             "rb_gravity"
             | "刚体重力"
             | "剛体重力"
@@ -16470,7 +19771,7 @@ impl Interpreter {
                 self.rigid_world.gravity = ling_physics::Vec3::new(gx, gy, gz);
                 return Ok(Value::Unit);
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "game"))]
             "rb_step"
             | "刚体步进"
             | "剛体更新"
@@ -16487,7 +19788,7 @@ impl Interpreter {
                 self.rigid_world.step(dt);
                 return Ok(Value::Unit);
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "game"))]
             "rb_pos"
             | "刚体位置"
             | "剛体位置"
@@ -16513,7 +19814,10 @@ impl Interpreter {
                     Value::Number(p.z as f64),
                 ])));
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            _ => {},
+        } }
+        if __ck <= 22 { __cl.at = 22; match name {
+            #[cfg(all(not(target_arch = "wasm32"), feature = "game"))]
             "rb_rot"
             | "刚体旋转"
             | "剛体回転"
@@ -16542,7 +19846,6 @@ impl Interpreter {
             },
 
             // ── native-res mesh (.lmesh): load once, draw fast (unlit, per-tri colour) ──
-            #[cfg(not(target_arch = "wasm32"))]
             "mesh_load"
             | "โหลดเมช"
             | "载入网格"
@@ -16560,12 +19863,26 @@ impl Interpreter {
                 } else {
                     path.clone()
                 };
+                #[cfg(not(target_arch = "wasm32"))]
                 let bytes = match std::fs::read(&resolved) {
                     Ok(b) => b,
                     Err(e) => {
                         eprintln!("mesh_load failed ({path}): {e}");
                         return Ok(Value::Number(-1.0));
                     },
+                };
+                #[cfg(target_arch = "wasm32")]
+                let bytes = {
+                    let _ = &resolved;
+                    // Web runtime: the streamed-asset registry (src/assets.rs). Until the
+                    // host streams the file in, return -1 — callers retry next frame.
+                    match crate::assets::get(&path) {
+                        Some(b) => b,
+                        None => {
+                            crate::assets::request(&path);
+                            return Ok(Value::Number(-1.0));
+                        },
+                    }
                 };
                 if bytes.len() < 16 || &bytes[0..4] != b"LMSH" {
                     eprintln!("mesh_load: bad header ({path})");
@@ -16600,22 +19917,21 @@ impl Interpreter {
                     .push(crate::gfx::shapes::ColorMesh { pos, col, height });
                 return Ok(Value::Number(id as f64));
             },
-            #[cfg(target_arch = "wasm32")]
-            "mesh_load"
-            | "โหลดเมช"
-            | "载入网格"
-            | "メッシュ読込"
-            | "메시로드"
-            | "بارگذاری_مش"
-            | "حمّل_شبكة"
-            | "טען_רשת"
-            | "میش_لوڈ" => {
-                // Native .lmesh loading is file-system based and not wired for wasm yet.
-                // Return an invalid handle so scripts can choose a fallback path.
-                return Ok(Value::Number(-1.0));
+            // is_web() — true when running in the browser (wasm) build
+            "is_web" => {
+                return Ok(Value::Bool(cfg!(target_arch = "wasm32")));
             },
-            #[cfg(not(target_arch = "wasm32"))]
-            "mesh_draw"
+            // release a mesh's geometry (the id stays valid but draws nothing)
+            "mesh_free" => {
+                let id = self.arg_num(&args, 0, -1.)?;
+                if id >= 0.0 && (id as usize) < self.meshes.len() {
+                    let m = &mut self.meshes[id as usize];
+                    m.pos = Vec::new();
+                    m.col = Vec::new();
+                }
+                return Ok(Value::Unit);
+            },
+                                    "mesh_draw"
             | "วาดเมชสี"
             | "绘制网格"
             | "メッシュ描画"
@@ -16643,20 +19959,9 @@ impl Interpreter {
                 }
                 return Ok(Value::Unit);
             },
-            #[cfg(target_arch = "wasm32")]
-            "mesh_draw"
-            | "วาดเมชสี"
-            | "绘制网格"
-            | "メッシュ描画"
-            | "메시그리기"
-            | "رسم_مش_رنگی"
-            | "ارسم_شبكة_ملونة"
-            | "צייר_רשת_צבעונית"
-            | "رنگین_میش_کھینچو" => {
-                return Ok(Value::Unit);
-            },
-
+            
             // ── liquid sim (water + oil, immiscible) ──
+            #[cfg(feature = "game")]
             "liquid_new"
             | "新建液体"
             | "液体新規"
@@ -16676,6 +19981,7 @@ impl Interpreter {
                     .push(ling_physics::liquid::LiquidGrid::new(w, h));
                 return Ok(Value::Number(id as f64));
             },
+            #[cfg(feature = "game")]
             "liquid_set_colors"
             | "液体颜色"
             | "液体配色"
@@ -16697,6 +20003,7 @@ impl Interpreter {
                 }
                 return Ok(Value::Unit);
             },
+            #[cfg(feature = "game")]
             "liquid_splat"
             | "液体注入"
             | "液体追加"
@@ -16720,6 +20027,7 @@ impl Interpreter {
                 }
                 return Ok(Value::Unit);
             },
+            #[cfg(feature = "game")]
             "liquid_gravity"
             | "液体重力"
             | "液体重力ベクトル"
@@ -16740,6 +20048,7 @@ impl Interpreter {
                 }
                 return Ok(Value::Unit);
             },
+            #[cfg(feature = "game")]
             "liquid_step"
             | "液体步进"
             | "液体更新"
@@ -16764,6 +20073,7 @@ impl Interpreter {
             // an embarrassingly-parallel batch: a scene with many liquid surfaces
             // steps in one call that scales across cores instead of N serial
             // `liquid_step` calls.
+            #[cfg(feature = "game")]
             "liquid_step_all"
             | "液体全步进"
             | "液体全更新"
@@ -16778,6 +20088,7 @@ impl Interpreter {
                 return Ok(Value::Unit);
             },
             // liquid_rainbow(id, on) — colour the fluid as a flowing ROYGBIV marble
+            #[cfg(feature = "game")]
             "liquid_rainbow"
             | "液体彩虹"
             | "液体虹"
@@ -16798,6 +20109,7 @@ impl Interpreter {
                 return Ok(Value::Unit);
             },
             // liquid_mix(id) -> 0 (oil/water separated) .. 1 (fully intermixed)
+            #[cfg(feature = "game")]
             "liquid_mix"
             | "液体混合"
             | "液体混合度"
@@ -16815,7 +20127,7 @@ impl Interpreter {
                 return Ok(Value::Number(m as f64));
             },
             // liquid_draw(id, sx, sy, scale) — fast flat 2-D blit of the colour field
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "game"))]
             "liquid_draw"
             | "绘制液体"
             | "液体描画"
@@ -16861,6 +20173,7 @@ impl Interpreter {
             },
             // liquid_draw_surface(id, kind, cx,cy,cz, radius, height)
             //   kind: 0 plane · 1 sphere · 2 cylinder · 3 cone · 4 dome
+            #[cfg(feature = "game")]
             "liquid_draw_surface"
             | "液体贴面"
             | "液体曲面"
@@ -17105,7 +20418,7 @@ impl Interpreter {
             // typed-out, colour-coded text boxes. Markup: {n}name{/} {p}place{/}
             // {i}item{/}, \n newline, || page break.
             // ══════════════════════════════════════════════════════════════════
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "game"))]
             "dialog_show"
             | "对话显示"
             | "会話表示"
@@ -17123,7 +20436,7 @@ impl Interpreter {
                 self.dialog = Some(ling_game::dialog::Dialog::new(&text, cps));
                 return Ok(Value::Unit);
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "game"))]
             "dialog_step"
             | "对话步进"
             | "会話更新"
@@ -17142,7 +20455,7 @@ impl Interpreter {
                 }
                 return Ok(Value::Unit);
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "game"))]
             "dialog_advance"
             | "对话推进"
             | "会話送り"
@@ -17160,7 +20473,7 @@ impl Interpreter {
                 }
                 return Ok(Value::Unit);
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "game"))]
             "dialog_active"
             | "对话激活"
             | "会話中"
@@ -17180,7 +20493,7 @@ impl Interpreter {
                     .unwrap_or(false);
                 return Ok(Value::Bool(a));
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "game"))]
             "dialog_typing"
             | "对话打字"
             | "会話タイプ中"
@@ -17202,7 +20515,10 @@ impl Interpreter {
                     .unwrap_or(false);
                 return Ok(Value::Bool(a));
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            _ => {},
+        } }
+        if __ck <= 23 { __cl.at = 23; match name {
+            #[cfg(all(not(target_arch = "wasm32"), feature = "game"))]
             "dialog_close"
             | "对话关闭"
             | "会話閉じる"
@@ -17240,7 +20556,7 @@ impl Interpreter {
                 return Ok(Value::Unit);
             },
             // dialog_draw(x, y, w, h [, font_handle]) — draw the box + typed text
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "game"))]
             "dialog_draw"
             | "对话绘制"
             | "会話描画"
@@ -17269,7 +20585,7 @@ impl Interpreter {
             // script can't grow the buffer without bound.
             #[cfg(not(target_arch = "wasm32"))]
             "text_poll" => {
-                const TEXT_BUFFER_MAX: usize = 240;
+                const TEXT_BUFFER_MAX: usize = 16384;
                 // See key_down/key_pressed: our topmost fullscreen window can
                 // be visually in front without real Win32 keyboard focus, so
                 // WM_KEYDOWN/WM_CHAR (what minifb's get_keys_pressed reads)
@@ -17286,6 +20602,8 @@ impl Interpreter {
                             return Ok(Value::Str(self.text_buffer.clone()));
                         }
                         let shift = os_key_down(VK_SHIFT);
+                        // Ctrl / Alt shortcuts (Ctrl+V, Ctrl+A ...) are not typing: the letter must not land in the field
+                        let chord = os_key_down(0x11) || os_key_down(0x12);
                         let now = crate::runtime::now_secs();
                         let mut gfx = self.gfx.borrow_mut();
                         let back_idx = VK_BACK as usize;
@@ -17295,13 +20613,18 @@ impl Interpreter {
                             gfx.raw_keys_down_since[back_idx],
                             gfx.raw_keys_last_fire[back_idx],
                         );
+                        let hwnd = self.gfx.borrow().hwnd;
+                        // with keyboard focus, typed characters come from WM_CHAR (the OS
+                        // layout and IME); key polling only feeds Backspace then
+                        let focused = window_has_key_focus(hwnd);
+                        let composing = focused && ime_composing(hwnd);
                         if key_repeat_fire(
                             now,
                             back_down,
                             back_was,
                             &mut back_since,
                             &mut back_fire,
-                        ) {
+                        ) && !composing {
                             self.text_buffer.pop();
                         }
                         gfx.raw_keys_down_since[back_idx] = back_since;
@@ -17309,12 +20632,15 @@ impl Interpreter {
                         gfx.raw_keys_prev[back_idx] = back_down;
                         for &vk in TEXT_POLL_VKS {
                             let idx = (vk as usize) & 0xFF;
-                            let down = os_key_down(vk);
+                            let (down, tapped) = os_key_state(vk);
                             let was = gfx.raw_keys_prev[idx];
                             let (mut since, mut fire) =
                                 (gfx.raw_keys_down_since[idx], gfx.raw_keys_last_fire[idx]);
-                            if key_repeat_fire(now, down, was, &mut since, &mut fire) {
-                                if let Some(c) = vk_char(vk, shift) {
+                            // a tap that came and went between two polls counts once
+                            let quick = tapped && !down && !was;
+                            let altgr = os_key_down(0xA5);
+                            if (quick || key_repeat_fire(now, down, was, &mut since, &mut fire)) && !focused && (!chord || altgr) {
+                                if let Some(c) = vk_char_layout(vk, shift) {
                                     if self.text_buffer.chars().count() < TEXT_BUFFER_MAX {
                                         self.text_buffer.push(c);
                                     }
@@ -17323,6 +20649,15 @@ impl Interpreter {
                             gfx.raw_keys_down_since[idx] = since;
                             gfx.raw_keys_last_fire[idx] = fire;
                             gfx.raw_keys_prev[idx] = down;
+                        }
+                        // without focus nothing reaches WM_CHAR; with it, every character does
+                        let typed = crate::gfx::native_text_take(now);
+                        if focused {
+                            for c in typed {
+                                if self.text_buffer.chars().count() < TEXT_BUFFER_MAX {
+                                    self.text_buffer.push(c);
+                                }
+                            }
                         }
                         return Ok(Value::Str(self.text_buffer.clone()));
                     }
@@ -17338,19 +20673,36 @@ impl Interpreter {
                         None => (Vec::new(), false),
                     }
                 };
+                let chord = {
+                    let gfx = self.gfx.borrow();
+                    gfx.window.as_ref().map(|w| w.is_key_down(minifb::Key::LeftCtrl) || w.is_key_down(minifb::Key::RightCtrl) || w.is_key_down(minifb::Key::LeftAlt)).unwrap_or(false)
+                };
+                // characters come from WM_CHAR (keyboard layout, AltGr, dead keys, IME
+                // commits); the key list only supplies Backspace — mapping keys to
+                // characters here as well typed every letter twice on non-US layouts
+                let _ = (shift, chord);
                 for k in keys {
                     if k == minifb::Key::Backspace {
                         self.text_buffer.pop();
-                    } else if let Some(c) = key_char(k, shift) {
-                        if self.text_buffer.chars().count() < TEXT_BUFFER_MAX {
-                            self.text_buffer.push(c);
-                        }
+                    }
+                }
+                for c in crate::gfx::native_text_take(crate::runtime::now_secs()) {
+                    if self.text_buffer.chars().count() < TEXT_BUFFER_MAX {
+                        self.text_buffer.push(c);
                     }
                 }
                 return Ok(Value::Str(self.text_buffer.clone()));
             },
             #[cfg(target_arch = "wasm32")]
             "text_poll" => {
+                const TEXT_BUFFER_MAX: usize = 16384;
+                for ev in crate::gfx::wasm_text_drain() {
+                    if ev == "\u{8}" {
+                        self.text_buffer.pop();
+                    } else if self.text_buffer.chars().count() < TEXT_BUFFER_MAX {
+                        self.text_buffer.push_str(&ev);
+                    }
+                }
                 return Ok(Value::Str(self.text_buffer.clone()));
             },
             "text_get" => return Ok(Value::Str(self.text_buffer.clone())),
@@ -17386,6 +20738,92 @@ impl Interpreter {
             "record_count" => return Ok(Value::Number(self.record_n as f64)),
             // ── screenshot(mode) → PNG in ./screenshots/ with timestamp + mode + size ──
             #[cfg(not(target_arch = "wasm32"))]
+            // capture_png_b64(x, y, w, h) — a rectangle of the CURRENT frame
+            //   (inside a ui_begin layer: of the virtual UI canvas) PNG-encoded and
+            //   base64'd, e.g. to upload the HUD portrait as the website avatar.
+            //   "" if the rect is empty / off-screen.
+            #[cfg(not(target_arch = "wasm32"))]
+            "capture_png_b64" => {
+                let x0 = self.arg_num(&args, 0, 0.0)?.max(0.0) as usize;
+                let y0 = self.arg_num(&args, 1, 0.0)?.max(0.0) as usize;
+                let cw = self.arg_num(&args, 2, 0.0)?.max(0.0) as usize;
+                let ch = self.arg_num(&args, 3, 0.0)?.max(0.0) as usize;
+                let gfx = self.gfx.borrow();
+                let (w, h) = (gfx.width, gfx.height);
+                let x1 = (x0 + cw).min(w);
+                let y1 = (y0 + ch).min(h);
+                if x1 <= x0 || y1 <= y0 {
+                    return Ok(Value::Str(String::new()));
+                }
+                let mut rgb = Vec::with_capacity((x1 - x0) * (y1 - y0) * 3);
+                for y in y0..y1 {
+                    for x in x0..x1 {
+                        let p = gfx.buffer[y * w + x];
+                        rgb.push((p >> 16) as u8);
+                        rgb.push((p >> 8) as u8);
+                        rgb.push(p as u8);
+                    }
+                }
+                drop(gfx);
+                let mut png: Vec<u8> = Vec::new();
+                if let Some(img) = image::RgbImage::from_raw((x1 - x0) as u32, (y1 - y0) as u32, rgb) {
+                    let _ = img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png);
+                }
+                use base64::Engine as _;
+                return Ok(Value::Str(base64::engine::general_purpose::STANDARD.encode(&png)));
+            },
+            // region_save(id, x, y, w, h): copy a screen rectangle (e.g. a HUD portrait
+            // rendered this frame); region_restore(id, x, y) pastes it back → 1, or 0
+            // when there is no such region (render + save it then). Native only.
+            #[cfg(not(target_arch = "wasm32"))]
+            "region_save" => {
+                let id = self.arg_num(&args, 0, 0.0)? as i64;
+                let x0 = self.arg_num(&args, 1, 0.0)?.max(0.0) as usize;
+                let y0 = self.arg_num(&args, 2, 0.0)?.max(0.0) as usize;
+                let cw = self.arg_num(&args, 3, 0.0)?.max(0.0) as usize;
+                let ch = self.arg_num(&args, 4, 0.0)?.max(0.0) as usize;
+                let gfx = self.gfx.borrow();
+                let (w, h) = (gfx.width, gfx.height);
+                let x1 = (x0 + cw).min(w);
+                let y1 = (y0 + ch).min(h);
+                if x1 > x0 && y1 > y0 {
+                    let mut px = Vec::with_capacity((x1 - x0) * (y1 - y0));
+                    for y in y0..y1 {
+                        px.extend_from_slice(&gfx.buffer[y * w + x0..y * w + x1]);
+                    }
+                    REGIONS.with(|r| r.borrow_mut().insert(id, (x1 - x0, y1 - y0, w, h, px)));
+                }
+                return Ok(Value::Unit);
+            },
+            #[cfg(not(target_arch = "wasm32"))]
+            "region_restore" => {
+                let id = self.arg_num(&args, 0, 0.0)? as i64;
+                let x0 = self.arg_num(&args, 1, 0.0)?.max(0.0) as usize;
+                let y0 = self.arg_num(&args, 2, 0.0)?.max(0.0) as usize;
+                let mut gfx = self.gfx.borrow_mut();
+                let (w, h) = (gfx.width, gfx.height);
+                let ok = REGIONS.with(|r| {
+                    let r = r.borrow();
+                    let Some((rw, rh, sw, sh, px)) = r.get(&id) else { return false };
+                    if *sw != w || *sh != h || x0 + rw > w || y0 + rh > h {
+                        return false;
+                    }
+                    for y in 0..*rh {
+                        let d = (y0 + y) * w + x0;
+                        gfx.buffer[d..d + rw].copy_from_slice(&px[y * rw..(y + 1) * rw]);
+                    }
+                    true
+                });
+                return Ok(Value::Number(if ok { 1.0 } else { 0.0 }));
+            },
+            #[cfg(target_arch = "wasm32")]
+            "region_save" => { return Ok(Value::Unit); },
+            #[cfg(target_arch = "wasm32")]
+            "region_restore" => { return Ok(Value::Number(0.0)); },
+            #[cfg(target_arch = "wasm32")]
+            "capture_png_b64" => {
+                return Ok(Value::Str(String::new()));
+            },
             "screenshot" | "บันทึกภาพ" | "عکس‌صفحه" | "لقطة_شاشة" | "צילום_מסך" | "اسکرین_شاٹ" =>
             {
                 let mode = self.arg_str(&args, 0, "game");
@@ -17418,7 +20856,7 @@ impl Interpreter {
             // ── microphone → crypto donut ──
             // mic_capture() — append the latest mic samples to the record buffer
             // (call each frame while recording). Returns the buffer length.
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
             "mic_capture" => {
                 if let Some(mic) = self.mic.as_ref() {
                     let s = mic.latest_samples();
@@ -17432,7 +20870,7 @@ impl Interpreter {
                 return Ok(Value::Number(self.mic_buffer.len() as f64));
             },
             // mic_seed() — SHA3-256 hex of the recorded audio, usable as a donut seed
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio", feature = "crypto"))]
             "mic_seed" => {
                 let mut bytes = Vec::with_capacity(self.mic_buffer.len() * 4);
                 for f in &self.mic_buffer {
@@ -17440,13 +20878,59 @@ impl Interpreter {
                 }
                 return Ok(Value::Str(hex_encode(&ling_crypto::geo::holo_hash(&bytes))));
             },
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
             "mic_clear" => {
                 self.mic_buffer.clear();
                 return Ok(Value::Number(0.0));
             },
             // flush the 3-D depth queue onto the framebuffer WITHOUT presenting,
             // so 2-D UI drawn afterwards overlays the 3-D scene.
+            // flush_3d_clip(x, y, w, h) — flush the queued 3-D like flush_3d, but
+            //   keep the result only inside the rect (everything outside is
+            //   restored): a "picture-in-picture" 3-D view drawn straight into a
+            //   HUD box (portrait cams, the inventory doll).
+            "flush_3d_clip" => {
+                let cx = self.arg_num(&args, 0, 0.0)?.floor() as i64;
+                let cy = self.arg_num(&args, 1, 0.0)?.floor() as i64;
+                let cw = self.arg_num(&args, 2, 0.0)?.ceil() as i64;
+                let ch = self.arg_num(&args, 3, 0.0)?.ceil() as i64;
+                let mut gfx = self.gfx.borrow_mut();
+                if !gfx.depth_queue.is_empty() {
+                    let w = gfx.width;
+                    let h = gfx.height;
+                    let x0 = cx.clamp(0, w as i64) as usize;
+                    let y0 = cy.clamp(0, h as i64) as usize;
+                    let x1 = (cx + cw).clamp(0, w as i64) as usize;
+                    let y1 = (cy + ch).clamp(0, h as i64) as usize;
+                    // save the rect's surroundings by saving the whole frame (simple, one copy)
+                    let before = gfx.buffer.clone();
+                    let dt = gfx.depth_test;
+                    let reset_z = gfx.zbuf_needs_clear;
+                    let (bm, ba) = (gfx.blend, gfx.alpha);
+                    let aa = gfx.antialias;
+                    let queue = std::mem::take(&mut gfx.depth_queue);
+                    {
+                        let g = &mut *gfx;
+                        crate::gfx::raster::set_persp_zd(g.camera.zdist);
+                        let z = if dt { Some(&mut g.depth_buf) } else { None };
+                        queue.flush(&mut g.buffer, z, reset_z, w, h, aa);
+                    }
+                    let buf = &mut gfx.buffer;
+                    for y in 0..h {
+                        let inside_y = y >= y0 && y < y1;
+                        let row = y * w;
+                        if !inside_y {
+                            buf[row..row + w].copy_from_slice(&before[row..row + w]);
+                        } else {
+                            buf[row..row + x0].copy_from_slice(&before[row..row + x0]);
+                            buf[row + x1..row + w].copy_from_slice(&before[row + x1..row + w]);
+                        }
+                    }
+                    gfx.zbuf_needs_clear = false;
+                    gfx.depth_queue.set_state(bm, ba);
+                }
+                return Ok(Value::Unit);
+            },
             #[cfg(not(target_arch = "wasm32"))]
             "flush_3d" | "render_3d" => {
                 let mut gfx = self.gfx.borrow_mut();
@@ -17460,7 +20944,8 @@ impl Interpreter {
                     let queue = std::mem::take(&mut gfx.depth_queue);
                     {
                         let g = &mut *gfx;
-                        let z = if dt { Some(&mut g.depth_buf) } else { None };
+                        crate::gfx::raster::set_persp_zd(g.camera.zdist);
+                                let z = if dt { Some(&mut g.depth_buf) } else { None };
                         queue.flush(&mut g.buffer, z, reset_z, w, h, aa);
                     }
                     gfx.zbuf_needs_clear = false;
@@ -17481,7 +20966,8 @@ impl Interpreter {
                     let queue = std::mem::take(&mut gfx.depth_queue);
                     {
                         let g = &mut *gfx;
-                        let z = if dt { Some(&mut g.depth_buf) } else { None };
+                        crate::gfx::raster::set_persp_zd(g.camera.zdist);
+                                let z = if dt { Some(&mut g.depth_buf) } else { None };
                         queue.flush(&mut g.buffer, z, reset_z, w, h, aa);
                     }
                     gfx.zbuf_needs_clear = false;
@@ -17490,10 +20976,140 @@ impl Interpreter {
                 return Ok(Value::Unit);
             },
 
+            // ── set_cull(mode) — backface culling for draw_triangle_3d / mesh draws ──
+            //   0 off (double-sided, default) · 1 cull faces wound clockwise on screen
+            //   · 2 cull counter-clockwise · 3 auto: baked (mesh_bake_*) and textured
+            //   (txm_draw) meshes are culled only when closed, on the side their own
+            //   winding says is the back; open cards / cloth stay double-sided.
+            //   Tested on the projected (hyperbolic-warped, FOV-aware) triangle.
+            "set_cull"
+            | "ตัดด้านหลัง"
+            | "背面剔除"
+            | "背面カリング"
+            | "뒷면컬링"
+            | "تنظیم_حذف_پشت"
+            | "عيّن_إقصاء_الخلفية"
+            | "קבע_סילוק_גב"
+            | "پشت_حذف_مقرر_کرو"
+            | "définir_élimination_dos"
+            | "rückseiten_entfernen"
+            | "задать_отсечение_граней" => {
+                let mode = self.arg_num(&args, 0, 1.0)?.clamp(0.0, 3.0) as u8;
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    self.gfx.borrow_mut().cull = mode;
+                }
+                #[cfg(target_arch = "wasm32")]
+                let _ = mode;
+                return Ok(Value::Unit);
+            },
+            // ── raster layers: draw static scenery once, recall it every frame ──
+            // layer_save(id): flush pending 3-D, snapshot colour (+ depth when the
+            //   depth test is on). layer_restore(id) → 1 if restored (colour and
+            //   depth — later geometry is still occluded by it), 0 if no such layer
+            //   or the window was resized (re-render + layer_save then). Typical:
+            //   if moved or layer_restore(1) == 0 { clear; draw static; layer_save(1) }
+            //   …draw dynamic objects…; present()
+            "layer_save"
+            | "บันทึกเลเยอร์"
+            | "图层保存"
+            | "レイヤー保存"
+            | "레이어저장"
+            | "ذخیره_لایه"
+            | "احفظ_الطبقة"
+            | "שמור_שכבה"
+            | "پرت_محفوظ_کرو"
+            | "sauver_calque"
+            | "ebene_speichern"
+            | "сохранить_слой" => {
+                let id = self.arg_num(&args, 0, 0.0)? as i64;
+                #[cfg(not(target_arch = "wasm32"))]
+                self.gfx.borrow_mut().layer_save(id);
+                #[cfg(target_arch = "wasm32")]
+                let _ = id;
+                return Ok(Value::Unit);
+            },
+            "layer_restore"
+            | "คืนเลเยอร์"
+            | "图层恢复"
+            | "レイヤー復元"
+            | "레이어복원"
+            | "بازیابی_لایه"
+            | "استعد_الطبقة"
+            | "שחזר_שכבה"
+            | "پرت_بحال_کرو"
+            | "restaurer_calque"
+            | "ebene_wiederherstellen"
+            | "восстановить_слой" => {
+                let id = self.arg_num(&args, 0, 0.0)? as i64;
+                #[cfg(not(target_arch = "wasm32"))]
+                let ok = self.gfx.borrow_mut().layer_restore(id);
+                #[cfg(target_arch = "wasm32")]
+                let ok = { let _ = id; false };
+                return Ok(Value::Number(if ok { 1.0 } else { 0.0 }));
+            },
+            "layer_free"
+            | "ลบเลเยอร์"
+            | "图层释放"
+            | "レイヤー解放"
+            | "레이어해제"
+            | "آزادسازی_لایه"
+            | "حرر_الطبقة"
+            | "שחרר_שכבה"
+            | "پرت_آزاد_کرو"
+            | "libérer_calque"
+            | "ebene_freigeben"
+            | "освободить_слой" => {
+                let id = self.arg_num(&args, 0, 0.0)? as i64;
+                #[cfg(not(target_arch = "wasm32"))]
+                self.gfx.borrow_mut().layers.remove(&id);
+                #[cfg(target_arch = "wasm32")]
+                let _ = id;
+                return Ok(Value::Unit);
+            },
+
             // flush_post() — flush the 3-D queue like `flush_3d`, then run the
             // toon post-chain (SSAO → outlines → tone ramp → bloom → FXAA) over
             // the SCENE immediately. `present` skips the chain this frame, so
             // 2-D UI drawn after this call stays exact — no bloom/blur on HUDs.
+            // set_color_grade(preset, strength = 1): the color-grading LUT over the world layer
+            //   (gfx/grade.rs: "heavy" "warm" "cool" "vivid" "noir"; "off" clears) -> true when known
+            "set_color_grade" => {
+                let name = self.arg_str(&args, 0, "off");
+                let s = self.arg_num(&args, 1, 1.0)? as f32;
+                return Ok(Value::Bool(crate::gfx::grade::set_preset(&name, s)));
+            },
+            // set_color_grade_mix(a, b, t, strength = 1): look a blended toward look b by t
+            "set_color_grade_mix" => {
+                let a = self.arg_str(&args, 0, "off");
+                let b = self.arg_str(&args, 1, "off");
+                let t = self.arg_num(&args, 2, 0.0)? as f32;
+                let s = self.arg_num(&args, 3, 1.0)? as f32;
+                return Ok(Value::Bool(crate::gfx::grade::set_mix(&a, &b, t, s)));
+            },
+            // set_color_cycle(degrees, shadow_s = 61, mid_s = 37, high_s = 23): a slow hue flow over the
+            //   grade -- each brightness band oscillates by up to `degrees` on its own period (0 = off)
+            "set_color_cycle" => {
+                let d = self.arg_num(&args, 0, 0.0)? as f32;
+                let p = [self.arg_num(&args, 1, 61.0)? as f32, self.arg_num(&args, 2, 37.0)? as f32, self.arg_num(&args, 3, 23.0)? as f32];
+                crate::gfx::grade::set_cycle(d, p);
+                return Ok(Value::Unit);
+            },
+            // set_color_lut(path, strength = 1): a strip LUT image (N slices of NxN) -> true when loaded
+            #[cfg(not(target_arch = "wasm32"))]
+            "set_color_lut" => {
+                let path = self.arg_str(&args, 0, "");
+                let s = self.arg_num(&args, 1, 1.0)? as f32;
+                let ok = match image::open(&path) {
+                    Ok(img) => {
+                        let img = img.to_rgba8();
+                        let (w, h) = (img.width() as usize, img.height() as usize);
+                        crate::gfx::grade::set_from_strip(img.as_raw(), w, h, s)
+                    },
+                    Err(_) => false,
+                };
+                return Ok(Value::Bool(ok));
+            },
             "flush_post" | "post_now" | "포스트플러시" | "后期冲刷" => {
                 let mut gfx = self.gfx.borrow_mut();
                 if !gfx.depth_queue.is_empty() {
@@ -17506,7 +21122,8 @@ impl Interpreter {
                     let queue = std::mem::take(&mut gfx.depth_queue);
                     {
                         let g = &mut *gfx;
-                        let z = if dt { Some(&mut g.depth_buf) } else { None };
+                        crate::gfx::raster::set_persp_zd(g.camera.zdist);
+                                let z = if dt { Some(&mut g.depth_buf) } else { None };
                         queue.flush(&mut g.buffer, z, reset_z, w, h, aa);
                     }
                     gfx.zbuf_needs_clear = false;
@@ -17585,6 +21202,22 @@ impl Interpreter {
                 let e0 = self.arg_num(&args, 10, 0.)? as f32;
                 let e1 = self.arg_num(&args, 11, 0.)? as f32;
                 let e2 = self.arg_num(&args, 12, 0.)? as f32;
+                // view cull before building: a primitive whose bounding sphere is off
+                // screen or behind the camera would cost a mesh clone, transform,
+                // normals and lighting for zero pixels (sky clouds/islands, far
+                // monsters). Never while recording a display list (camera-free).
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let g = self.gfx.borrow();
+                    if g.mesh_capture.is_none() && g.width > 0 {
+                        if let Some(br) = crate::gfx::shapes::base_radius(kind, e0, e1, e2) {
+                            let r = br * sx.abs().max(sy.abs()).max(sz.abs());
+                            if !g.sphere_in_view([cx, cy, cz], r) {
+                                return Ok(Value::Unit);
+                            }
+                        }
+                    }
+                }
                 if let Some(mesh) = crate::gfx::shapes::build(
                     kind,
                     [cx, cy, cz, sx, sy, sz, rx, ry, rz],
@@ -17599,7 +21232,7 @@ impl Interpreter {
             },
 
             _ => {},
-        }
+        } }
 
         // `form` struct constructor: positional `Name(v0, v1, ...)`.
         if let Some(field_names) = self.structs.get(name).cloned() {
@@ -17629,6 +21262,11 @@ impl Interpreter {
         #[cfg(target_arch = "wasm32")]
         if let Some(v) = wasm_unsupported_builtin(name) {
             return Ok(v);
+        }
+
+        // A builtin of an install profile this build leaves out: say which one.
+        if let Some(msg) = profiles::missing_profile(name) {
+            return Err(EvalErr::from(msg));
         }
 
         Err(EvalErr::from(format!("unknown function '{name}'")))
@@ -17830,47 +21468,155 @@ impl Interpreter {
         routes: Vec<(String, String, Value)>,
     ) -> Result<Value, EvalErr> {
         for pending in rx {
-            let matched = routes.iter().find(|(m, p, _)| m == &pending.method && p == &pending.path);
-            let response = match matched {
-                Some((_, _, handler)) => {
-                    let req_value = Value::Struct {
-                        name: "Request".to_string(),
-                        fields: vec![
-                            ("method".to_string(), Value::Str(pending.method.clone())),
-                            ("path".to_string(), Value::Str(pending.path.clone())),
-                            ("query".to_string(), Value::Str(pending.query.clone())),
-                            ("body".to_string(), Value::Str(pending.body.clone())),
-                            ("cookie".to_string(), Value::Str(pending.cookie.clone())),
-                            ("authorization".to_string(), Value::Str(pending.authorization.clone())),
-                            ("client_ip".to_string(), Value::Str(pending.client_ip.clone())),
-                        ],
-                    };
-                    match self.call_value(handler.clone(), vec![req_value]) {
-                        Ok(v) => web::value_to_response(&v),
-                        Err(e) => web::HttpResponse {
-                            status: 500,
-                            content_type: "text/plain; charset=utf-8".to_string(),
-                            body: format!("handler error: {e:?}"),
-                            set_cookie: None,
-                            location: None,
-                        },
-                    }
-                },
-                None => web::HttpResponse {
-                    status: 404,
-                    content_type: "text/plain; charset=utf-8".to_string(),
-                    body: "not found".to_string(),
-                    set_cookie: None,
-                    location: None,
-                },
+            self.dispatch_http_request(pending, &routes);
+        }
+        Ok(Value::Unit)
+    }
+
+    /// Dispatch one request to whichever registered route closure matches
+    /// method+path, and answer it. One request, one response — shared by the
+    /// single-threaded drain loop and the pool's main-interpreter loop.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "web"))]
+    fn dispatch_http_request(
+        &mut self,
+        pending: web::PendingRequest,
+        routes: &[(String, String, Value)],
+    ) {
+        let matched = routes.iter().find(|(m, p, _)| m == &pending.method && p == &pending.path);
+        let response = match matched {
+            Some((_, _, handler)) => {
+                let req_value = http_request_value(&pending);
+                match self.call_value(handler.clone(), vec![req_value]) {
+                    Ok(v) => web::value_to_response(&v),
+                    Err(e) => http_plain_response(500, format!("handler error: {e:?}")),
+                }
+            },
+            None => http_plain_response(404, "not found".to_string()),
+        };
+        let _ = pending.respond_to.send(response);
+    }
+
+    /// `http_serve` with `workers > 1`: this (main) interpreter plus
+    /// `workers - 1` fresh worker interpreters all pull from the one request
+    /// queue, so one slow handler no longer stalls every other visitor.
+    /// `workers <= 1` falls through to the classic single-threaded loop —
+    /// existing sites behave exactly as before until they opt in.
+    ///
+    /// `Value` closures hold `Rc` and cannot cross threads, so each worker is
+    /// a fresh interpreter built the same way as a `thread_spawn` isolate: it
+    /// re-registers the program's *declarations* — top-level startup side
+    /// effects (the `start` do-block) run only in the main interpreter — and
+    /// resolves each route handler by function name in its own function
+    /// table. Handlers must therefore be named top-level functions when
+    /// workers are enabled; an inline closure handler is a startup error
+    /// here, not a silent misroute. Each worker opens its own SQLite
+    /// connection to the `db_open` path (SQLite writes still go one at a
+    /// time — WAL + busy_timeout make them queue), and every worker shares
+    /// this interpreter's async-jobs table, so an `http_post_async` job
+    /// started on one worker can be polled from another.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "web"))]
+    fn drain_http_requests_pool(
+        &mut self,
+        rx: std::sync::mpsc::Receiver<web::PendingRequest>,
+        routes: Vec<(String, String, Value)>,
+        workers: usize,
+    ) -> Result<Value, EvalErr> {
+        if workers <= 1 {
+            return self.drain_http_requests(rx, routes);
+        }
+
+        // Resolve every route handler back to its function name. A looked-up
+        // function value is an exact clone of its FnDef's (params, body)
+        // (see `lookup`), so a one-time structural match over the function
+        // table recovers the name; two functions with identical shape would
+        // dispatch identically, so a collision is harmless.
+        let mut by_shape: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        for (name, def) in &self.functions {
+            by_shape.insert(format!("{:?}|{:?}", def.params, def.body), name.clone());
+        }
+        let mut named_routes: Vec<(String, String, String)> = Vec::with_capacity(routes.len());
+        for (m, p, handler) in &routes {
+            let Value::Fn(params, body, _) = handler else {
+                return Err(EvalErr::from(format!(
+                    "http_serve: workers > 1, but route {m} {p} has a non-function handler"
+                )));
             };
-            let _ = pending.respond_to.send(response);
+            match by_shape.get(&format!("{params:?}|{body:?}")) {
+                Some(name) => named_routes.push((m.clone(), p.clone(), name.clone())),
+                None => {
+                    return Err(EvalErr::from(format!(
+                        "http_serve: with workers > 1 every route handler must be a named \
+                         top-level function (workers look handlers up by name), but the \
+                         handler for {m} {p} is an inline closure"
+                    )))
+                },
+            }
+        }
+
+        let program = self.program.clone().ok_or_else(|| {
+            EvalErr::from(
+                "http_serve: workers > 1 needs the interpreter's registered program \
+                 (run the script on the interpreter, e.g. `ling run --interp`)"
+                    .to_string(),
+            )
+        })?;
+        let source_dir = self.source_dir.clone();
+        let db_path = self.db_path.clone();
+        let jobs = self.async_jobs.clone();
+        let shared_rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
+        let named_routes = std::sync::Arc::new(named_routes);
+
+        let mut handles = Vec::new();
+        for i in 1..workers {
+            let rx = shared_rx.clone();
+            let program = program.clone();
+            let source_dir = source_dir.clone();
+            let db_path = db_path.clone();
+            let jobs = jobs.clone();
+            let named_routes = named_routes.clone();
+            let spawned = std::thread::Builder::new()
+                .name(format!("ling-http-worker-{i}"))
+                // Same reserved (lazily committed) stack as a thread_spawn
+                // isolate: the tree-walker recurses.
+                .stack_size(32 << 20)
+                .spawn(move || {
+                    http_worker_main(rx, program, source_dir, db_path, jobs, named_routes)
+                });
+            match spawned {
+                Ok(h) => handles.push(h),
+                Err(e) => eprintln!("http_serve: failed to start worker {i}: {e}"),
+            }
+        }
+        println!(
+            "http_serve: {} interpreters serving (main + {} workers)",
+            handles.len() + 1,
+            handles.len()
+        );
+
+        // The main interpreter is worker 0: same queue, dispatching through
+        // its registered closures exactly like the single-threaded path.
+        // Exactly one idle thread at a time holds the lock blocked in recv();
+        // it releases the lock before running the handler, so the next idle
+        // thread takes over the queue while this one works.
+        loop {
+            let pending = {
+                let guard = shared_rx.lock().unwrap_or_else(|e| e.into_inner());
+                guard.recv()
+            };
+            match pending {
+                Ok(p) => self.dispatch_http_request(p, &routes),
+                Err(_) => break, // server thread gone — nothing more will arrive
+            }
+        }
+        for h in handles {
+            let _ = h.join();
         }
         Ok(Value::Unit)
     }
 
     /// Read a list-of-strings argument as `Vec<String>` (empty if absent/not a list).
     /// Used by `run_process` for argv — never shell-interpreted, so no injection risk.
+    #[cfg_attr(not(feature = "proc"), allow(dead_code))]
     fn arg_list_str(&self, args: &[Value], n: usize) -> Vec<String> {
         match args.get(n) {
             Some(Value::List(v)) => v.iter().map(|x| x.to_string()).collect(),
@@ -17895,7 +21641,6 @@ impl Interpreter {
 
     /// Optional `r,g,b` colour override starting at arg `i` → packed 0x00RRGGBB,
     /// or `default` if those three numeric args aren't present.
-    #[cfg(not(target_arch = "wasm32"))]
     fn color_at(&self, args: &[Value], i: usize, default: u32) -> u32 {
         match (args.get(i), args.get(i + 1), args.get(i + 2)) {
             (Some(a), Some(b), Some(c)) => {
@@ -17911,7 +21656,7 @@ impl Interpreter {
     }
 
     /// A pitch argument: a note-name string (`"C4"`, `"A#3"`) or a numeric MIDI value.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), feature = "audio"))]
     fn pitch_arg(&self, args: &[Value], i: usize, default: i32) -> i32 {
         match args.get(i) {
             Some(Value::Str(s)) => ling_music::note::parse_pitch(s).unwrap_or(default),
@@ -17921,26 +21666,39 @@ impl Interpreter {
     }
 
     /// Current mouse position + left-button-down (native window only).
+    #[cfg(target_arch = "wasm32")]
+    fn mouse_now(&self) -> (f32, f32, bool) {
+        let k = ui_scale_now();
+        (crate::gfx::wasm_mouse_x() / k, crate::gfx::wasm_mouse_y() / k, crate::gfx::wasm_mouse_down())
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
+    #[cfg_attr(not(feature = "ui"), allow(dead_code))]
     fn mouse_now(&self) -> (f32, f32, bool) {
         let gfx = self.gfx.borrow();
         let (mx, my) = gfx
             .window
             .as_ref()
-            .and_then(|w| w.get_mouse_pos(minifb::MouseMode::Clamp))
+            .filter(|w| {
+                        // minifb panics clamping the mouse into a window with no client area (minimised)
+                        let (sw, sh) = w.get_size();
+                        sw > 0 && sh > 0
+                    })
+                    .and_then(|w| buffer_mouse_pos(w))
             .unwrap_or((0.0, 0.0));
         let down = gfx
             .window
             .as_ref()
             .map(|w| w.get_mouse_down(minifb::MouseButton::Left))
             .unwrap_or(false);
-        (mx, my, down)
+        let k = ui_scale_now();
+        (mx / k, my / k, down)
     }
 
     /// Rasterize a UI [`ling_ui::widgets::Draw`] into the framebuffer: filled
     /// polygons via the AA scanline fill, polylines via AA lines, honouring the
     /// current blend mode.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(feature = "ui")]
     fn draw_ui(&self, d: &ling_ui::widgets::Draw) {
         let mut gfx = self.gfx.borrow_mut();
         let (w, h, add) = (gfx.width, gfx.height, gfx.blend == 1);
@@ -18053,7 +21811,7 @@ impl Interpreter {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "game"))]
 /// Map a friendly button name (any vendor / d-pad alias) to a gamepad button.
 #[cfg(not(target_arch = "wasm32"))]
 fn parse_pad_button(name: &str) -> Option<ling_input::GamepadButton> {
@@ -18113,6 +21871,30 @@ fn str_to_minifb_key(name: &str) -> Option<minifb::Key> {
         "rctrl" | "rightctrl" => Key::RightCtrl,
         "lalt" | "leftalt" => Key::LeftAlt,
         "ralt" | "rightalt" => Key::RightAlt,
+        "f1" => Key::F1,
+        "f2" => Key::F2,
+        "f3" => Key::F3,
+        "f4" => Key::F4,
+        "f5" => Key::F5,
+        "f6" => Key::F6,
+        "f7" => Key::F7,
+        "f8" => Key::F8,
+        "f9" => Key::F9,
+        "f10" => Key::F10,
+        "f11" => Key::F11,
+        "f12" => Key::F12,
+        "capslock" => Key::CapsLock,
+        "minus" | "-" => Key::Minus,
+        "equals" | "=" | "plus" => Key::Equal,
+        "comma" | "," => Key::Comma,
+        "period" | "." => Key::Period,
+        "slash" | "/" => Key::Slash,
+        "semicolon" | ";" => Key::Semicolon,
+        "quote" | "'" => Key::Apostrophe,
+        "lbracket" | "[" => Key::LeftBracket,
+        "rbracket" | "]" => Key::RightBracket,
+        "backslash" => Key::Backslash,
+        "grave" | "`" => Key::Backquote,
         "tab" => Key::Tab,
         "backspace" => Key::Backspace,
         "delete" => Key::Delete,
@@ -18306,6 +22088,32 @@ fn apply_frame_pacing(win: &mut minifb::Window, vsync: bool) {
     }
 }
 
+/// The primary monitor as `(width, height, hz, dpi, bits per pixel)`, physical pixels.
+#[cfg(all(not(target_arch = "wasm32"), windows))]
+fn display_info() -> (i32, i32, i32, i32, i32) {
+    unsafe {
+        extern "system" {
+            fn SetProcessDPIAware() -> i32;
+            fn GetDC(hwnd: isize) -> isize;
+            fn ReleaseDC(hwnd: isize, hdc: isize) -> i32;
+            fn GetDeviceCaps(hdc: isize, index: i32) -> i32;
+        }
+        SetProcessDPIAware();
+        let (w, h, hz) = monitor_info();
+        let hdc = GetDC(0);
+        let (dpi, bpp) = if hdc != 0 { (GetDeviceCaps(hdc, 88), GetDeviceCaps(hdc, 12)) } else { (96, 32) };
+        if hdc != 0 {
+            ReleaseDC(0, hdc);
+        }
+        (w, h, hz, if dpi > 0 { dpi } else { 96 }, if bpp > 0 { bpp } else { 32 })
+    }
+}
+#[cfg(not(all(not(target_arch = "wasm32"), windows)))]
+fn display_info() -> (i32, i32, i32, i32, i32) {
+    let (w, h, hz) = monitor_info();
+    (w, h, hz, 96, 32)
+}
+
 /// Primary-monitor resolution and refresh rate as `(width, height, hz)`.
 /// `hz` falls back to 60 when the driver reports an unknown/`default` rate.
 #[cfg(all(not(target_arch = "wasm32"), windows))]
@@ -18329,6 +22137,89 @@ fn monitor_info() -> (i32, i32, i32) {
         }
         (w, h, hz)
     }
+}
+
+// ── scaled windows (open_window mode 2) ─────────────────────────────────────
+// The framebuffer keeps its logical size and minifb stretches it into the
+// client area with ScaleMode::AspectRatioStretch. minifb reports the cursor in
+// client pixels, so it is mapped back into framebuffer pixels here.
+#[cfg(not(target_arch = "wasm32"))]
+static SCALED_BUF: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(not(target_arch = "wasm32"))]
+fn set_scaled_buffer(on: bool, w: usize, h: usize) {
+    let v = if on { ((w as u64) << 32) | h as u64 } else { 0 };
+    SCALED_BUF.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+// -- UI scale layer (ui_begin / ui_end) -----------------------------------------
+// While a UI layer is open, 2-D drawing goes into an offscreen buffer at the
+// VIRTUAL size (real / scale) and the mouse + project_3d report virtual
+// coordinates, so a HUD laid out for one resolution scales to any other.
+thread_local! {
+    static UI_SCALE: std::cell::Cell<f32> = std::cell::Cell::new(1.0);
+}
+fn ui_scale_now() -> f32 {
+    UI_SCALE.with(|c| c.get())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn buffer_mouse_pos(win: &minifb::Window) -> Option<(f32, f32)> {
+    let v = SCALED_BUF.load(std::sync::atomic::Ordering::Relaxed);
+    if v == 0 {
+        return win.get_mouse_pos(minifb::MouseMode::Clamp);
+    }
+    let (bw, bh) = ((v >> 32) as f32, (v & 0xFFFF_FFFF) as f32);
+    let (cw, ch) = win.get_size();
+    let (cw, ch) = (cw as f32, ch as f32);
+    if cw < 1.0 || ch < 1.0 || bw < 1.0 || bh < 1.0 {
+        return None;
+    }
+    let (mx, my) = win.get_unscaled_mouse_pos(minifb::MouseMode::Pass)?;
+    // same letterbox maths as minifb's AspectRatioStretch blit
+    let (ba, wa) = (bw / bh, cw / ch);
+    let (dw, dh, ox, oy) = if ba > wa {
+        let dh = cw / ba;
+        (cw, dh, 0.0, (ch - dh) / 2.0)
+    } else {
+        let dw = ch * ba;
+        (dw, ch, (cw - dw) / 2.0, 0.0)
+    };
+    let x = ((mx - ox) * bw / dw).clamp(0.0, bw - 1.0);
+    let y = ((my - oy) * bh / dh).clamp(0.0, bh - 1.0);
+    Some((x, y))
+}
+
+/// Client-area size of a maximized window: the work area (screen minus
+/// taskbar) minus the title bar.
+#[cfg(all(not(target_arch = "wasm32"), windows))]
+fn work_area_client() -> (i32, i32) {
+    #[repr(C)]
+    struct RECT {
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+    }
+    extern "system" {
+        fn SystemParametersInfoW(action: u32, param: u32, pv: *mut RECT, winini: u32) -> i32;
+        fn GetSystemMetrics(index: i32) -> i32;
+    }
+    unsafe {
+        let mut r = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+        if SystemParametersInfoW(0x0030, 0, &mut r, 0) != 0 && r.right > r.left && r.bottom > r.top {
+            let caption = GetSystemMetrics(4); // SM_CYCAPTION
+            (r.right - r.left, (r.bottom - r.top - caption).max(1))
+        } else {
+            (GetSystemMetrics(0).max(1), GetSystemMetrics(1).max(1))
+        }
+    }
+}
+
+#[cfg(all(not(target_arch = "wasm32"), not(windows)))]
+fn work_area_client() -> (i32, i32) {
+    let (w, h) = native_screen_size();
+    (w as i32, h as i32)
 }
 
 /// Non-Windows native fallback: resolution from [`native_screen_size`]; refresh
@@ -18413,13 +22304,96 @@ DP-1 connected 2560x1440+1920+0
     }
 }
 
-/// Query the primary display resolution on non-Windows platforms.
-/// Falls back to 1920×1080 if the size cannot be determined.
+/// Query the primary display resolution on non-Windows platforms: the primary output's active mode
+/// from `xrandr` (X11 and XWayland), else the framebuffer's size (`/sys/class/graphics/fb0`), else
+/// 1920×1080. On macOS, `system_profiler` reports the main display.
 #[cfg(all(not(target_arch = "wasm32"), not(windows)))]
 fn native_screen_size() -> (f64, f64) {
-    // On Linux/macOS we don't have an easy dependency-free call; return a
-    // sensible default. Callers can always pass explicit dimensions.
+    if let Some((w, h)) = xrandr_primary_size() {
+        return (w as f64, h as f64);
+    }
+    #[cfg(target_os = "macos")]
+    if let Some((w, h)) = mac_main_display_size() {
+        return (w as f64, h as f64);
+    }
+    if let Ok(t) = std::fs::read_to_string("/sys/class/graphics/fb0/virtual_size") {
+        let v: Vec<f64> = t.trim().split(',').filter_map(|x| x.parse().ok()).collect();
+        if v.len() == 2 && v[0] >= 320.0 && v[1] >= 240.0 {
+            return (v[0], v[1]);
+        }
+    }
     (1920.0, 1080.0)
+}
+
+/// The primary (else the first connected) output's active mode from `xrandr --current`.
+#[cfg(all(not(target_arch = "wasm32"), not(windows)))]
+fn xrandr_primary_size() -> Option<(i32, i32)> {
+    let out = std::process::Command::new("xrandr").arg("--current").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_xrandr_size(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Pure parse for [`xrandr_primary_size`]: a `connected ... WxH+X+Y` line, the `primary` one first.
+#[cfg(all(not(target_arch = "wasm32"), not(windows)))]
+fn parse_xrandr_size(text: &str) -> Option<(i32, i32)> {
+    let geom = |line: &str| -> Option<(i32, i32)> {
+        line.split_whitespace().find_map(|tok| {
+            let (wh, _) = tok.split_once('+')?;
+            let (w, h) = wh.split_once('x')?;
+            Some((w.parse().ok()?, h.parse().ok()?))
+        })
+    };
+    let lines: Vec<&str> = text.lines().filter(|l| l.contains(" connected")).collect();
+    lines.iter().find(|l| l.contains(" primary")).and_then(|l| geom(l)).or_else(|| lines.iter().find_map(|l| geom(l)))
+}
+
+#[cfg(target_os = "macos")]
+fn mac_main_display_size() -> Option<(i32, i32)> {
+    let out = std::process::Command::new("system_profiler").arg("SPDisplaysDataType").output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    // "Resolution: 3024 x 1964 Retina" - the first display listed is the main one
+    let line = text.lines().find(|l| l.trim_start().starts_with("Resolution:"))?;
+    let nums: Vec<i32> = line.split(|c: char| !c.is_ascii_digit()).filter_map(|x| x.parse().ok()).collect();
+    if nums.len() >= 2 { Some((nums[0], nums[1])) } else { None }
+}
+
+/// Explain the usual reason for no sound on a Linux desktop (once).
+#[cfg(feature = "audio")]
+fn linux_audio_hint() {
+    #[cfg(target_os = "linux")]
+    {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let root = std::env::var("USER").map(|u| u == "root").unwrap_or(false) || std::env::var("HOME").map(|h| h == "/root").unwrap_or(false);
+            if root {
+                eprintln!("  (running as root: the desktop's sound server belongs to your user - run the game as your normal user for sound)");
+            } else {
+                eprintln!("  (no ALSA device: on a PipeWire / PulseAudio desktop install the ALSA bridge, e.g. pipewire-alsa or libasound2-plugins)");
+            }
+        });
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32"), not(windows)))]
+mod xrandr_size_tests {
+    use super::parse_xrandr_size;
+    #[test]
+    fn primary_wins() {
+        let t = "Screen 0: minimum 8 x 8, current 4480 x 1440
+DP-1 connected 1920x1080+2560+0 (normal)
+eDP-1 connected primary 2560x1440+0+0 (normal) 344mm x 194mm
+";
+        assert_eq!(parse_xrandr_size(t), Some((2560, 1440)));
+    }
+    #[test]
+    fn first_connected() {
+        let t = "HDMI-1 disconnected
+XWAYLAND0 connected 1920x1200+0+0 0mm x 0mm
+";
+        assert_eq!(parse_xrandr_size(t), Some((1920, 1200)));
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -18438,6 +22412,17 @@ struct LingProfileState {
     every: u64,
     frames: u64,
     calls: std::collections::HashMap<String, (u64, u128)>, // name -> (count, nanos)
+}
+
+thread_local! {
+    /// gltf LOD thresholds in projected pixels: (skip below, cached pose below)
+    static GLTF_LOD: std::cell::Cell<(f32, f32)> = std::cell::Cell::new((3.0, 50.0));
+    static GLTF_SKIN_CACHE: std::cell::RefCell<std::collections::HashMap<(usize, i64, usize, i64), std::rc::Rc<Vec<Vec<[f32; 3]>>>>> = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+thread_local! {
+    /// per gltf handle: (mesh count when measured, bind-pose bounding radius)
+    static GLTF_RADIUS: std::cell::RefCell<std::collections::HashMap<usize, (usize, f32)>> = std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
 thread_local! {
@@ -18622,4 +22607,160 @@ fn truncate_name(s: &str) -> String {
         t.push('…');
         t
     }
+}
+
+impl Interpreter {
+    /// Fail unless this isolate holds `cap` (LING_API.md §1). The main
+    /// thread (`caps == None`) holds every capability.
+    pub(crate) fn require_cap(&self, cap: &str) -> Result<(), EvalErr> {
+        match &self.caps {
+            None => Ok(()),
+            Some(set) if set.contains(cap) => Ok(()),
+            Some(_) => Err(EvalErr::Runtime(format!("capability \"{cap}\" not granted"))),
+        }
+    }
+}
+
+#[cfg(all(not(target_arch = "wasm32"), any(feature = "web", feature = "proc")))]
+fn procs() -> &'static std::sync::Mutex<(u32, HashMap<u32, (std::process::Child, Option<f64>)>)> {
+    static R: std::sync::OnceLock<std::sync::Mutex<(u32, HashMap<u32, (std::process::Child, Option<f64>)>)>> = std::sync::OnceLock::new();
+    R.get_or_init(|| std::sync::Mutex::new((0, HashMap::new())))
+}
+
+/// The `Request` struct value handed to a `.ling` route handler — one shape,
+/// shared by the main interpreter's dispatch and the `http_serve` workers'.
+#[cfg(all(not(target_arch = "wasm32"), feature = "web"))]
+fn http_request_value(p: &web::PendingRequest) -> Value {
+    Value::Struct {
+        name: "Request".to_string(),
+        fields: vec![
+            ("method".to_string(), Value::Str(p.method.clone())),
+            ("path".to_string(), Value::Str(p.path.clone())),
+            ("query".to_string(), Value::Str(p.query.clone())),
+            ("body".to_string(), Value::Str(p.body.clone())),
+            ("cookie".to_string(), Value::Str(p.cookie.clone())),
+            ("authorization".to_string(), Value::Str(p.authorization.clone())),
+            ("client_ip".to_string(), Value::Str(p.client_ip.clone())),
+        ],
+    }
+}
+
+/// A plain-text HTTP response (500s and 404s from the dispatch loops).
+#[cfg(all(not(target_arch = "wasm32"), feature = "web"))]
+fn http_plain_response(status: u16, body: String) -> web::HttpResponse {
+    web::HttpResponse {
+        status,
+        content_type: "text/plain; charset=utf-8".to_string(),
+        body,
+        set_cookie: None,
+        location: None,
+    }
+}
+
+/// Body of one `http_serve` worker thread (see `drain_http_requests_pool`).
+///
+/// Builds a fresh interpreter the way `thread_spawn` isolates do — register
+/// the program's declarations, never run the `start` entry, so startup side
+/// effects stay in the main interpreter — then pulls requests off the shared
+/// queue until the server closes it. Workers are first-party server code with
+/// the same trust as the main interpreter (`caps = None`), not sandboxed
+/// isolates: the worker count is set by the server's author, not by uploaded
+/// content. If a handler panics, the worker answers 500 and rebuilds its
+/// interpreter, so one poisoned request can't take the worker down for good.
+#[cfg(all(not(target_arch = "wasm32"), feature = "web"))]
+fn http_worker_main(
+    rx: std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<web::PendingRequest>>>,
+    program: std::sync::Arc<Program>,
+    source_dir: Option<std::path::PathBuf>,
+    db_path: Option<String>,
+    jobs: web::AsyncJobs,
+    routes: std::sync::Arc<Vec<(String, String, String)>>,
+) {
+    'rebuild: loop {
+        let mut it = Interpreter::new_isolate(Default::default());
+        it.caps = None;
+        it.source_dir = source_dir.clone();
+        // Pre-seed with the shared Arc so register_program skips its copy.
+        it.program = Some(program.clone());
+        if let Err(e) = it.register_program(&program) {
+            eprintln!("http_serve worker: failed to register program: {e}");
+            return;
+        }
+        it.async_jobs = jobs.clone();
+        if let Some(path) = &db_path {
+            match ling_http::rusqlite::Connection::open(path) {
+                Ok(conn) => {
+                    let _ = conn.execute_batch(
+                        "PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;",
+                    );
+                    it.db = Some(conn);
+                },
+                Err(e) => {
+                    eprintln!("http_serve worker: db_open '{path}': {e}");
+                    return;
+                },
+            }
+        }
+        loop {
+            let pending = {
+                let guard = rx.lock().unwrap_or_else(|e| e.into_inner());
+                guard.recv()
+            };
+            let Ok(pending) = pending else { return }; // server gone
+            let req_value = http_request_value(&pending);
+            let web::PendingRequest { method, path, respond_to, .. } = pending;
+            let matched = routes.iter().find(|(m, p, _)| *m == method && *p == path);
+            let response = match matched {
+                Some((_, _, fname)) => {
+                    let called = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        it.call_named(fname, vec![req_value], &new_env())
+                    }));
+                    match called {
+                        Ok(Ok(v)) | Ok(Err(EvalErr::Return(v))) => web::value_to_response(&v),
+                        Ok(Err(e)) => http_plain_response(500, format!("handler error: {e:?}")),
+                        Err(_) => {
+                            let _ = respond_to
+                                .send(http_plain_response(500, "handler panicked".to_string()));
+                            continue 'rebuild;
+                        },
+                    }
+                },
+                None => http_plain_response(404, "not found".to_string()),
+            };
+            let _ = respond_to.send(response);
+        }
+    }
+}
+
+/// Row-parallel helper for the full-frame UI layer copies (ui_begin/ui_end).
+#[cfg(not(target_arch = "wasm32"))]
+fn ui_par_rows<F: Fn(usize, &mut [u32]) + Sync + Send>(buf: &mut [u32], w: usize, f: F) {
+    use rayon::prelude::*;
+    if w == 0 {
+        return;
+    }
+    buf.par_chunks_mut(w).enumerate().for_each(|(y, r)| f(y, r));
+}
+#[cfg(target_arch = "wasm32")]
+fn ui_par_rows<F: Fn(usize, &mut [u32])>(buf: &mut [u32], w: usize, f: F) {
+    if w == 0 {
+        return;
+    }
+    buf.chunks_mut(w).enumerate().for_each(|(y, r)| f(y, r));
+}
+fn ui_par_copy(dst: &mut [u32], src: &[u32]) {
+    let n = dst.len().min(src.len());
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use rayon::prelude::*;
+        dst[..n].par_chunks_mut(64 * 1024).zip(src[..n].par_chunks(64 * 1024)).for_each(|(d, s)| d.copy_from_slice(s));
+    }
+    #[cfg(target_arch = "wasm32")]
+    dst[..n].copy_from_slice(&src[..n]);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+thread_local! {
+    /// region_save / region_restore: id -> (w, h, screen w, screen h, pixels)
+    static REGIONS: std::cell::RefCell<std::collections::HashMap<i64, (usize, usize, usize, usize, Vec<u32>)>> = std::cell::RefCell::new(std::collections::HashMap::new());
 }

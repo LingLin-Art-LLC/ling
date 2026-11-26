@@ -1,0 +1,17 @@
+[package]
+name = "ling-fxcore"
+version = "2030.0.1"
+edition = "2021"
+description = "LingStationX's effect DSP (ling-daw dsp/*fx*) as no_std + alloc, for the LingOS kernel DAW"
+license = "Apache-2.0 OR MIT"
+
+[dependencies]
+libm = "0.2"
+serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
+
+[dev-dependencies]
+ling-daw = { path = "../ling-daw" }
+
+[lib]
+name = "ling_fxcore"
+path = "src/lib.rs"

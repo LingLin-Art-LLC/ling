@@ -267,6 +267,91 @@ async fn stream_multipart_to_disk(req: Request) -> Result<String, Response> {
     Ok(body)
 }
 
+/// The in-browser editor shares memory between its threads (SharedArrayBuffer), which browsers only allow on a
+/// cross-origin-isolated page: COOP + COEP on that page and on the files it loads. Nothing else needs it, so nothing else gets it.
+async fn isolate_online(req: Request, next: axum::middleware::Next) -> Response {
+    let on = {
+        let p = req.uri().path();
+        p.starts_with("/studio/online") || p.starts_with("/static/webstudio/") || p.starts_with("/static/lsx/")
+    };
+    let mut r = next.run(req).await;
+    if on {
+        let h = r.headers_mut();
+        h.insert("cross-origin-opener-policy", axum::http::HeaderValue::from_static("same-origin"));
+        h.insert("cross-origin-embedder-policy", axum::http::HeaderValue::from_static("require-corp"));
+        h.insert("cross-origin-resource-policy", axum::http::HeaderValue::from_static("same-origin"));
+    }
+    r
+}
+
+/// The request's hostname, lower-cased, port stripped: the `Host` header
+/// (HTTP/1.1) or the URI authority (HTTP/2). "" if neither is present.
+fn request_host(req: &Request) -> String {
+    let raw = req
+        .headers()
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| req.uri().host())
+        .unwrap_or("");
+    // Strip a trailing `:port`, but not the colons inside a bare IPv6 literal.
+    let host = match raw.rsplit_once(':') {
+        Some((h, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => h,
+        _ => raw,
+    };
+    host.to_ascii_lowercase()
+}
+
+/// `http_vhost`: a request for one of the registered hostnames is either
+/// redirected (when the target is an `http(s)://` URL) or answered
+/// straight from that host's directory (served at the root, byte for byte),
+/// before the `http_static` prefixes and the Ling routes ever see it. A miss
+/// answers 404 with the directory's own `404.html` when there is one (mdBook
+/// and most static-site generators emit it).
+async fn vhost_static(
+    State(vhosts): State<std::sync::Arc<Vec<(String, String)>>>,
+    req: Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let host = request_host(&req);
+    let Some((_, dir)) = vhosts.iter().find(|(h, _)| *h == host) else {
+        return next.run(req).await;
+    };
+    // A URL target means "this host moved": 301 to the same path and query
+    // under that base (docs.example.org/a.html -> example.org/docs/a.html).
+    if dir.starts_with("http://") || dir.starts_with("https://") {
+        let mut to = format!("{}{}", dir.trim_end_matches('/'), req.uri().path());
+        if let Some(q) = req.uri().query() {
+            to.push('?');
+            to.push_str(q);
+        }
+        return match axum::http::HeaderValue::from_str(&to) {
+            Ok(loc) => {
+                let mut r = StatusCode::MOVED_PERMANENTLY.into_response();
+                r.headers_mut().insert(axum::http::header::LOCATION, loc);
+                r
+            },
+            Err(_) => (StatusCode::BAD_REQUEST, "bad redirect target").into_response(),
+        };
+    }
+    let mut serve = tower_http::services::ServeDir::new(dir);
+    match serve.try_call(req).await {
+        Ok(resp) if resp.status() == StatusCode::NOT_FOUND => {
+            let page = std::path::Path::new(dir).join("404.html");
+            match tokio::fs::read(&page).await {
+                Ok(bytes) => (
+                    StatusCode::NOT_FOUND,
+                    [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                    bytes,
+                )
+                    .into_response(),
+                Err(_) => resp.map(axum::body::Body::new),
+            }
+        },
+        Ok(resp) => resp.map(axum::body::Body::new),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("vhost: {e}")).into_response(),
+    }
+}
+
 async fn catch_all(State(state): State<ServerState>, req: Request) -> Response {
     let method = req.method().to_string();
     let path = req.uri().path().to_string();
@@ -323,6 +408,8 @@ async fn catch_all(State(state): State<ServerState>, req: Request) -> Response {
         String::from_utf8_lossy(&body_bytes).into_owned()
     };
 
+    // the embeddable player (/embed) is meant to be framed by other sites; every other page forbids it
+    let frameable = path.starts_with("/embed");
     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
     let sent = state.tx.send(PendingRequest {
         method,
@@ -365,14 +452,16 @@ async fn catch_all(State(state): State<ServerState>, req: Request) -> Response {
             // <iframe>/<frame>/<embed>. `X-Frame-Options: DENY` covers legacy
             // browsers; CSP `frame-ancestors 'none'` is the modern equivalent
             // (and the only one that reliably applies to `<embed>`/`<object>`).
-            r.headers_mut().insert(
-                axum::http::header::X_FRAME_OPTIONS,
-                axum::http::HeaderValue::from_static("DENY"),
-            );
-            r.headers_mut().insert(
-                axum::http::header::CONTENT_SECURITY_POLICY,
-                axum::http::HeaderValue::from_static("frame-ancestors 'none'"),
-            );
+            if !frameable {
+                r.headers_mut().insert(
+                    axum::http::header::X_FRAME_OPTIONS,
+                    axum::http::HeaderValue::from_static("DENY"),
+                );
+                r.headers_mut().insert(
+                    axum::http::header::CONTENT_SECURITY_POLICY,
+                    axum::http::HeaderValue::from_static("frame-ancestors 'none'"),
+                );
+            }
             r
         },
         Err(_) => (
@@ -405,10 +494,15 @@ pub enum TlsMode {
 /// `tower_http::services::ServeDir`, so binary files (fonts, images, zips)
 /// never have to round-trip through the `String`-typed `Value`/`PendingRequest`
 /// bridge that `.ling` route handlers use.
+///
+/// `vhosts` is `(hostname, disk_dir)` pairs registered via `http_vhost` — a
+/// request whose Host names one of them is served from that directory at the
+/// root, ahead of `static_dirs` and the Ling routes (see `vhost_static`).
 pub fn spawn_server(
     host: String,
     port: u16,
     static_dirs: Vec<(String, String)>,
+    vhosts: Vec<(String, String)>,
     tls: TlsMode,
 ) -> std::sync::mpsc::Receiver<PendingRequest> {
     let (tx, rx) = std::sync::mpsc::channel::<PendingRequest>();
@@ -441,7 +535,18 @@ pub fn spawn_server(
             let router: Router = router
                 .fallback(catch_all)
                 .layer(DefaultBodyLimit::disable())
+                .layer(axum::middleware::from_fn(isolate_online))
                 .with_state(state);
+            // Outermost layer, so a vhost request never reaches the prefixes
+            // or the Ling routes.
+            let router = if vhosts.is_empty() {
+                router
+            } else {
+                router.layer(axum::middleware::from_fn_with_state(
+                    std::sync::Arc::new(vhosts),
+                    vhost_static,
+                ))
+            };
             // ling-http's `dev-certs` feature is unconditionally enabled on
             // its dependency line in the root Cargo.toml (whenever this
             // `web` feature is on, so is that one), so serve_dev_tls is
@@ -544,7 +649,7 @@ impl AsyncJobs {
         let jobs = self.0.clone();
         let job_id = id.clone();
         async_runtime_handle().spawn(async move {
-            let client = reqwest::Client::new();
+            let client = if super::cookiejar::is_on() { super::cookiejar::client().clone() } else { reqwest::Client::new() };
             let result = client
                 .post(&url)
                 .header(reqwest::header::CONTENT_TYPE, content_type)
@@ -561,6 +666,33 @@ impl AsyncJobs {
             jobs.lock().unwrap().insert(job_id, Some(text));
         });
 
+        id
+    }
+
+    /// Starts a GET request in the background; returns a job id immediately.
+    /// The `http_get_async` twin of `start_post` — a page fetch that must not
+    /// block the caller's loop (Horizon polls while it keeps rendering).
+    pub fn start_get(&self, url: String) -> String {
+        let id = {
+            use rand::RngCore;
+            let mut buf = [0u8; 16];
+            rand::rngs::OsRng.fill_bytes(&mut buf);
+            buf.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        };
+        self.0.lock().unwrap().insert(id.clone(), None);
+        let jobs = self.0.clone();
+        let job_id = id.clone();
+        async_runtime_handle().spawn(async move {
+            let client = if super::cookiejar::is_on() { super::cookiejar::client().clone() } else { reqwest::Client::new() };
+            let text = match client.get(&url).send().await {
+                Ok(resp) => resp
+                    .text()
+                    .await
+                    .unwrap_or_else(|e| format!("ERROR: body read failed: {e}")),
+                Err(e) => format!("ERROR: {}", e.to_string().replace('"', "'")),
+            };
+            jobs.lock().unwrap().insert(job_id, Some(text));
+        });
         id
     }
 
@@ -810,10 +942,19 @@ pub fn get_blocking(url: &str) -> (u16, String) {
     let handle = async_runtime_handle();
     let url = url.to_string();
     handle.block_on(async move {
-        let client = reqwest::Client::new();
+        // a browser-shaped User-Agent: many sites refuse (or strip down) requests without one
+        let client = if super::cookiejar::is_on() {
+            super::cookiejar::client().clone()
+        } else {
+            reqwest::Client::builder()
+                .user_agent(BROWSER_UA)
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new())
+        };
         match client.get(&url).send().await {
             Ok(resp) => {
                 let status = resp.status().as_u16();
+                super::cookiejar::note_response(resp.url().as_str(), resp.headers());
                 let body = resp.text().await.unwrap_or_default();
                 (status, body)
             },
@@ -822,11 +963,78 @@ pub fn get_blocking(url: &str) -> (u16, String) {
     })
 }
 
+/// Fetches every address concurrently and blocks until all are in: the bodies in order, ""
+/// for one that failed or answered with an HTTP error.
+pub fn get_all_blocking(urls: &[String]) -> Vec<String> {
+    let handle = async_runtime_handle();
+    let urls = urls.to_vec();
+    handle.block_on(async move {
+        let client = if super::cookiejar::is_on() {
+            super::cookiejar::client().clone()
+        } else {
+            reqwest::Client::builder()
+                .user_agent(BROWSER_UA)
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new())
+        };
+        let jobs = urls.into_iter().map(|u| {
+            let client = client.clone();
+            tokio::spawn(async move {
+                match client.get(&u).send().await {
+                    Ok(resp) if resp.status().as_u16() < 400 => resp.text().await.unwrap_or_default(),
+                    _ => String::new(),
+                }
+            })
+        });
+        let mut out = Vec::new();
+        for j in jobs.collect::<Vec<_>>() {
+            out.push(j.await.unwrap_or_default());
+        }
+        out
+    })
+}
+
+const BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Horizon/1.0";
+
+/// Fetches `url` as raw bytes (images, media) with its content type, blocking the calling
+/// thread (callers run it on a worker thread of their own). No cookies and no Referer are
+/// sent. Bodies over `max` bytes are refused.
+pub fn get_bytes_blocking(url: &str, max: usize) -> Result<(Vec<u8>, String), String> {
+    let handle = async_runtime_handle();
+    let url = url.to_string();
+    handle.block_on(async move {
+        let client = if super::cookiejar::is_on() {
+            super::cookiejar::client().clone()
+        } else {
+            reqwest::Client::builder().user_agent(BROWSER_UA).build().map_err(|e| e.to_string())?
+        };
+        let resp = client.get(&url).send().await.map_err(|e| e.to_string())?;
+        let status = resp.status().as_u16();
+        if status >= 400 {
+            return Err(format!("HTTP {status}"));
+        }
+        if resp.content_length().is_some_and(|n| n as usize > max) {
+            return Err("too large".into());
+        }
+        let ctype = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
+        if bytes.len() > max {
+            return Err("too large".into());
+        }
+        Ok((bytes.to_vec(), ctype))
+    })
+}
+
 /// A background tokio runtime dedicated to `AsyncJobs`, independent of whether
 /// `http_serve`/`spawn_server`'s own server runtime is running — so
 /// `http_post_async` also works from a plain script, not just inside a route
 /// handler. Started lazily on first use and kept alive for the process lifetime.
-fn async_runtime_handle() -> tokio::runtime::Handle {
+pub(crate) fn async_runtime_handle() -> tokio::runtime::Handle {
     static HANDLE: std::sync::OnceLock<tokio::runtime::Handle> = std::sync::OnceLock::new();
     HANDLE
         .get_or_init(|| {

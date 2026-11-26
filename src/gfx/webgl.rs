@@ -41,6 +41,10 @@ struct State {
     tex: WebGlTexture,
     quad: WebGlBuffer,
     u_tex: WebGlUniformLocation,
+    /// the blit texture's current size (0 = not allocated) and the quad's attribute slot
+    tex_w: usize,
+    tex_h: usize,
+    a_pos: u32,
 }
 
 thread_local! {
@@ -89,7 +93,9 @@ in vec2 vUv;
 uniform sampler2D uTex;
 out vec4 fragColor;
 void main() {
-    fragColor = texture(uTex, vUv);
+    // the CPU framebuffer is uploaded as-is: each 0x00RRGGBB pixel's bytes are B,G,R,0
+    vec4 t = texture(uTex, vUv);
+    fragColor = vec4(t.b, t.g, t.r, 1.0);
 }
 "#;
 
@@ -188,8 +194,17 @@ pub fn init_canvas(canvas: web_sys::OffscreenCanvas) {
             tex,
             quad,
             u_tex,
+            tex_w: 0,
+            tex_h: 0,
+            a_pos: u32::MAX,
         });
     });
+}
+
+/// Run `f` with the WebGL2 context; `None` until `init_canvas` has run.
+#[cfg(feature = "gl-web")]
+pub(crate) fn with_ctx<R>(f: impl FnOnce(&Gl) -> R) -> Option<R> {
+    STATE.with(|cell| cell.borrow().as_ref().map(|s| f(&s.ctx)))
 }
 
 /// Return the current canvas backing-store dimensions.
@@ -339,6 +354,43 @@ pub fn flush(fill_r: f32, fill_g: f32, fill_b: f32, width: usize, height: usize)
     });
 }
 
+/// Resize the OffscreenCanvas backing store (live window resize / fullscreen).
+pub fn resize_canvas(width: usize, height: usize) {
+    STATE.with(|cell| {
+        if let Some(s) = cell.borrow().as_ref() {
+            s.canvas.set_width(width as u32);
+            s.canvas.set_height(height as u32);
+            s.ctx.viewport(0, 0, width as i32, height as i32);
+        }
+    });
+}
+
+/// Post the detached UI layer (RGBA, its own resolution) to the page, or an
+/// empty `{type:'ui', w:0}` when no UI was drawn this frame.
+pub fn post_ui(px: Option<Option<(Vec<u8>, usize, usize)>>) {
+    // None: the UI layer is identical to the last one posted — the page keeps it
+    let Some(px) = px else { return };
+    let global = js_sys::global();
+    let Ok(worker) = global.dyn_into::<web_sys::DedicatedWorkerGlobalScope>() else { return };
+    let msg = js_sys::Object::new();
+    let _ = js_sys::Reflect::set(&msg, &JsValue::from_str("type"), &JsValue::from_str("ui"));
+    match px {
+        Some((data, w, h)) => {
+            let arr = js_sys::Uint8ClampedArray::from(&data[..]);
+            let _ = js_sys::Reflect::set(&msg, &JsValue::from_str("w"), &JsValue::from(w as u32));
+            let _ = js_sys::Reflect::set(&msg, &JsValue::from_str("h"), &JsValue::from(h as u32));
+            let _ = js_sys::Reflect::set(&msg, &JsValue::from_str("data"), &arr);
+            let tr = js_sys::Array::new();
+            tr.push(&arr.buffer());
+            let _ = worker.post_message_with_transfer(&msg, &tr);
+        },
+        None => {
+            let _ = js_sys::Reflect::set(&msg, &JsValue::from_str("w"), &JsValue::from(0u32));
+            let _ = worker.post_message(&msg);
+        },
+    }
+}
+
 /// Upload the software framebuffer (`0x00RRGGBB`, row-major, top-left origin) as
 /// a texture and draw it across the whole canvas. This is the `present()` path:
 /// everything the CPU rasteriser produced — 3-D meshes, 2-D shapes, vector
@@ -352,42 +404,64 @@ pub fn blit_rgb(buffer: &[u32], width: usize, height: usize) {
         let Some(s) = opt.as_mut() else { return };
         let ctx = &s.ctx;
 
-        // 0x00RRGGBB → tightly packed RGBA8 (opaque).
+        // Upload the framebuffer AS-IS: no per-frame RGBA conversion or allocation.
+        // Each 0x00RRGGBB pixel is the bytes B,G,R,0 in memory; the blit shader
+        // swaps them back. The texture is allocated once per size, then updated in
+        // place (texSubImage2D) every frame.
         let n = width * height;
-        let mut px = Vec::with_capacity(n * 4);
-        for i in 0..n {
-            let c = buffer.get(i).copied().unwrap_or(0);
-            px.push(((c >> 16) & 0xFF) as u8);
-            px.push(((c >> 8) & 0xFF) as u8);
-            px.push((c & 0xFF) as u8);
-            px.push(255);
+        if buffer.len() < n {
+            return;
         }
-
+        // Safety: a u32 slice viewed as its bytes (alignment 1 <= 4, length n * 4);
+        // web-sys hands JS a view, consumed before anything can grow wasm memory.
+        let bytes = unsafe { std::slice::from_raw_parts(buffer.as_ptr() as *const u8, n * 4) };
         ctx.active_texture(Gl::TEXTURE0);
         ctx.bind_texture(Gl::TEXTURE_2D, Some(&s.tex));
-        ctx.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_MIN_FILTER, Gl::NEAREST as i32);
-        ctx.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_MAG_FILTER, Gl::NEAREST as i32);
-        ctx.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_WRAP_S, Gl::CLAMP_TO_EDGE as i32);
-        ctx.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_WRAP_T, Gl::CLAMP_TO_EDGE as i32);
-        let _ = ctx.tex_image_2d_with_i32_and_i32_and_i32_and_format_and_type_and_opt_u8_array(
-            Gl::TEXTURE_2D,
-            0,
-            Gl::RGBA as i32,
-            width as i32,
-            height as i32,
-            0,
-            Gl::RGBA,
-            Gl::UNSIGNED_BYTE,
-            Some(&px),
-        );
+        if s.tex_w != width || s.tex_h != height {
+            ctx.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_MIN_FILTER, Gl::NEAREST as i32);
+            ctx.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_MAG_FILTER, Gl::NEAREST as i32);
+            ctx.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_WRAP_S, Gl::CLAMP_TO_EDGE as i32);
+            ctx.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_WRAP_T, Gl::CLAMP_TO_EDGE as i32);
+            let _ = ctx.tex_image_2d_with_i32_and_i32_and_i32_and_format_and_type_and_opt_u8_array(
+                Gl::TEXTURE_2D,
+                0,
+                Gl::RGBA as i32,
+                width as i32,
+                height as i32,
+                0,
+                Gl::RGBA,
+                Gl::UNSIGNED_BYTE,
+                Some(bytes),
+            );
+            s.tex_w = width;
+            s.tex_h = height;
+        } else {
+            let _ = ctx.tex_sub_image_2d_with_i32_and_i32_and_u32_and_type_and_opt_u8_array(
+                Gl::TEXTURE_2D,
+                0,
+                0,
+                0,
+                width as i32,
+                height as i32,
+                Gl::RGBA,
+                Gl::UNSIGNED_BYTE,
+                Some(bytes),
+            );
+        }
 
         ctx.use_program(Some(&s.tex_prog));
         ctx.uniform1i(Some(&s.u_tex), 0);
         ctx.bind_buffer(Gl::ARRAY_BUFFER, Some(&s.quad));
-        let loc = ctx.get_attrib_location(&s.tex_prog, "aPos") as u32;
+        if s.a_pos == u32::MAX {
+            s.a_pos = ctx.get_attrib_location(&s.tex_prog, "aPos") as u32;
+        }
+        let loc = s.a_pos;
         ctx.enable_vertex_attrib_array(loc);
         ctx.vertex_attrib_pointer_with_i32(loc, 2, Gl::FLOAT, false, 0, 0);
         ctx.draw_arrays(Gl::TRIANGLES, 0, 6);
+
+        #[cfg(feature = "gl-web")]
+        crate::gfx::webgl_scene::draw(ctx, width, height);
 
         // Required so the OffscreenCanvas compositor reads the finished frame.
         ctx.flush();

@@ -6,7 +6,8 @@
 //! load a WAV background track with [`AudioEngine::load_bgm`].
 
 pub mod engine;
+mod hrtf;
 pub mod fft;
 
-pub use engine::{AudioEngine, ToneParams, Wave};
+pub use engine::{AudioEngine, DroneParams, ToneParams, Wave};
 pub use fft::{freq_texture, waveform_texture, CosPalette, FftAnalyzer, Window};

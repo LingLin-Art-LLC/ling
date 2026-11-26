@@ -26,6 +26,10 @@ pub struct CraneliftBackend {
     /// `without_kernel_symbols()` since nothing provides those symbols when
     /// linking a normal Windows/Linux/macOS executable.
     include_kernel: bool,
+    /// `Some(sym)`: emit the program as a bundled app — every function gets
+    /// local linkage and `__main__` is exported as `sym` — so it can be linked
+    /// into an image next to another compiled program without symbol clashes.
+    app_entry: Option<String>,
 }
 
 /// Render a single-line tqdm-style progress bar to stderr (overwriting in place
@@ -140,6 +144,10 @@ fn declare_runtime_functions(
             types::I64,
         ),
         ("ling_kernel_halt", &[], types::I64),
+        // aarch64/Raspberry Pi idle loop with a live on-screen uptime clock
+        // (proof-of-life substitute for `wfi` on Pi 5, which has no serial and
+        // no timer IRQs yet). No-op import on x86_64 (never called there).
+        ("ling_kernel_rpi_idle", &[], types::I64),
         ("ling_kernel_cli", &[], types::I64),
         ("ling_kernel_sti", &[], types::I64),
         ("ling_kernel_inb", &[types::I64], types::I64),
@@ -276,6 +284,7 @@ fn declare_runtime_functions(
             &[types::I64, types::I64, types::I64, types::I64],
             types::I64,
         ),
+        ("ling_kernel_wm_draw_cursor", &[types::I64, types::I64], types::I64),
         (
             "ling_kernel_fb_back_blend_rect",
             &[
@@ -379,6 +388,10 @@ fn declare_runtime_functions(
         ("ling_kernel_wm_draw_menu", &[], types::I64),
         ("ling_kernel_wm_logout_requested", &[], types::I64),
         ("ling_kernel_wm_clear_logout", &[], types::I64),
+        ("ling_kernel_wm_lock_due", &[], types::I64),
+        ("ling_kernel_wm_after_sign_in", &[], types::I64),
+        ("ling_kernel_user_unlock", &[types::I64], types::I64),
+        ("ling_kernel_user_current", &[], types::I64),
         ("ling_kernel_reboot", &[], types::I64),
         ("ling_kernel_poweroff", &[], types::I64),
         ("ling_kernel_browser_go", &[types::I64, types::I64], types::I64),
@@ -493,6 +506,8 @@ fn declare_runtime_functions(
         ("ling_kernel_services_boot_configure", &[], types::I64),
         ("ling_kernel_sshd_serve", &[], types::I64),
         ("ling_kernel_sshd_start", &[], types::I64),
+        ("ling_kernel_sshd_set", &[types::I64], types::I64),
+        ("ling_kernel_sshd_running", &[], types::I64),
         ("ling_kernel_services_ssh_enabled", &[], types::I64),
         ("ling_kernel_messenger_start", &[], types::I64),
         ("ling_kernel_locale_selected", &[], types::I64),
@@ -782,7 +797,16 @@ impl CraneliftBackend {
         flag_builder.set("is_pic", "true").unwrap();
         flag_builder.set("opt_level", "speed").unwrap();
         flag_builder.set("enable_alias_analysis", "true").unwrap();
-        flag_builder.set("enable_verifier", "false").unwrap();
+        // Stack probes: a function whose frame is larger than a page (a UI's frame function with hundreds of locals) must touch
+        // its stack a page at a time, or it jumps past the guard page Windows grows the stack with and faults on memory that was
+        // never committed (a release-build segfault on the first call into such a function).
+        flag_builder.set("enable_probestack", "true").unwrap();
+        flag_builder.set("probestack_strategy", "inline").unwrap();
+        // LING_AOT_VERIFY=1 turns Cranelift's IR verifier on: invalid IR from the
+        // translator then fails the build naming the function, instead of being
+        // encoded into instructions that fault at run time on the target.
+        let verify = std::env::var("LING_AOT_VERIFY").is_ok_and(|v| v == "1");
+        flag_builder.set("enable_verifier", if verify { "true" } else { "false" }).unwrap();
         let isa = isa_builder
             .finish(settings::Flags::new(flag_builder))
             .unwrap();
@@ -798,7 +822,14 @@ impl CraneliftBackend {
             builder_ctx: FunctionBuilderContext::new(),
             progress: false,
             include_kernel: true,
+            app_entry: None,
         }
+    }
+
+    /// Emit as a bundled app: functions local, `__main__` exported as `entry_sym`.
+    pub fn as_app(mut self, entry_sym: &str) -> Self {
+        self.app_entry = Some(entry_sym.to_string());
+        self
     }
 
     /// Enable a tqdm-style progress bar over the per-function codegen loop.
@@ -841,9 +872,12 @@ impl CodegenBackend for CraneliftBackend {
                 sig.params.push(AbiParam::new(types::I64));
             }
             sig.returns.push(AbiParam::new(types::I64));
-            let id = module
-                .declare_function(&func.name, Linkage::Export, &sig)
-                .unwrap();
+            let id = match &self.app_entry {
+                Some(sym) if func.name == "__main__" => module.declare_function(sym, Linkage::Export, &sig),
+                Some(_) => module.declare_function(&func.name, Linkage::Local, &sig),
+                None => module.declare_function(&func.name, Linkage::Export, &sig),
+            }
+            .unwrap();
             func_ids.insert(func.name.clone(), id);
             func_arities.insert(func.name.clone(), func.arg_count);
         }
@@ -939,10 +973,17 @@ impl CodegenBackend for CraneliftBackend {
                 func_arities: &func_arities,
                 nt: &num_types,
                 fname: &func.name,
+                // Ownership frees are JIT-only for now: the LingOS/ling-user
+                // runtime has no ling_retain, and AOT userland processes are
+                // short-lived (the OS reclaims at exit).
+                frees: false,
+                boxed_sweep: &[],
             };
             build_function_body(&mut builder, func, &blocks, &tctx);
             builder.finalize();
-            module.define_function(fid, &mut ctx).unwrap();
+            if let Err(e) = module.define_function(fid, &mut ctx) {
+                panic!("AOT codegen failed in function `{}`: {e:?}", func.name);
+            }
         }
         if show_progress {
             eprintln!();

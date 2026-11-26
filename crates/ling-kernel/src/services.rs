@@ -3,11 +3,11 @@
 //! via a small graphical prompt and persisted to lingfs `/services`, then
 //! honored (and reported) on every subsequent boot.
 //!
-//! Honest scope: this is the *service-management* half. A working sshd also
-//! needs server-side TCP (accept/listen -- netstack is client-only today) and
-//! the SSH transport itself (KEX/auth/channels -- a large protocol like TLS,
-//! built on `crypto.rs`). So an "enabled" service here is configured and
-//! announced at boot; the listener/protocol is the remaining work.
+//! The server itself is real now: `drivers::sshd` is a persistent background
+//! SSH + SFTP server (curve25519 KEX, ed25519 host key, chacha20-poly1305,
+//! password auth) over the netstack's listen/accept sockets. This module only
+//! manages the boot flag; `startup::set("ssh", ..)` / the console's
+//! `ssh-serve on|off` flip both the flag and the live listener.
 
 use crate::drivers::{font8x8, framebuffer, keyboard};
 use crate::fs::lingfs;
@@ -23,44 +23,84 @@ fn read_services(buf: &mut [u8; lingfs::BLOCK_SIZE]) -> Option<usize> {
     lingfs::read_file(SERVICES_PATH, buf).ok().flatten()
 }
 
+// In-memory copy of `/services`, so callers that poll every frame (the Startup
+// tab's os_service_enabled("ssh")) never touch storage: a lingfs read waits
+// behind any big background write (a LingScheduler screenshot) and froze the
+// desktop for seconds. 0 = not loaded yet, 1 = file missing, 2 = ssh 0, 3 = ssh 1.
+// Only set_ssh writes the file, and it updates this.
+static CACHE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+fn cached() -> u8 {
+    use core::sync::atomic::Ordering;
+    let c = CACHE.load(Ordering::Acquire);
+    if c != 0 {
+        return c;
+    }
+    let mut buf = [0u8; lingfs::BLOCK_SIZE];
+    let v = match read_services(&mut buf) {
+        None => 1,
+        Some(len) => {
+            let mut on = false;
+            for line in buf[..len].split(|&b| b == b'\n') {
+                let mut f = line.split(|&b| b == b' ' || b == b'\t').filter(|x| !x.is_empty());
+                if let (Some(name), Some(val)) = (f.next(), f.next()) {
+                    if name == b"ssh" {
+                        on = val == b"1";
+                        break;
+                    }
+                }
+            }
+            if on { 3 } else { 2 }
+        }
+    };
+    // Don't remember "missing" before the filesystem is up; it may just not be mounted yet.
+    if v != 1 || lingfs::is_mounted() {
+        CACHE.store(v, Ordering::Release);
+    }
+    v
+}
+
 /// Has the user been asked about services yet (does `/services` exist)?
 pub fn is_configured() -> bool {
-    let mut buf = [0u8; lingfs::BLOCK_SIZE];
-    read_services(&mut buf).is_some()
+    cached() != 1
 }
 
 /// Is the SSH server marked to start at boot?
 pub fn ssh_enabled() -> bool {
-    let mut buf = [0u8; lingfs::BLOCK_SIZE];
-    if let Some(len) = read_services(&mut buf) {
-        for line in buf[..len].split(|&b| b == b'\n') {
-            let mut f = line.split(|&b| b == b' ' || b == b'\t').filter(|x| !x.is_empty());
-            if let (Some(name), Some(val)) = (f.next(), f.next()) {
-                if name == b"ssh" {
-                    return val == b"1";
-                }
-            }
-        }
-    }
-    false
+    cached() == 3
 }
 
-/// Persist whether SSH should start at boot.
-pub fn set_ssh(on: bool) {
+/// Persist whether SSH should start at boot. Returns whether it was saved: a
+/// failed save used to vanish silently, leaving the switch to snap back at the
+/// next boot with nothing in the log to say why.
+pub fn set_ssh(on: bool) -> bool {
     let line: &[u8] = if on { b"ssh 1\n" } else { b"ssh 0\n" };
-    let _ = lingfs::write_file(SERVICES_PATH, line);
+    let saved = lingfs::write_file(SERVICES_PATH, line).is_ok();
+    // Re-read from storage next time if the save failed; otherwise we know the value.
+    CACHE.store(if saved { if on { 3 } else { 2 } } else { 0 }, core::sync::atomic::Ordering::Release);
+    if !saved {
+        crate::console_write(if lingfs::is_mounted() {
+            b"services: could not save the SSH setting (write to /services failed)\n".as_slice()
+        } else {
+            b"services: could not save the SSH setting (the filesystem is not mounted)\n".as_slice()
+        });
+    }
+    saved
 }
 
 /// Run once at boot: on first boot (no `/services` yet) ask whether to enable
 /// SSH, persist the answer, then report the SSH service state.
 pub fn boot_configure() {
+    if !lingfs::is_mounted() {
+        crate::console_write(b"services: lingfs is NOT mounted -- settings cannot be saved this boot\n");
+    }
     if !is_configured() && framebuffer::available() {
         prompt_ssh();
     }
     if ssh_enabled() {
-        crate::console_write(b"services: sshd enabled at boot (SSH transport is WIP)\n");
+        crate::console_write(b"services: SSH + SFTP server enabled at boot\n");
     } else {
-        crate::console_write(b"services: sshd off (enable with 'services enable ssh')\n");
+        crate::console_write(b"services: sshd off (enable with 'ssh-serve on')\n");
     }
 }
 

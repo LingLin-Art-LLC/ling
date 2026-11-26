@@ -18,6 +18,22 @@ pub struct FbInfo {
 
 static mut FB: Option<FbInfo> = None;
 
+// Overscan safe-area margin. The logical origin is inset by (OX, OY) from the
+// real top-left, and width()/height() report the reduced drawable area, so UI
+// laid out against those bounds lands fully inside a display that crops the
+// signal edges (common on HDMI panels/TVs — on the Pi 5 the visible area can
+// start a couple % in, so content at a true (0,0) gets clipped off the top-left
+// corner). aarch64/Pi sets this after framebuffer init; it stays 0 on x86_64
+// (VMs present the whole surface, no overscan), so set_pixel/fill_rect/width/
+// height are unchanged there.
+static mut OX: u32 = 0;
+static mut OY: u32 = 0;
+
+/// The largest screen: 2560x1600 on a PC (1440p / 1600p monitors run at
+/// their native mode), 1920x1080 on the Pi (its HDMI output and memory).
+#[cfg(target_arch = "x86_64")]
+const BACKBUFFER_MAX: usize = 2560 * 1600 * 4;
+#[cfg(not(target_arch = "x86_64"))]
 const BACKBUFFER_MAX: usize = 1920 * 1080 * 4;
 static mut BACKBUFFER: [u8; BACKBUFFER_MAX] = [0u8; BACKBUFFER_MAX];
 
@@ -78,6 +94,13 @@ pub fn init() {
                 let width = ptr::read_unaligned((base + 20) as *const u32);
                 let height = ptr::read_unaligned((base + 24) as *const u32);
                 let bpp = ptr::read_volatile((base + 28) as *const u8);
+                // UEFI + a discrete GPU: the framebuffer is in the card's BAR1,
+                // often far above the 4 GiB the boot page tables map
+                let size = pitch as u64 * height as u64;
+                if addr + size > 1 << 32 && !crate::arch::boot::map_high_early(addr, size) {
+                    crate::drivers::serial::write(b"framebuffer: above 4 GiB and not mappable; no screen\n");
+                    return;
+                }
                 ptr::write(
                     &raw mut FB,
                     Some(FbInfo { addr, pitch, width, height, bpp }),
@@ -91,11 +114,20 @@ pub fn init() {
     #[cfg(target_arch = "aarch64")]
     {
         if let Some((addr, pitch, width, height, bpp)) =
-            crate::arch::aarch64::mailbox::allocate_framebuffer(1024, 768, 32)
+            // 1280x720 (720p): a standard HDMI/TV mode. TVs often won't cleanly
+            // scan out the 4:3 1024x768 computer mode, and the firmware may give
+            // an odd surface for it. The firmware clamps to the display's real
+            // mode anyway, and we read the actual geometry back.
+            crate::arch::mailbox::allocate_framebuffer(1280, 720, 32)
         {
             unsafe {
                 ptr::write(&raw mut FB, Some(FbInfo { addr, pitch, width, height, bpp }));
             }
+            // Overscan safe area: pull all rendering in from the edges so a
+            // monitor that crops the HDMI signal (reported ~10px off the top-
+            // left on real Pi 5 hardware) doesn't clip the UI. Proportional
+            // (~2%) so it scales with resolution; the config screen can nudge it.
+            set_safe_margin(width / 48, height / 48);
         }
     }
 }
@@ -183,6 +215,7 @@ pub fn set_mode(w: u32, h: u32) -> bool {
     if !dispi::present() {
         return false;
     }
+    crate::drivers::cursor_overlay::forget();
     dispi::set(w as u16, h as u16);
     fb.width = w;
     fb.height = h;
@@ -194,9 +227,57 @@ pub fn set_mode(w: u32, h: u32) -> bool {
     true
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+/// The Pi: ask the firmware for a new surface (physical + virtual size), take
+/// whatever geometry it really gave (the Pi 5 quirks are handled in the
+/// mailbox code) and re-derive the overscan margin. The window layer re-sizes
+/// itself from `width()`/`height()` afterwards.
+#[cfg(target_arch = "aarch64")]
+pub fn set_mode(w: u32, h: u32) -> bool {
+    if w == 0 || h == 0 || (w as usize) * (h as usize) * 4 > BACKBUFFER_MAX {
+        return false;
+    }
+    let Some((addr, pitch, width, height, bpp)) = crate::arch::mailbox::allocate_framebuffer(w, h, 32) else {
+        return false;
+    };
+    unsafe {
+        ptr::write(&raw mut FB, Some(FbInfo { addr, pitch, width, height, bpp }));
+    }
+    set_safe_margin(width / 48, height / 48);
+    clear_physical(0);
+    // what the firmware really gave (its geometry / pitch / depth answers
+    // are not always what was asked): on the serial log for the test runs
+    let d = unsafe { crate::arch::mailbox::FB_DIAG };
+    crate::console_write(b"display: ");
+    crate::print_decimal(width as u64);
+    crate::console_write(b"x");
+    crate::print_decimal(height as u64);
+    crate::console_write(b" pitch ");
+    crate::print_decimal(pitch as u64);
+    crate::console_write(b" bpp ");
+    crate::print_decimal(bpp as u64);
+    crate::console_write(b" (phys ");
+    crate::print_decimal(d[0] as u64);
+    crate::console_write(b"x");
+    crate::print_decimal(d[1] as u64);
+    crate::console_write(b" virt ");
+    crate::print_decimal(d[2] as u64);
+    crate::console_write(b"x");
+    crate::print_decimal(d[3] as u64);
+    crate::console_write(b" size ");
+    crate::print_decimal(d[5] as u64);
+    crate::console_write(b")
+");
+    true
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub fn set_mode(_w: u32, _h: u32) -> bool {
     false
+}
+
+/// The surface's full size (before the overscan margin), for the mode row.
+pub fn mode_dims() -> (u32, u32) {
+    get().map(|f| (f.width, f.height)).unwrap_or((0, 0))
 }
 
 pub fn get() -> Option<FbInfo> {
@@ -208,16 +289,34 @@ pub fn available() -> bool {
 }
 
 pub fn width() -> u32 {
-    get().map(|f| f.width).unwrap_or(0)
+    get().map(|f| f.width).unwrap_or(0).saturating_sub(unsafe { OX } * 2)
 }
 
 pub fn height() -> u32 {
-    get().map(|f| f.height).unwrap_or(0)
+    get().map(|f| f.height).unwrap_or(0).saturating_sub(unsafe { OY } * 2)
+}
+
+/// Set the overscan safe-area margin (pixels inset on each edge). All direct
+/// framebuffer drawing shifts in by this and width()/height() shrink by twice
+/// it, so UI laid out against those bounds stays within a display that crops
+/// its edges. The Pi config screen exposes this as a live alignment nudge.
+pub fn set_safe_margin(ox: u32, oy: u32) {
+    unsafe {
+        OX = ox;
+        OY = oy;
+    }
+}
+
+/// Current overscan safe-area margin (pixels inset per edge).
+pub fn safe_margin() -> (u32, u32) {
+    unsafe { (OX, OY) }
 }
 
 pub fn set_pixel(x: u32, y: u32, color: u32) {
     unsafe {
         let Some(fb) = get() else { return };
+        let x = x + OX;
+        let y = y + OY;
         if x >= fb.width || y >= fb.height {
             return;
         }
@@ -231,6 +330,7 @@ pub fn set_pixel(x: u32, y: u32, color: u32) {
                 ptr::write_volatile(p.add(1), ((color >> 8) & 0xFF) as u8);
                 ptr::write_volatile(p.add(2), ((color >> 16) & 0xFF) as u8);
             },
+            2 => ptr::write_volatile(p as *mut u16, rgb565(color)),
             _ => {},
         }
     }
@@ -238,6 +338,7 @@ pub fn set_pixel(x: u32, y: u32, color: u32) {
 
 pub fn fill_rect(x: u32, y: u32, w: u32, h: u32, color: u32) {
     let Some(fb) = get() else { return };
+    let (x, y) = unsafe { (x + OX, y + OY) };
     if x >= fb.width || y >= fb.height {
         return;
     }
@@ -269,7 +370,217 @@ pub fn fill_rect(x: u32, y: u32, w: u32, h: u32, color: u32) {
                 }
             }
         }
+    } else if bypp == 2 {
+        let p16 = rgb565(color);
+        for row in y..y + h {
+            let row_start = (fb.addr + row as u64 * fb.pitch as u64 + x as u64 * 2) as *mut u16;
+            for col in 0..w as usize {
+                unsafe { ptr::write_volatile(row_start.add(col), p16) };
+            }
+        }
     }
+}
+
+/// Fill the WHOLE physical framebuffer, margin included, with one 0xRRGGBB
+/// color — so nothing drawn earlier (the boot banner) lingers in the overscan
+/// margin around a full-screen app.
+pub fn clear_physical(color: u32) {
+    let Some(fb) = get() else { return };
+    for y in 0..fb.height as usize {
+        let base = fb.addr as usize + y * fb.pitch as usize;
+        unsafe {
+            match fb.bpp {
+                32 => {
+                    let row = base as *mut u32;
+                    for x in 0..fb.width as usize {
+                        ptr::write_volatile(row.add(x), color);
+                    }
+                },
+                16 => {
+                    let row = base as *mut u16;
+                    for x in 0..fb.width as usize {
+                        ptr::write_volatile(row.add(x), rgb565(color));
+                    }
+                },
+                _ => {
+                    for x in 0..fb.width as usize * (fb.bpp as usize / 8) {
+                        ptr::write_volatile((base + x) as *mut u8, 0);
+                    }
+                },
+            }
+        }
+    }
+}
+
+/// Copy a whole `sw`×`sh` frame of 0xRRGGBB pixels to the live framebuffer at
+/// the safe-area origin, converting to the panel's format (32/24bpp, or the
+/// RGB565 the Pi 5 firmware scans out). One pass, row by row — the Ling app
+/// runtime's `present()`; far cheaper than per-pixel `set_pixel`.
+pub fn blit_rgb(src: &[u32], sw: usize, sh: usize) {
+    let Some(fb) = get() else { return };
+    let (ox, oy) = unsafe { (OX as usize, OY as usize) };
+    let (fw, fh) = (fb.width as usize, fb.height as usize);
+    if ox >= fw || oy >= fh || sw == 0 {
+        return;
+    }
+    let w = sw.min(fw - ox);
+    let h = sh.min(fh - oy).min(src.len() / sw);
+    let pitch = fb.pitch as usize;
+    // rows go to the screen in parallel bands over the cores (x86-64 SMP)
+    let (chunks, per) = crate::par::row_chunks(h, 64);
+    crate::par::for_each(chunks, &|c: usize| blit_rows(src, sw, w, ox, oy, pitch, fb.addr as usize, fb.bpp, c * per, ((c + 1) * per).min(h)));
+}
+
+#[allow(clippy::too_many_arguments)]
+fn blit_rows(src: &[u32], sw: usize, w: usize, ox: usize, oy: usize, pitch: usize, addr: usize, bpp: u8, y0: usize, y1: usize) {
+    for y in y0..y1 {
+        let row = &src[y * sw..y * sw + w];
+        let base = addr + (y + oy) * pitch;
+        unsafe {
+            match bpp {
+                32 => {
+                    let dst = (base + ox * 4) as *mut u32;
+                    ptr::copy_nonoverlapping(row.as_ptr(), dst, w);
+                },
+                16 => {
+                    // Two pixels per 32-bit store: the Pi's screen is write-combined
+                    // memory, so wide plain stores go several times faster than
+                    // one volatile 16-bit write per pixel.
+                    let dst = (base + ox * 2) as *mut u16;
+                    let mut x = 0usize;
+                    if (dst as usize) & 3 == 0 {
+                        let d32 = dst as *mut u32;
+                        while x + 1 < w {
+                            let v = rgb565(row[x]) as u32 | ((rgb565(row[x + 1]) as u32) << 16);
+                            ptr::write(d32.add(x / 2), v);
+                            x += 2;
+                        }
+                    }
+                    while x < w {
+                        ptr::write(dst.add(x), rgb565(row[x]));
+                        x += 1;
+                    }
+                },
+                24 => {
+                    let mut p = (base + ox * 3) as *mut u8;
+                    for &c in row {
+                        ptr::write_volatile(p, (c & 0xFF) as u8);
+                        ptr::write_volatile(p.add(1), ((c >> 8) & 0xFF) as u8);
+                        ptr::write_volatile(p.add(2), ((c >> 16) & 0xFF) as u8);
+                        p = p.add(3);
+                    }
+                },
+                _ => {},
+            }
+        }
+    }
+}
+
+/// Copy the `w`×`h` rectangle at (`x`, `y`) of a `stride`-wide 0xRRGGBB frame
+/// to the same place on the live framebuffer (safe-area origin) -- for
+/// partial updates (the boot screen re-blits only what animated).
+pub fn blit_rect(src: &[u32], stride: usize, x: usize, y: usize, w: usize, h: usize) {
+    let Some(fb) = get() else { return };
+    let (ox, oy) = unsafe { (OX as usize, OY as usize) };
+    let (fw, fh) = (fb.width as usize, fb.height as usize);
+    if x + ox >= fw || y + oy >= fh || stride == 0 {
+        return;
+    }
+    let w = w.min(fw - ox - x).min(stride.saturating_sub(x));
+    let h = h.min(fh - oy - y);
+    let pitch = fb.pitch as usize;
+    for row in 0..h {
+        let sy = y + row;
+        if (sy + 1) * stride > src.len() {
+            break;
+        }
+        let line = &src[sy * stride + x..sy * stride + x + w];
+        let base = fb.addr as usize + (sy + oy) * pitch;
+        let px = x + ox;
+        unsafe {
+            match fb.bpp {
+                32 => ptr::copy_nonoverlapping(line.as_ptr(), (base + px * 4) as *mut u32, w),
+                16 => {
+                    let dst = (base + px * 2) as *mut u16;
+                    let mut i = 0usize;
+                    if (dst as usize) & 3 == 0 {
+                        let d32 = dst as *mut u32;
+                        while i + 1 < w {
+                            ptr::write(d32.add(i / 2), rgb565(line[i]) as u32 | ((rgb565(line[i + 1]) as u32) << 16));
+                            i += 2;
+                        }
+                    }
+                    while i < w {
+                        ptr::write(dst.add(i), rgb565(line[i]));
+                        i += 1;
+                    }
+                },
+                24 => {
+                    let mut p = (base + px * 3) as *mut u8;
+                    for &c in line {
+                        ptr::write_volatile(p, (c & 0xFF) as u8);
+                        ptr::write_volatile(p.add(1), ((c >> 8) & 0xFF) as u8);
+                        ptr::write_volatile(p.add(2), ((c >> 16) & 0xFF) as u8);
+                        p = p.add(3);
+                    }
+                },
+                _ => {},
+            }
+        }
+    }
+}
+
+/// What is on the screen right now (the safe area), as 0xRRGGBB rows: the
+/// screenshot tool's source. Read back from the live surface rather than any
+/// back buffer because the Ling desktop blits its own frames straight there
+/// (`blit_rgb`) while the native window manager composes in `BACKBUFFER` --
+/// the screen is the one place both end up. Slow-ish (uncached video memory),
+/// but it runs once per capture.
+pub fn read_screen() -> Option<(alloc::vec::Vec<u32>, usize, usize)> {
+    let fb = get()?;
+    let (ox, oy) = unsafe { (OX as usize, OY as usize) };
+    let (w, h) = (width() as usize, height() as usize);
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let mut out = alloc::vec![0u32; w * h];
+    for y in 0..h {
+        let base = fb.addr as usize + (y + oy) * fb.pitch as usize;
+        let row = &mut out[y * w..(y + 1) * w];
+        unsafe {
+            match fb.bpp {
+                32 => ptr::copy_nonoverlapping((base + ox * 4) as *const u32, row.as_mut_ptr(), w),
+                24 => {
+                    for (x, d) in row.iter_mut().enumerate() {
+                        let p = (base + (ox + x) * 3) as *const u8;
+                        *d = ptr::read_volatile(p) as u32 | (ptr::read_volatile(p.add(1)) as u32) << 8 | (ptr::read_volatile(p.add(2)) as u32) << 16;
+                    }
+                },
+                16 => {
+                    for (x, d) in row.iter_mut().enumerate() {
+                        let v = ptr::read_volatile((base + (ox + x) * 2) as *const u16) as u32;
+                        let (r, g, b) = ((v >> 11) & 0x1F, (v >> 5) & 0x3F, v & 0x1F);
+                        *d = (r << 3 | r >> 2) << 16 | (g << 2 | g >> 4) << 8 | (b << 3 | b >> 2);
+                    }
+                },
+                _ => return None,
+            }
+        }
+        for d in row.iter_mut() {
+            *d &= 0xFF_FFFF;
+        }
+    }
+    Some((out, w, h))
+}
+
+/// Pack a 0xRRGGBB color into 16-bit RGB565, for the 16bpp framebuffer the
+/// Pi 5 firmware sometimes hands back regardless of the requested depth.
+#[inline]
+fn rgb565(color: u32) -> u16 {
+    let r = (color >> 16) & 0xFF;
+    let g = (color >> 8) & 0xFF;
+    let b = color & 0xFF;
+    ((((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3)) & 0xFFFF) as u16
 }
 
 pub fn clear(color: u32) {
@@ -371,6 +682,25 @@ pub fn back_set_pixel(x: u32, y: u32, color: u32) {
             buf[offset + 2] = ((color >> 16) & 0xFF) as u8;
         },
         _ => {},
+    }
+}
+
+/// The back buffer's pixel at (x, y) as 0xRRGGBB (0 off-screen); for blending overlays.
+pub fn back_get_pixel(x: u32, y: u32) -> u32 {
+    let Some(fb) = get() else { return 0 };
+    if x >= fb.width || y >= fb.height {
+        return 0;
+    }
+    let bypp = fb.bpp as u32 / 8;
+    let offset = y as usize * fb.pitch as usize + x as usize * bypp as usize;
+    if offset + bypp as usize > BACKBUFFER_MAX {
+        return 0;
+    }
+    let buf = back_buf();
+    match bypp {
+        4 => u32::from_le_bytes([buf[offset], buf[offset + 1], buf[offset + 2], 0]),
+        3 => buf[offset] as u32 | (buf[offset + 1] as u32) << 8 | (buf[offset + 2] as u32) << 16,
+        _ => 0,
     }
 }
 
@@ -589,14 +919,183 @@ pub fn back_blend_rounded_rect(x: u32, y: u32, w: u32, h: u32, radius: u32, colo
 static mut PRESENT_HZ: u32 = 60;
 static mut LAST_PRESENT_US: u64 = 0;
 
+// The monitor's own refresh, from lingboot's `edid=WxH@HZ` command-line word
+// (read from the EDID's preferred timing). It replaces the 60 Hz default the
+// first time anyone asks; a rate chosen in Settings (set_present_hz) wins.
+static mut HZ_HINT_DONE: bool = false;
+static mut EDID_LINE: Option<alloc::string::String> = None;
+
+/// The boot command line's `edid=` word (e.g. "2560x1440@144"), if lingboot
+/// read the monitor's EDID.
+pub fn edid_summary() -> Option<alloc::string::String> {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        if (*(&raw const EDID_LINE)).is_none() {
+            let line = crate::arch::bootmodule::cmdline().unwrap_or_default();
+            let w = line.split_whitespace().find_map(|w| w.strip_prefix("edid=")).map(alloc::string::String::from);
+            *(&raw mut EDID_LINE) = Some(w.unwrap_or_default());
+        }
+        return (*(&raw const EDID_LINE)).clone().filter(|s| !s.is_empty());
+    }
+    #[allow(unreachable_code)]
+    None
+}
+
+fn apply_hz_hint() {
+    unsafe {
+        if HZ_HINT_DONE {
+            return;
+        }
+        HZ_HINT_DONE = true;
+    }
+    if let Some(e) = edid_summary() {
+        if let Some(hz) = e.split('@').nth(1).and_then(|h| h.parse::<u32>().ok()).filter(|&h| (24..=500).contains(&h)) {
+            unsafe { PRESENT_HZ = hz };
+        }
+    }
+}
+
 pub fn set_present_hz(hz: u32) {
-    unsafe { PRESENT_HZ = hz };
+    unsafe {
+        HZ_HINT_DONE = true;
+        HZ_AUTO = false;
+        PRESENT_HZ = hz
+    };
+}
+
+/// The frame cap follows the monitor (its EDID refresh, else 60 Hz) until a
+/// rate is chosen; Settings' "Auto" puts it back.
+static mut HZ_AUTO: bool = true;
+pub fn set_present_auto() {
+    unsafe {
+        HZ_HINT_DONE = true;
+        HZ_AUTO = true;
+        PRESENT_HZ = match monitor_hz() {
+            0 => 60,
+            h => h,
+        };
+    }
+}
+pub fn present_auto() -> bool {
+    unsafe { HZ_AUTO }
 }
 pub fn present_hz() -> u32 {
+    apply_hz_hint();
     unsafe { PRESENT_HZ }
 }
 
+// ── What the monitor says about itself (Settings > Display, `display_info`) ──
+// lingboot reads the EDID base block through the firmware (EFI_EDID_ACTIVE /
+// DISCOVERED) and passes: `edid=WxH@HZ` (preferred timing), `edidmm=WxH`
+// (picture size in mm), `edidmax=HZ` (range-limits top refresh) and
+// `edidname=NAME`. A BIOS / GRUB boot and QEMU's bochs display have none of
+// them: the refresh is then unknown (0) and the frame cap stays at 60 Hz.
+
+/// One `key=value` word of the boot command line.
+fn boot_word(key: &str) -> Option<alloc::string::String> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let line = crate::arch::bootmodule::cmdline().unwrap_or_default();
+        let pre = alloc::format!("{key}=");
+        return line.split_whitespace().find_map(|w| w.strip_prefix(pre.as_str())).map(alloc::string::String::from);
+    }
+    #[allow(unreachable_code)]
+    {
+        let _ = key;
+        None
+    }
+}
+
+fn pair(s: &str) -> Option<(u32, u32)> {
+    let (a, b) = s.split_once('x')?;
+    Some((a.parse().ok()?, b.parse().ok()?))
+}
+
+/// The monitor's own refresh (its preferred timing), 0 when unknown.
+pub fn monitor_hz() -> u32 {
+    edid_summary().and_then(|e| e.split('@').nth(1).and_then(|h| h.parse::<u32>().ok())).filter(|&h| (24..=500).contains(&h)).unwrap_or(0)
+}
+
+/// The monitor's native resolution (EDID preferred timing).
+pub fn monitor_native() -> Option<(u32, u32)> {
+    edid_summary().and_then(|e| e.split('@').next().and_then(pair))
+}
+
+/// The highest refresh the monitor accepts (EDID range limits), 0 when unknown.
+pub fn monitor_max_hz() -> u32 {
+    boot_word("edidmax").and_then(|h| h.parse::<u32>().ok()).filter(|&h| (24..=1000).contains(&h)).unwrap_or(0)
+}
+
+/// The monitor's picture size in mm.
+pub fn monitor_mm() -> Option<(u32, u32)> {
+    boot_word("edidmm").and_then(|s| pair(&s)).filter(|&(w, h)| w > 0 && h > 0)
+}
+
+/// The monitor's name from its EDID ("" when unknown).
+pub fn monitor_name() -> alloc::string::String {
+    boot_word("edidname").map(|n| n.replace('_', " ")).unwrap_or_default()
+}
+
+/// Colour depth of the live mode in bits per pixel.
+pub fn depth() -> u32 {
+    get().map(|f| f.bpp as u32).unwrap_or(0)
+}
+
+/// Dots per inch of the screen at the live mode: from the monitor's size in mm
+/// when the EDID gave it (a mode smaller than the panel is scaled across all
+/// of it, so it is the mode's width over the panel's width), else 96.
+pub fn dpi() -> u32 {
+    let w = width();
+    match monitor_mm() {
+        Some((wmm, _)) if w > 0 => ((w as u64 * 254 + wmm as u64 * 5) / (wmm as u64 * 10)).clamp(48, 600) as u32,
+        _ => 96,
+    }
+}
+
+/// Where the display facts come from: "EDID" (lingboot read the monitor),
+/// "VM" (bochs DISPI: QEMU / VirtualBox), else "firmware".
+pub fn info_source() -> &'static str {
+    if edid_summary().is_some() {
+        "EDID"
+    } else if dispi_capable() {
+        "VM"
+    } else {
+        "firmware"
+    }
+}
+
+/// Exchange a 0xRRGGBB patch with the 32bpp back buffer at its place (twice =
+/// a no-op): overlays a notice for one `present` without owning the frame.
+#[cfg(target_arch = "x86_64")]
+fn swap_back_rect(t: &mut crate::drivers::screenshot::Patch) {
+    let Some(fb) = get() else { return };
+    if fb.bpp != 32 {
+        return;
+    }
+    let buf = back_buf();
+    for row in 0..t.h {
+        let y = t.y + row;
+        if y >= fb.height as usize {
+            break;
+        }
+        for col in 0..t.w.min((fb.width as usize).saturating_sub(t.x)) {
+            let o = y * fb.pitch as usize + (t.x + col) * 4;
+            if o + 4 > BACKBUFFER_MAX {
+                return;
+            }
+            let cur = u32::from_le_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]]);
+            buf[o..o + 4].copy_from_slice(&t.px[row * t.w + col].to_le_bytes());
+            t.px[row * t.w + col] = cur;
+        }
+    }
+}
+
 pub fn present() {
+    // whoever presents a full frame owns the screen: the boot screen bows out
+    crate::drivers::bootscreen::end();
+    // this path draws its own pointer into the back buffer
+    #[cfg(target_arch = "x86_64")]
+    crate::drivers::cursor_overlay::forget();
     #[cfg(target_arch = "x86_64")]
     unsafe {
         let hz = PRESENT_HZ;
@@ -606,18 +1105,76 @@ pub fn present() {
             // Yield to other cooperative tasks until this frame's slot; also
             // guard against a backwards/zero clock so we can't spin forever.
             let mut spins = 0u32;
+            // the wait less what other tasks used of it is the boot core idle (per-core load)
+            let (t0, mut lent) = (crate::arch::timer::now_us(), 0u64);
             while crate::arch::timer::now_us() < next && spins < 100_000 {
+                let ty = crate::arch::timer::now_us();
                 crate::proc::sched::yield_now();
+                lent += crate::arch::smp::yield_cost(ty, crate::arch::timer::now_us());
                 spins += 1;
+                // the desktop's sounds: keep the (short) audio queue fed while waiting
+                crate::drivers::mixer::pump();
+                // nobody else needed the core: halt until close to the slot
+                let left = next.saturating_sub(crate::arch::timer::now_us());
+                if left > 300 {
+                    crate::arch::smp::idle_us(left.min(1000) - 100);
+                }
             }
             LAST_PRESENT_US = crate::arch::timer::now_us();
+            crate::arch::smp::note_idle(LAST_PRESENT_US.saturating_sub(t0).saturating_sub(lent));
+            crate::arch::smp::sample();
         }
+    }
+    // the native window manager's frames (the x86 Terminal loop) carry the
+    // screenshot notice too, and PrtSc pressed there opens the overlay here
+    #[cfg(target_arch = "x86_64")]
+    let mut toast = crate::drivers::screenshot::toast_image();
+    #[cfg(target_arch = "x86_64")]
+    if let Some(t) = toast.as_mut() {
+        swap_back_rect(t);
     }
     unsafe {
         let Some(fb) = get() else { return };
         let total = (fb.pitch as usize * fb.height as usize).min(BACKBUFFER_MAX);
         let dst = fb.addr as *mut u8;
         let buf = back_buf();
-        ptr::copy_nonoverlapping(buf.as_ptr(), dst, total);
+        // the full-frame copy to video memory, in row bands over the cores
+        // (x86-64 SMP; one plain copy elsewhere): disjoint rows, plain memory
+        let pitch = (fb.pitch as usize).max(1);
+        let rows = total / pitch;
+        let (chunks, per) = crate::par::row_chunks(rows, 64);
+        let (src_a, dst_a) = (buf.as_ptr() as usize, dst as usize);
+        crate::par::for_each(chunks, &|c: usize| {
+            let (y0, y1) = (c * per, ((c + 1) * per).min(rows));
+            if y1 > y0 {
+                ptr::copy_nonoverlapping((src_a + y0 * pitch) as *const u8, (dst_a + y0 * pitch) as *mut u8, (y1 - y0) * pitch);
+            }
+        });
+        if rows * pitch < total {
+            ptr::copy_nonoverlapping(buf.as_ptr().add(rows * pitch), dst.add(rows * pitch), total - rows * pitch);
+        }
+        #[cfg(target_arch = "x86_64")]
+        if fb.bpp == 32 && crate::drivers::screenrec::active() {
+            let (ox, oy) = (OX as usize, OY as usize);
+            let stride = fb.pitch as usize / 4;
+            // (a byte array: read it as pixels only when it happens to be aligned)
+            let (pre, px, _) = buf[..total].align_to::<u32>();
+            if pre.is_empty() {
+                let start = (oy * stride + ox).min(px.len());
+                crate::drivers::screenrec::frame(&px[start..], stride, width() as usize, height() as usize);
+            } else if let Some((shot, w, h)) = read_screen() {
+                crate::drivers::screenrec::frame(&shot, w, w, h);
+            }
+        }
+    }
+    // swapping again puts the frame's own pixels back: callers that do not
+    // redraw the whole back buffer every frame never keep a stale notice
+    #[cfg(target_arch = "x86_64")]
+    if let Some(t) = toast.as_mut() {
+        swap_back_rect(t);
+    }
+    #[cfg(target_arch = "x86_64")]
+    if crate::drivers::screenshot::take_pending() {
+        crate::drivers::screenshot::run();
     }
 }

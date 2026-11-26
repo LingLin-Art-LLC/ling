@@ -27,7 +27,7 @@ const MODE_FILE: &str = "/display_mode";
 /// Candidate modes, small -> large. The Settings row shows the subset the
 /// card actually supports (see `fits`). 1600x900 / 1920x1080 are new and only
 /// appear when the adapter reports it can drive them.
-pub const CANDIDATES: [(&str, u32, u32); 7] = [
+pub const CANDIDATES: [(&str, u32, u32); 9] = [
     ("640 x 480", 640, 480),
     ("800 x 600", 800, 600),
     ("1024 x 768", 1024, 768),
@@ -35,6 +35,8 @@ pub const CANDIDATES: [(&str, u32, u32); 7] = [
     ("1280 x 1024", 1280, 1024),
     ("1600 x 900", 1600, 900),
     ("1920 x 1080", 1920, 1080),
+    ("2560 x 1440", 2560, 1440),
+    ("2560 x 1600", 2560, 1600),
 ];
 
 /// stage2.asm's `display_modes` order -- the next-boot header byte indexes

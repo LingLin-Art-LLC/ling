@@ -5,6 +5,7 @@
 use crate::synth::{Patch, Synth};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 struct TrackPlayer {
     stereo: Arc<Vec<f32>>, // interleaved L,R at src_rate
@@ -19,9 +20,27 @@ struct MusicState {
     synth: Synth,
     master: f32,
     out_rate: u32,
+    /// The track position (seconds) at the start of the last buffer handed to
+    /// the device, when that buffer starts coming out of the speaker, and
+    /// whether the track was playing: `position` runs on this, so it reports
+    /// what is heard rather than the render cursor a device buffer ahead.
+    heard_pos: f64,
+    heard_at: Option<Instant>,
+    heard_playing: bool,
 }
 
 impl MusicState {
+    fn note_buffer(&mut self, latency: Duration) {
+        match &self.track {
+            Some(t) => {
+                self.heard_pos = t.pos / t.src_rate.max(1) as f64;
+                self.heard_playing = t.playing;
+                self.heard_at = Some(Instant::now() + latency);
+            }
+            None => self.heard_at = None,
+        }
+    }
+
     #[inline]
     fn next(&mut self) -> (f32, f32) {
         let (mut l, mut r) = (0.0f32, 0.0f32);
@@ -79,6 +98,9 @@ impl MusicEngine {
             synth: Synth::new(out_rate as f32),
             master: 0.8,
             out_rate,
+            heard_pos: 0.0,
+            heard_at: None,
+            heard_playing: false,
         }));
         let stream = build_stream(&device, &config, channels, Arc::clone(&state), fmt)?;
         stream.play()?;
@@ -128,16 +150,28 @@ impl MusicEngine {
             if let Some(t) = &mut s.track {
                 t.pos = (sec.max(0.0) as f64) * t.src_rate as f64;
             }
+            s.heard_at = None;
         }
     }
 
-    /// Current playback position in seconds.
+    /// Current playback position in seconds: what is coming out of the speaker
+    /// now (the last buffer's start, carried forward in real time), never past
+    /// the render cursor.
     pub fn position(&self) -> f32 {
-        self.state
-            .lock()
-            .ok()
-            .and_then(|s| s.track.as_ref().map(|t| (t.pos / t.src_rate as f64) as f32))
-            .unwrap_or(0.0)
+        let Ok(s) = self.state.lock() else { return 0.0 };
+        let Some(t) = s.track.as_ref() else { return 0.0 };
+        let raw = t.pos / t.src_rate.max(1) as f64;
+        let Some(at) = s.heard_at else { return raw as f32 };
+        if !s.heard_playing {
+            return s.heard_pos.min(raw).max(0.0) as f32;
+        }
+        let now = Instant::now();
+        let p = if now >= at {
+            s.heard_pos + (now - at).as_secs_f64()
+        } else {
+            s.heard_pos - (at - now).as_secs_f64()
+        };
+        p.min(raw).max(0.0) as f32
     }
 
     pub fn set_volume(&self, v: f32) {
@@ -202,7 +236,7 @@ fn build_stream(
             let st = Arc::clone(&state);
             device.build_output_stream(
                 config,
-                move |d: &mut [f32], _| fill_f32(d, channels, &st),
+                move |d: &mut [f32], info: &cpal::OutputCallbackInfo| fill_f32(d, channels, &st, out_latency(info)),
                 err_fn,
                 None,
             )?
@@ -211,7 +245,7 @@ fn build_stream(
             let st = Arc::clone(&state);
             device.build_output_stream::<i16, _, _>(
                 config,
-                move |d: &mut [i16], _| fill_i16(d, channels, &st),
+                move |d: &mut [i16], info: &cpal::OutputCallbackInfo| fill_i16(d, channels, &st, out_latency(info)),
                 err_fn,
                 None,
             )?
@@ -219,9 +253,16 @@ fn build_stream(
     })
 }
 
-fn fill_f32(data: &mut [f32], ch: usize, state: &Arc<Mutex<MusicState>>) {
+/// How long until the buffer being filled is heard (cpal's playback - callback instants).
+fn out_latency(info: &cpal::OutputCallbackInfo) -> Duration {
+    let ts = info.timestamp();
+    ts.playback.duration_since(&ts.callback).unwrap_or(Duration::ZERO)
+}
+
+fn fill_f32(data: &mut [f32], ch: usize, state: &Arc<Mutex<MusicState>>, latency: Duration) {
     let ch = ch.max(1);
     if let Ok(mut s) = state.try_lock() {
+        s.note_buffer(latency);
         for frame in data.chunks_mut(ch) {
             let (l, r) = s.next();
             frame[0] = l;
@@ -239,9 +280,10 @@ fn fill_f32(data: &mut [f32], ch: usize, state: &Arc<Mutex<MusicState>>) {
     }
 }
 
-fn fill_i16(data: &mut [i16], ch: usize, state: &Arc<Mutex<MusicState>>) {
+fn fill_i16(data: &mut [i16], ch: usize, state: &Arc<Mutex<MusicState>>, latency: Duration) {
     let ch = ch.max(1);
     if let Ok(mut s) = state.try_lock() {
+        s.note_buffer(latency);
         for frame in data.chunks_mut(ch) {
             let (l, r) = s.next();
             frame[0] = (l * 32767.0) as i16;

@@ -48,6 +48,9 @@ fn declare_runtime_functions(module: &mut JITModule) -> HashMap<String, (FuncId,
         ("__ling_sqrt", &[types::F64], types::F64),
         ("__ling_abs", &[types::F64], types::F64),
         ("__ling_floor", &[types::F64], types::F64),
+        // LING_PROFILE_FN hooks (see fnprof.rs); bound in new_tuned, called only when instrumenting
+        ("__ling_fn_enter", &[types::I64], types::I64),
+        ("__ling_fn_exit", &[types::I64], types::I64),
         ("__ling_ceil", &[types::F64], types::F64),
         ("__ling_round", &[types::F64], types::F64),
         ("__ling_add", &[types::I64, types::I64], types::I64),
@@ -68,6 +71,7 @@ fn declare_runtime_functions(module: &mut JITModule) -> HashMap<String, (FuncId,
         ("__ling_bool_to_u64", &[types::I64], types::I64),
         ("__ling_alloc", &[types::I64], types::I64),
         ("__ling_free", &[types::I64], types::I64),
+        ("__ling_retain", &[types::I64], types::I64),
         ("__ling_panic", &[types::I64], types::I64),
         ("__ling_str_new", &[types::I64, types::I64], types::I64),
         ("__ling_str_len", &[types::I64], types::I64),
@@ -235,12 +239,39 @@ impl JitBackend {
     where
         F: FnOnce(&mut JITBuilder),
     {
+        Self::new_tuned(false, register_symbols_fn)
+    }
+
+    /// `fast` trades code quality for compile time: no Cranelift optimisation and
+    /// the linear-time single-pass register allocator. The default allocator is
+    /// superlinear in block count, so one multi-thousand-block frame closure can
+    /// take minutes (and GBs) to compile; single-pass makes it near-instant.
+    /// `LING_JIT_FAST=0/1` overrides the caller's choice.
+    pub fn new_tuned<F>(fast: bool, register_symbols_fn: F) -> Self
+    where
+        F: FnOnce(&mut JITBuilder),
+    {
+        let fast = match std::env::var("LING_JIT_FAST").as_deref() {
+            Ok("0") => false,
+            Ok(v) if !v.is_empty() => true,
+            _ => fast,
+        };
         let mut flag_builder = settings::builder();
         flag_builder.set("use_colocated_libcalls", "false").unwrap();
         flag_builder.set("is_pic", "false").unwrap();
-        flag_builder.set("opt_level", "speed").unwrap();
-        flag_builder.set("enable_alias_analysis", "true").unwrap();
+        if fast {
+            flag_builder.set("opt_level", "none").unwrap();
+            flag_builder.set("regalloc_algorithm", "single_pass").unwrap();
+        } else {
+            flag_builder.set("opt_level", "speed").unwrap();
+            flag_builder.set("enable_alias_analysis", "true").unwrap();
+        }
         flag_builder.set("enable_verifier", "false").unwrap();
+        // Stack probes: a function whose frame is larger than a page (a UI's frame function with hundreds of locals) must touch
+        // its stack a page at a time, or it jumps past the guard page Windows grows the stack with and faults on memory that was
+        // never committed (a release-build segfault on the first call into such a function).
+        flag_builder.set("enable_probestack", "true").unwrap();
+        flag_builder.set("probestack_strategy", "inline").unwrap();
 
         let isa_builder = cranelift_native::builder()
             .unwrap_or_else(|msg| panic!("host architecture not supported: {msg}"));
@@ -249,7 +280,15 @@ impl JitBackend {
             .unwrap_or_else(|msg| panic!("host architecture not supported: {msg}"));
 
         let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
+        // One contiguous reservation for code + data: the default allocator maps
+        // them separately, and with a GPU stack loaded they can land >2 GB apart,
+        // overflowing the 32-bit PC-relative relocations (TryFromIntError panic).
+        if let Ok(arena) = cranelift_jit::ArenaMemoryProvider::new_with_size(1 << 30) {
+            builder.memory_provider(Box::new(arena));
+        }
         register_symbols_fn(&mut builder);
+        builder.symbol("__ling_fn_enter", super::fnprof::ling_fn_enter as *const u8);
+        builder.symbol("__ling_fn_exit", super::fnprof::ling_fn_exit as *const u8);
         let module = JITModule::new(builder);
 
         Self {
@@ -335,6 +374,11 @@ impl JitBackend {
     }
 
     fn translate_function(&mut self, func: &MirFunction, nt: &NumberTypes) {
+        // LING_MIR_DUMP=<name|*>: print the optimized MIR the JIT receives for one
+        // function (or all), for debugging mis-lowered shapes.
+        if std::env::var("LING_MIR_DUMP").map_or(false, |v| v == func.name || v == "*") {
+            eprintln!("=== MIR {} ===\n{:#?}", func.name, func);
+        }
         let &fid = self.func_ids.get(&func.name).unwrap();
         let mut ctx = self.module.make_context();
         let mut sig = self.module.make_signature();
@@ -379,6 +423,19 @@ impl JitBackend {
         }
 
         let func_arities = self.func_arities.clone();
+        // Ownership-based frees (see TransCtx::frees). LING_JIT_FREE=0 restores
+        // the old leak-everything behaviour as a kill switch. The sweep is every
+        // local that could hold a heap box: whatever numtype didn't prove to be
+        // an integer or a strict bool (those are immediates, never boxed).
+        let frees = std::env::var("LING_JIT_FREE").map_or(true, |v| v != "0");
+        let boxed_sweep: Vec<usize> = if frees {
+            (1..=max_local)
+                .filter(|&i| !nt.local_is_int(&func.name, i))
+                .filter(|&i| !nt.operand_is_bool(&func.name, &Operand::Copy(Local(i))))
+                .collect()
+        } else {
+            Vec::new()
+        };
         let tctx = TransCtx {
             vars: &vars,
             string_gvs: &string_gvs,
@@ -388,10 +445,31 @@ impl JitBackend {
             func_arities: &func_arities,
             nt,
             fname: &func.name,
+            frees,
+            boxed_sweep: &boxed_sweep,
         };
+        let trace = std::env::var("LING_JIT_TRACE").map_or(false, |v| v != "0");
+        let t0 = std::time::Instant::now();
+        super::fnprof::set_current(if super::fnprof::enabled() { Some(super::fnprof::id_for(&func.name)) } else { None });
         build_function_body(&mut builder, func, &blocks, &tctx);
+        super::fnprof::set_current(None);
         builder.finalize();
+        let t_build = t0.elapsed();
+        // LING_JIT_TRACE=1: name each function before cranelift compiles it (release builds abort on a
+        // cranelift panic, so the last name printed is the one it failed on).
+        if trace {
+            eprintln!("jit: {} ({} blocks)", func.name, func.basic_blocks.len());
+        }
+        let t1 = std::time::Instant::now();
         self.module.define_function(fid, &mut ctx).unwrap();
+        if trace && (t_build + t1.elapsed()).as_millis() >= 50 {
+            eprintln!(
+                "jit:   {} lowered in {} ms, cranelift in {} ms",
+                func.name,
+                t_build.as_millis(),
+                t1.elapsed().as_millis()
+            );
+        }
     }
 
     pub fn get_function(&mut self, name: &str) -> Option<*const u8> {

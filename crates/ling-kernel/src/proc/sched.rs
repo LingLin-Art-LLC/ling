@@ -14,7 +14,7 @@
 //! spawned task.
 use core::arch::global_asm;
 
-pub const MAX_TASKS: usize = 4;
+pub const MAX_TASKS: usize = 6;
 /// 2MiB per spawned task. Post-quantum crypto on RustCrypto's `ml-dsa` is a
 /// heavy stack user: Messenger's `messenger_task` (via `ling-messenger`) runs
 /// ML-DSA-87 keygen at first beacon and then, on a real chat handshake, an
@@ -68,6 +68,15 @@ static mut TASK_ENTRY: [u64; MAX_TASKS] = [0; MAX_TASKS];
 /// running on the bootloader's stack — see `init_main_task`).
 static mut STACK_GUARD: [u64; MAX_TASKS] = [0; MAX_TASKS];
 static mut CURRENT: usize = 0;
+/// What each spawned task is, for the stall recorder ("" = unnamed).
+static mut TASK_NAME: [&str; MAX_TASKS] = [""; MAX_TASKS];
+
+/// Name the task in `slot` (what `spawn` returned) for `hitches`.
+pub fn set_name(slot: u64, name: &'static str) {
+    if (slot as usize) < MAX_TASKS {
+        unsafe { TASK_NAME[slot as usize] = name };
+    }
+}
 static mut STARTED: bool = false;
 
 extern "C" {
@@ -77,14 +86,15 @@ extern "C" {
     /// called `switch_to` from (or `trampoline`, for a task's first run; see
     /// `spawn`'s fabricated stack). Plain SysV AMD64 (`rdi`, `rsi`), the
     /// same convention every `ling_kernel_*` intrinsic already uses.
-    fn switch_to(save_sp: *mut u64, new_sp: u64);
+    fn sched_switch_to(save_sp: *mut u64, new_sp: u64);
 }
 
+#[cfg(target_arch = "x86_64")]
 global_asm!(
     r#"
 .section .text
-.global switch_to
-switch_to:
+.global sched_switch_to
+sched_switch_to:
     push rbx
     push rbp
     push r12
@@ -105,6 +115,45 @@ switch_to:
 
 /// Lands here (via `ret`, out of `switch_to`) the first time a spawned
 /// task's slot is switched into — never called directly.
+// AArch64: the same shape as `lingapp`'s `ling_switch_stack` -- the callee-
+// saved x19-x30 and d8-d15 in a 176-byte frame, sp saved to `*save_sp`, then
+// the other stack's frame is popped and `ret` lands in x30 (`trampoline` on a
+// fresh stack).
+#[cfg(target_arch = "aarch64")]
+global_asm!(
+    r#"
+.section .text
+.global sched_switch_to
+sched_switch_to:
+    sub sp, sp, #176
+    stp x19, x20, [sp, #0]
+    stp x21, x22, [sp, #16]
+    stp x23, x24, [sp, #32]
+    stp x25, x26, [sp, #48]
+    stp x27, x28, [sp, #64]
+    stp x29, x30, [sp, #80]
+    stp d8, d9, [sp, #96]
+    stp d10, d11, [sp, #112]
+    stp d12, d13, [sp, #128]
+    stp d14, d15, [sp, #144]
+    mov x2, sp
+    str x2, [x0]
+    mov sp, x1
+    ldp x19, x20, [sp, #0]
+    ldp x21, x22, [sp, #16]
+    ldp x23, x24, [sp, #32]
+    ldp x25, x26, [sp, #48]
+    ldp x27, x28, [sp, #64]
+    ldp x29, x30, [sp, #80]
+    ldp d8, d9, [sp, #96]
+    ldp d10, d11, [sp, #112]
+    ldp d12, d13, [sp, #128]
+    ldp d14, d15, [sp, #144]
+    add sp, sp, #176
+    ret
+"#
+);
+
 extern "C" fn trampoline() -> ! {
     let idx = unsafe { CURRENT };
     let entry = unsafe { TASK_ENTRY[idx] };
@@ -150,12 +199,26 @@ pub fn spawn(entry: u64) -> u64 {
                 // Fabricate the frame `switch_to`'s pop sequence expects:
                 // r15,r14,r13,r12,rbp,rbx (unused, zeroed) then a return
                 // address landing in `trampoline`.
-                let mut sp = top - 8;
-                *(sp as *mut u64) = trampoline as *const () as usize as u64;
-                for _ in 0..6 {
-                    sp -= 8;
-                    *(sp as *mut u64) = 0;
-                }
+                // `ret` pops the trampoline address, leaving rsp at `top - 8` (8 mod 16) as if `trampoline` had been called: with
+                // hardware SSE enabled the compiler uses aligned `movaps` on the stack and faults when entered 16-byte aligned.
+                #[cfg(target_arch = "x86_64")]
+                let sp = {
+                    let mut sp = top - 16;
+                    *(sp as *mut u64) = trampoline as *const () as usize as u64;
+                    for _ in 0..6 {
+                        sp -= 8;
+                        *(sp as *mut u64) = 0;
+                    }
+                    sp
+                };
+                #[cfg(target_arch = "aarch64")]
+                let sp = {
+                    // the frame `switch_to` pops: zeros, `trampoline` in x30
+                    let sp = top - 176;
+                    core::ptr::write_bytes(sp as *mut u8, 0, 176);
+                    *((sp + 88) as *mut u64) = trampoline as *const () as usize as u64;
+                    sp
+                };
 
                 TASKS[i].sp = sp;
                 TASKS[i].state = TaskState::Ready;
@@ -181,6 +244,17 @@ fn check_stack_guards() {
             }
         }
     }
+    // slot 0 runs on the boot stack (arch/x86_64/boot.rs), which has its own canary
+    #[cfg(target_arch = "x86_64")]
+    if !crate::arch::boot::stack_guard_ok() {
+        panic!("stack overflow: the boot stack (task slot 0, the desktop) ran out of its 4 MiB");
+    }
+}
+
+/// Is the running task the main one (slot 0: the desktop / the running program)?
+/// Background tasks (SSH server, chat listener, icon loader) are the others.
+pub fn is_main() -> bool {
+    unsafe { !STARTED || CURRENT == 0 }
 }
 
 pub fn yield_now() {
@@ -189,6 +263,10 @@ pub fn yield_now() {
             return;
         }
         check_stack_guards();
+        // every switch is a safe point (nobody is inside a USB transfer):
+        // take the keyboard's reports now, not only once a frame
+        #[cfg(target_arch = "aarch64")]
+        crate::arch::xhci::service();
         let prev = CURRENT;
         let mut next = (prev + 1) % MAX_TASKS;
         while next != prev && TASKS[next].state != TaskState::Ready {
@@ -203,10 +281,22 @@ pub fn yield_now() {
         }
         TASKS[next].state = TaskState::Running;
         CURRENT = next;
+        crate::kstats::switched();
+        // the stall recorder: how long the task handing over had the CPU
+        {
+            static mut TURN_US: u64 = 0;
+            let now = crate::arch::timer::now_us();
+            if prev != 0 {
+                let label = [b'0' + prev as u8];
+                let name = TASK_NAME[prev];
+                crate::hitch::span_parts(&[b"background task #", &label, b" ", name.as_bytes()], now.saturating_sub(TURN_US));
+            }
+            TURN_US = now;
+        }
 
         let save_ptr = &raw mut TASKS[prev].sp;
         let new_sp = TASKS[next].sp;
-        switch_to(save_ptr, new_sp);
+        sched_switch_to(save_ptr, new_sp);
     }
 }
 
@@ -221,6 +311,32 @@ pub fn exit() -> ! {
     loop {
         yield_now();
         unsafe { crate::arch::cpu::halt() };
+    }
+}
+
+/// Top of the running task's stack (slot 0 runs on the boot stack).
+pub fn current_stack_top() -> u64 {
+    unsafe { stack_top_of(CURRENT) }
+}
+
+unsafe fn stack_top_of(i: usize) -> u64 {
+    if i == 0 {
+        crate::arch::boot::boot_stack_top()
+    } else {
+        ((&raw const STACKS[i]) as u64 + STACK_SIZE as u64) & !0xF
+    }
+}
+
+/// Every other live task's stack, from its saved `rsp` (where `switch_to`
+/// pushed its registers) to the top -- what `lingrt`'s collector scans.
+pub fn for_each_suspended_stack(mut f: impl FnMut(u64, u64)) {
+    unsafe {
+        for i in 0..MAX_TASKS {
+            if i == CURRENT || TASKS[i].state != TaskState::Ready || TASKS[i].sp == 0 {
+                continue;
+            }
+            f(TASKS[i].sp, stack_top_of(i));
+        }
     }
 }
 

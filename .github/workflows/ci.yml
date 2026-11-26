@@ -1,72 +1,86 @@
 name: CI
 
+# Build + test the Ling compiler/runtime workspace on every push and pull request.
+#
+# The workspace has a member (crates/ling-kernel, the LingOS kernel) with path dependencies on
+# three sibling repos -- ../../../bring-browser, ../../../horizon-browser, ../../../ling-messenger --
+# and cargo cannot even load the workspace without them. So this repo is checked out at ./ling
+# and the siblings next to it, the same layout as a developer machine.
+
 on:
   push:
     branches: [master, main, develop]
   pull_request:
-    branches: [master, main]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
+  ORG: LingLin-Art-LLC
 
 jobs:
   test:
-    name: Build & Test
-    runs-on: ubuntu-latest
+    name: Build & Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
+        with: { path: ling }
+      - uses: actions/checkout@v4
+        with: { repository: "${{ env.ORG }}/bring-browser", path: bring-browser }
+      - uses: actions/checkout@v4
+        with: { repository: "${{ env.ORG }}/horizon-browser", path: horizon-browser }
+      - uses: actions/checkout@v4
+        with: { repository: "${{ env.ORG }}/ling-messenger", path: ling-messenger }
 
-      - name: Install Rust (stable)
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: "ling -> target" }
 
       # minifb (graphics) needs X11/Wayland headers; cpal (audio) needs ALSA.
       - name: Install system dependencies
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libasound2-dev libudev-dev libxkbcommon-dev libwayland-dev xorg-dev
+            libasound2-dev libudev-dev libxkbcommon-dev libwayland-dev xorg-dev pkg-config
+      - uses: ilammy/setup-nasm@v1
+        if: runner.os != 'Linux'
 
-      # ling-kernel is excluded from both steps below: it's no_std/bare-metal
-      # and requires the nightly toolchain (`#![feature(abi_x86_interrupt)]`,
-      # plus `-Z build-std` for a real build — see `ling build --platform
-      # kernel` / gen_kernel_cargo_toml in src/main.rs), which this job never
-      # installs (stable only, line 20). `cargo build --workspace` without
-      # the exclude fails immediately with E0554 ("#![feature] may not be
-      # used on the stable release channel") — confirmed against the exact
-      # CI failure. Its own boot assembly (boot32.rs) also calls
-      # `kernel_entry`, which it never defines itself (only a generated
-      # kernel project's main.rs does), so even on nightly `cargo test`
-      # would fail to link a standalone test binary for it regardless.
-      #
-      # ling-user is excluded from the test step only: it's the no_std
-      # userland runtime ring-3 LingOS processes link against, with its own
-      # `#[panic_handler]` (see crates/ling-user/src/entry.rs) — its own
-      # Cargo.toml already sets `test = false` to stop `cargo test -p
-      # ling-user` from linking std alongside that handler (E0152 duplicate
-      # `panic_impl`), but a workspace-wide `cargo test` still pulls it into
-      # the shared test-profile dependency graph unless excluded here too.
-      # It builds fine as an ordinary rlib dependency, so `cargo build`
-      # doesn't need the same exclude.
+      # ling-kernel is no_std/bare-metal and nightly-only (`#![feature(abi_x86_interrupt)]`,
+      # `-Z build-std`), so it is excluded here; the LingOS repo's CI builds it for real.
+      # ling-user (the no_std ring-3 runtime) has its own #[panic_handler], so it is kept out of
+      # the test graph (E0152 duplicate `panic_impl`) but still builds as an rlib.
       - name: Build
-        run: cargo build --workspace --exclude ling-kernel --verbose
+        working-directory: ling
+        run: cargo build --workspace --exclude ling-kernel
 
       - name: Run tests
-        run: cargo test --workspace --exclude ling-kernel --exclude ling-user --verbose
+        if: runner.os == 'Linux'
+        working-directory: ling
+        run: cargo test --workspace --exclude ling-kernel --exclude ling-user
 
   lint:
     name: Format & Clippy (non-blocking)
     runs-on: ubuntu-latest
-    # Advisory only — does not gate the CI status / test badge.
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
+        with: { path: ling }
+      - uses: actions/checkout@v4
+        with: { repository: "${{ env.ORG }}/bring-browser", path: bring-browser }
+      - uses: actions/checkout@v4
+        with: { repository: "${{ env.ORG }}/horizon-browser", path: horizon-browser }
+      - uses: actions/checkout@v4
+        with: { repository: "${{ env.ORG }}/ling-messenger", path: ling-messenger }
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+        with: { components: "rustfmt, clippy" }
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libasound2-dev libudev-dev libxkbcommon-dev libwayland-dev xorg-dev
       - name: Format check
+        working-directory: ling
         run: cargo fmt --all -- --check
       - name: Clippy
-        run: cargo clippy --workspace
+        working-directory: ling
+        run: cargo clippy --workspace --exclude ling-kernel

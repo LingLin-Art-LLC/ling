@@ -119,6 +119,110 @@ global_asm!(
     eret
 .endm
 
+// Kernel-mode traps also keep the SIMD/FP registers: the Rust handlers
+// (HDMI audio pump, GIC, timer) are free to use q0-q31 for copies and
+// arithmetic, and the interrupted code -- Argon2, compiled Ling floats --
+// had live values there. Without this a timer tick on the Pi 5 changed a
+// password hash mid-computation. These handlers always resume the same
+// frame (no process switch), so the FP area sits just above it.
+.macro SAVE_FP_AND_DISPATCH kind, handler
+    sub sp, sp, #528
+    stp q0, q1, [sp, #0]
+    stp q2, q3, [sp, #32]
+    stp q4, q5, [sp, #64]
+    stp q6, q7, [sp, #96]
+    stp q8, q9, [sp, #128]
+    stp q10, q11, [sp, #160]
+    stp q12, q13, [sp, #192]
+    stp q14, q15, [sp, #224]
+    stp q16, q17, [sp, #256]
+    stp q18, q19, [sp, #288]
+    stp q20, q21, [sp, #320]
+    stp q22, q23, [sp, #352]
+    stp q24, q25, [sp, #384]
+    stp q26, q27, [sp, #416]
+    stp q28, q29, [sp, #448]
+    stp q30, q31, [sp, #480]
+    str x0, [sp, #-16]!
+    mrs x0, fpcr
+    str x0, [sp, #16 + 512]
+    mrs x0, fpsr
+    str x0, [sp, #16 + 520]
+    ldr x0, [sp], #16
+    sub sp, sp, #{frame_size}
+    stp x0, x1, [sp, #0]
+    stp x2, x3, [sp, #16]
+    stp x4, x5, [sp, #32]
+    stp x6, x7, [sp, #48]
+    stp x8, x9, [sp, #64]
+    stp x10, x11, [sp, #80]
+    stp x12, x13, [sp, #96]
+    stp x14, x15, [sp, #112]
+    stp x16, x17, [sp, #128]
+    stp x18, x19, [sp, #144]
+    stp x20, x21, [sp, #160]
+    stp x22, x23, [sp, #176]
+    stp x24, x25, [sp, #192]
+    stp x26, x27, [sp, #208]
+    stp x28, x29, [sp, #224]
+    str x30, [sp, #240]
+    mrs x9, sp_el0
+    str x9, [sp, #248]
+    mrs x9, elr_el1
+    str x9, [sp, #256]
+    mrs x9, spsr_el1
+    str x9, [sp, #264]
+    mov x0, sp
+    mov x1, \kind
+    bl \handler
+    mov sp, x0
+    ldr x9, [sp, #256]
+    msr elr_el1, x9
+    ldr x9, [sp, #264]
+    msr spsr_el1, x9
+    ldr x9, [sp, #248]
+    msr sp_el0, x9
+    ldr x9, [sp, #{frame_size} + 512]
+    msr fpcr, x9
+    ldr x9, [sp, #{frame_size} + 520]
+    msr fpsr, x9
+    ldp x0, x1, [sp, #0]
+    ldp x2, x3, [sp, #16]
+    ldp x4, x5, [sp, #32]
+    ldp x6, x7, [sp, #48]
+    ldp x8, x9, [sp, #64]
+    ldp x10, x11, [sp, #80]
+    ldp x12, x13, [sp, #96]
+    ldp x14, x15, [sp, #112]
+    ldp x16, x17, [sp, #128]
+    ldp x18, x19, [sp, #144]
+    ldp x20, x21, [sp, #160]
+    ldp x22, x23, [sp, #176]
+    ldp x24, x25, [sp, #192]
+    ldp x26, x27, [sp, #208]
+    ldp x28, x29, [sp, #224]
+    ldr x30, [sp, #240]
+    add sp, sp, #{frame_size}
+    ldp q0, q1, [sp, #0]
+    ldp q2, q3, [sp, #32]
+    ldp q4, q5, [sp, #64]
+    ldp q6, q7, [sp, #96]
+    ldp q8, q9, [sp, #128]
+    ldp q10, q11, [sp, #160]
+    ldp q12, q13, [sp, #192]
+    ldp q14, q15, [sp, #224]
+    ldp q16, q17, [sp, #256]
+    ldp q18, q19, [sp, #288]
+    ldp q20, q21, [sp, #320]
+    ldp q22, q23, [sp, #352]
+    ldp q24, q25, [sp, #384]
+    ldp q26, q27, [sp, #416]
+    ldp q28, q29, [sp, #448]
+    ldp q30, q31, [sp, #480]
+    add sp, sp, #528
+    eret
+.endm
+
 .section .text
 .align 11
 .global vector_table_el1
@@ -142,9 +246,9 @@ vector_table_el1:
 
 // Out-of-line: unconstrained size, unlike the slots above.
 vec_sync:
-    SAVE_AND_DISPATCH 0, aarch64_trap_handler
+    SAVE_FP_AND_DISPATCH 0, aarch64_trap_handler
 vec_irq:
-    SAVE_AND_DISPATCH 1, aarch64_trap_handler
+    SAVE_FP_AND_DISPATCH 1, aarch64_trap_handler
 vec_unreachable:
     SAVE_AND_DISPATCH 2, aarch64_trap_handler
 vec_sync_el0:
@@ -197,6 +301,13 @@ fn read_far_el1() -> u64 {
 const HEARTBEAT_HZ: u32 = 100;
 
 static mut TICKS: u64 = 0;
+/// IRQ exceptions taken (any source), for `uptime`'s diagnostics.
+static mut IRQ_ENTRIES: u64 = 0;
+static mut FIRST_IAR: u32 = u32::MAX;
+
+pub fn irq_entries() -> u64 {
+    unsafe { IRQ_ENTRIES }
+}
 
 pub fn ticks() -> u64 {
     unsafe { TICKS }
@@ -212,18 +323,37 @@ const ESR_EC_BRK: u64 = 0x3C;
 /// `ESR_EL1[31:26]` exception class for an `svc` trap.
 const ESR_EC_SVC64: u64 = 0x15;
 
+/// Data abort taken from the current EL (a kernel load/store that faulted).
+const ESR_EC_DABT_CUR: u64 = 0x25;
+
+static mut PROBE_ACTIVE: bool = false;
+static mut PROBE_FAULTED: bool = false;
+
+/// Read a 32-bit MMIO register that may not exist: `None` when the access
+/// raised a data abort (synchronous external abort on an unmapped bus
+/// address), the value otherwise. Drivers use it once, before trusting an
+/// optional block (the hardware RNG on QEMU's Pi 4 model is absent).
+pub fn probe_read32(addr: usize) -> Option<u32> {
+    let v: u32;
+    unsafe {
+        PROBE_FAULTED = false;
+        PROBE_ACTIVE = true;
+        // one plain load, so the abort handler can step over exactly it
+        core::arch::asm!("ldr {v:w}, [{a}]", "dsb sy", a = in(reg) addr, v = out(reg) v, options(nostack));
+        PROBE_ACTIVE = false;
+        if PROBE_FAULTED {
+            return None;
+        }
+    }
+    Some(v)
+}
+
 #[no_mangle]
 extern "C" fn aarch64_trap_handler(frame: &mut TrapFrame, kind: u64) -> u64 {
     let frame_addr = frame as *mut TrapFrame as u64;
     match kind {
         1 => {
-            if crate::arch::intc::core_timer_pending() {
-                unsafe { TICKS += 1 };
-                crate::arch::timer::rearm_periodic(HEARTBEAT_HZ);
-            }
-            if crate::arch::intc::uart_pending() {
-                crate::drivers::uart::irq_drain();
-            }
+            service_irqs();
             frame_addr
         }
         0 => {
@@ -232,6 +362,13 @@ extern "C" fn aarch64_trap_handler(frame: &mut TrapFrame, kind: u64) -> u64 {
             if ec == ESR_EC_BRK {
                 crate::console_write(b"\n!!! Breakpoint (brk)\n");
                 print_hex64("  elr=", frame.elr);
+                frame.elr += 4;
+                return frame_addr;
+            }
+            // A data abort inside `probe_read32`: the device is not there
+            // (an emulator without it, a board variant). Step over the load.
+            if ec == ESR_EC_DABT_CUR && unsafe { PROBE_ACTIVE } {
+                unsafe { PROBE_FAULTED = true };
                 frame.elr += 4;
                 return frame_addr;
             }
@@ -251,20 +388,85 @@ extern "C" fn aarch64_trap_handler(frame: &mut TrapFrame, kind: u64) -> u64 {
             crate::proc::uproc::on_syscall_return(frame_addr)
         }
         4 => {
-            if crate::arch::intc::core_timer_pending() {
-                unsafe { TICKS += 1 };
-                crate::arch::timer::rearm_periodic(HEARTBEAT_HZ);
-            }
-            if crate::arch::intc::uart_pending() {
-                crate::drivers::uart::irq_drain();
-            }
+            service_irqs();
             crate::proc::uproc::on_timer_preempt(frame_addr)
         }
         _ => fault_halt("Unhandled Exception", frame, read_esr_el1(), read_far_el1()),
     }
 }
 
+/// One heartbeat: re-arm the generic timer, keep the HDMI ring fed, watch for hangs.
+fn timer_tick() {
+    unsafe { TICKS += 1 };
+    if unsafe { TICKS } == 300 {
+        // one line, three seconds in: proof on the serial log that the timer IRQ runs
+        crate::console_write(b"irq: heartbeat alive (300 ticks)\n");
+    }
+    crate::arch::timer::rearm_periodic(HEARTBEAT_HZ);
+    crate::arch::hdmi_audio::pump_irq();
+    if unsafe { TICKS } % 100 == 0 {
+        crate::lingrt::hang_tick();
+    }
+}
+
+/// Dispatch whatever raised the IRQ: through the GIC on the Pi 4 / 5
+/// (acknowledge, handle, end), through the legacy controllers on the Pi 3.
+fn service_irqs() {
+    unsafe { IRQ_ENTRIES += 1 };
+    if crate::arch::gic::active() {
+        let mut guard = 0;
+        let mut ticked = false;
+        while let Some(iar) = crate::arch::gic::ack() {
+            if unsafe { FIRST_IAR } == u32::MAX {
+                unsafe { FIRST_IAR = iar };
+                print_hex64("irq: first interrupt from the GIC, IAR=", iar as u64);
+            }
+            if matches!(iar & 0x3FF, crate::arch::gic::IRQ_TIMER_PHYS_NS | crate::arch::gic::IRQ_TIMER_PHYS_S) {
+                timer_tick();
+                ticked = true;
+            }
+            crate::arch::gic::eoi(iar);
+            guard += 1;
+            if guard > 16 {
+                break;
+            }
+        }
+        // the timer under another id (or a spurious 1023): its own status
+        // bit says whether it fired, and re-arming it drops the level
+        if !ticked && crate::arch::timer::phys_pending() {
+            timer_tick();
+        }
+        return;
+    }
+    if crate::arch::intc::core_timer_pending() {
+        timer_tick();
+    }
+    if crate::arch::intc::uart_pending() {
+        crate::drivers::uart::irq_drain();
+    }
+}
+
+/// `v` as 0x-less hex into `buf` (no allocation: the heap may be what broke).
+fn hex_into(buf: &mut [u8; 18], v: u64) -> &[u8] {
+    let digits = b"0123456789abcdef";
+    let mut n = 0;
+    let mut started = false;
+    for i in (0..16).rev() {
+        let d = ((v >> (i * 4)) & 0xF) as usize;
+        if d != 0 || started || i == 0 {
+            started = true;
+            buf[n] = digits[d];
+            n += 1;
+        }
+    }
+    &buf[..n]
+}
+
 fn fault_halt(name: &str, frame: &TrapFrame, esr: u64, far: u64) -> ! {
+    // Silence the HDMI audio ring and take the screen back so the report is
+    // visible, instead of the last buffer looping behind a frozen window.
+    crate::arch::hdmi_audio::stop();
+    crate::drivers::fbcon::init();
     crate::console_write(b"\n!!! CPU EXCEPTION: ");
     crate::console_write(name.as_bytes());
     crate::console_write(b"\n");
@@ -274,6 +476,28 @@ fn fault_halt(name: &str, frame: &TrapFrame, esr: u64, far: u64) -> ! {
     print_hex64("  spsr_el1=", frame.spsr);
     print_hex64("  sp_el0=", frame.sp_el0);
     print_hex64("  x30(lr)=", frame.gpr[30]);
+    print_hex64("  x29(fp)=", frame.gpr[29]);
+    crate::console_write(b"  thread: ");
+    crate::console_write(crate::coro::current_name());
+    crate::console_write(b"\n");
+    // the call chain (frame records: [fp] = caller's fp, [fp + 8] = return address)
+    crate::console_write(b"  backtrace:");
+    let mut fp = frame.gpr[29];
+    let mut n = 0;
+    while n < 14 && fp != 0 && fp & 7 == 0 && (0x8_0000..0x10_0000_0000).contains(&fp) {
+        let ret = unsafe { core::ptr::read_volatile((fp + 8) as *const u64) };
+        let next = unsafe { core::ptr::read_volatile(fp as *const u64) };
+        let mut b = [0u8; 18];
+        let s = hex_into(&mut b, ret);
+        crate::console_write(b" ");
+        crate::console_write(s);
+        if next <= fp {
+            break;
+        }
+        fp = next;
+        n += 1;
+    }
+    crate::console_write(b"\n");
     crate::console_write(b"!!! kernel halted\n");
     loop {
         unsafe { super::cpu::wfi() };

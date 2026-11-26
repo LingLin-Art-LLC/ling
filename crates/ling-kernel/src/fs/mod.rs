@@ -4,11 +4,22 @@
 //! x86_64-only today — the aarch64 storage stack (`drivers::emmc`, once it
 //! exists) is on the LingOS packages roadmap, not started yet.
 
-#[cfg(target_arch = "x86_64")]
 pub mod blockdev;
+// x86: every whole disk (SATA, NVMe, USB), partition tables, the installer's GPT.
 #[cfg(target_arch = "x86_64")]
+pub mod disks;
+// FAT16/32 volumes (USB flash drives, SD cards) and their mounts under media/.
+pub mod fat;
+// exFAT volumes (files over 4 GiB: big data partitions, SDXC cards).
+pub mod exfat;
+pub mod media;
 pub mod lingfs;
-#[cfg(target_arch = "x86_64")]
 pub mod packages;
-#[cfg(target_arch = "x86_64")]
 pub mod users;
+// Optional two-factor sign-in (TOTP + recovery codes) for accounts.
+pub mod twofa;
+pub mod seckey;
+// SSH keys approved (with a touch of the account's security key) for publickey logins.
+pub mod sshkeys;
+// Security keys for apps (Ling Wallet, Ling Messenger): keyslots for an app secret.
+pub mod appkeys;

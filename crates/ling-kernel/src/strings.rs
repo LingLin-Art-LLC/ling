@@ -7,11 +7,10 @@
 //! `crates/ling-codegen/src/cranelift/runtime.rs` if that ever changes).
 //!
 //! Nothing here ever calls `mm::heap::free`: the Ling compiler doesn't emit
-//! drop/refcount calls for kernel-target code, so every string this runtime
-//! allocates is intentionally leaked for the process's lifetime, same as
-//! before this module moved off the old bump allocator — a real fix needs
-//! ownership tracking at the language/compiler level, not an allocator
-//! change, and is out of scope here.
+//! drop/refcount calls for kernel-target code. Instead every string is a
+//! `lingrt` collector object -- a 16-byte `GcHdr` sits right before the
+//! length word the value points at -- and `lingrt::gc_collect` frees the
+//! ones nothing refers to any more.
 use core::ptr;
 
 const TAG_PATTERN: u64 = 0x7F00_0000_0000_0000;
@@ -30,7 +29,7 @@ pub(crate) fn decode_ptr(val: u64) -> *mut u8 {
     (val & PTR_MASK) as *mut u8
 }
 
-unsafe fn header_len(ptr: *const u8) -> usize {
+pub(crate) unsafe fn header_len(ptr: *const u8) -> usize {
     u32::from_le_bytes([*ptr, *ptr.add(1), *ptr.add(2), *ptr.add(3)]) as usize
 }
 
@@ -56,10 +55,11 @@ pub(crate) unsafe fn bytes_of_ptr(p: *mut u8) -> &'static [u8] {
 }
 
 fn alloc_string(len: usize) -> *mut u8 {
-    let buf = crate::mm::heap::alloc(4 + len);
-    if buf.is_null() {
-        crate::kernel_panic("out of memory (heap allocator exhausted)");
-    }
+    // A compiled program's very first act can be building a string literal,
+    // before anything has called ling_kernel_init (LingStationX never does).
+    crate::lingrt::ensure_init();
+    let base = crate::lingrt::gc_alloc(crate::lingrt::GC_HDR + 4 + len, crate::lingrt::GK_STR);
+    let buf = unsafe { base.add(crate::lingrt::GC_HDR) };
     let len_bytes = (len as u32).to_le_bytes();
     unsafe { ptr::copy_nonoverlapping(len_bytes.as_ptr(), buf, 4) };
     buf
@@ -75,14 +75,31 @@ pub unsafe extern "C" fn ling_str_new(bytes: *const u8, len: usize) -> u64 {
     encode(buf)
 }
 
+/// `len(x)` — the compiler routes every `len` here, so it must handle lists as
+/// well as strings. Strings count *characters* (UTF-8), like the interpreter.
 #[no_mangle]
 pub unsafe extern "C" fn ling_str_len(val: u64) -> u64 {
-    let len = header_len(decode_ptr(val));
-    (len as f64).to_bits()
+    use crate::lingrt;
+    let n = if lingrt::is_str(val) {
+        lingrt::str_of(val).chars().count()
+    } else if lingrt::is_list(val) {
+        lingrt::list_items(val).len()
+    } else {
+        0
+    };
+    (n as f64).to_bits()
 }
 
+/// Concatenate; a non-string operand is formatted the interpreter's way.
 #[no_mangle]
 pub unsafe extern "C" fn ling_str_concat(a: u64, b: u64) -> u64 {
+    use crate::lingrt;
+    if !(lingrt::is_str(a) && lingrt::is_str(b)) {
+        let mut s = alloc::string::String::new();
+        lingrt::fmt_into(&mut s, a);
+        lingrt::fmt_into(&mut s, b);
+        return lingrt::mk_str(&s);
+    }
     let (pa, pb) = (decode_ptr(a), decode_ptr(b));
     let (la, lb) = (header_len(pa), header_len(pb));
     let buf = alloc_string(la + lb);

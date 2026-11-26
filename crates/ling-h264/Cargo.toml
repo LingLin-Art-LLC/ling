@@ -1,0 +1,17 @@
+[package]
+name = "ling-h264"
+version = "2030.0.1"
+edition = "2021"
+authors = ["Ling Lin <taellinglin@gmail.com>"]
+description = "A freestanding (no_std + alloc) H.264/AVC decoder for LingOS: Constrained Baseline, Main and High profile progressive 8-bit 4:2:0 (CAVLC + CABAC, I/P/B, weighted prediction, direct modes, 8x8 transform and scaling matrices, deblocking, DPB/POC/reordering). MP4 avcC samples or Annex-B input, YUV 4:2:0 or RGBA output."
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/taellinglin/ling"
+
+[features]
+default = []
+
+[dependencies]
+
+[dev-dependencies]
+# the encoder example writes MP4 files
+ling-mp4 = { path = "../ling-mp4" }

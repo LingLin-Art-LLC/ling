@@ -32,6 +32,18 @@ pub fn compile_path(entry: &Path, opt_level: OptimizationLevel) -> LingResult<Mi
     Ok(optimize(mir, opt_level))
 }
 
+/// Like [`compile_path`], for programs that run with no host interpreter behind
+/// them (LingOS kernel and userland images). Functions read module globals via
+/// `__ling_global`, which the hosted runtime answers from the interpreter's
+/// evaluated snapshot; standalone there is no such snapshot, so `__main__` first
+/// evaluates every global `bind` in source order and records it with
+/// `__ling_global_set` before running the entry.
+pub fn compile_path_standalone(entry: &Path, opt_level: OptimizationLevel) -> LingResult<MirProgram> {
+    let flat = flatten_path(entry)?;
+    let mir = lower_program_with(&flat, true);
+    Ok(optimize(mir, opt_level))
+}
+
 /// Resolve `use`/`mod` imports for `entry` and return the flattened AST. Used by
 /// the JIT to prime its fallback interpreter with the same program it compiles.
 pub fn flatten_path(entry: &Path) -> LingResult<parser::ast::Program> {
@@ -113,6 +125,16 @@ fn optimize(mut mir: MirProgram, opt_level: OptimizationLevel) -> MirProgram {
 // ─── AST → MIR lowering ──────────────────────────────────────────────────────
 
 fn lower_program(prog: &parser::ast::Program) -> MirProgram {
+    lower_program_with(prog, false)
+}
+
+thread_local! {
+    /// Lowering for a standalone image (LingOS): no host interpreter behind it.
+    static STANDALONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn lower_program_with(prog: &parser::ast::Program, init_globals: bool) -> MirProgram {
+    STANDALONE.with(|s| s.set(init_globals));
     let entry = crate::entry::entry_name(&prog.items);
 
     // Module globals: every top-level bind that is not the entry. Functions read
@@ -142,6 +164,34 @@ fn lower_program(prog: &parser::ast::Program) -> MirProgram {
     // other top-level binds are globals (resolved at runtime, see above).
     // With no entry, every top-level bind is treated as the script body.
     let mut main_stmts: Vec<parser::ast::Stmt> = Vec::new();
+    if init_globals && entry.is_some() {
+        // Standalone images have no interpreter to know the program's `form`s:
+        // tell the runtime each one's field names first, so a constructor call
+        // (`Meta(a, b)`) builds a record and `r.field` reads it.
+        for item in &prog.items {
+            if let parser::ast::Item::Struct(name, fields) = item {
+                let mut args = vec![parser::ast::Expr::Str(name.clone())];
+                args.extend(fields.iter().map(|f| parser::ast::Expr::Str(f.clone())));
+                main_stmts.push(parser::ast::Stmt::Expr(parser::ast::Expr::Call(
+                    Box::new(parser::ast::Expr::Ident("__ling_form_def".to_string())),
+                    args,
+                )));
+            }
+        }
+        // Standalone images: evaluate each global in source order and record it,
+        // so `__ling_global` reads (from any function) find a value. A global's
+        // initialiser that names an earlier global reads it back the same way.
+        for item in &prog.items {
+            if let parser::ast::Item::Bind(name, body) = item {
+                if globals.contains(name) {
+                    main_stmts.push(parser::ast::Stmt::Expr(parser::ast::Expr::Call(
+                        Box::new(parser::ast::Expr::Ident("__ling_global_set".to_string())),
+                        vec![parser::ast::Expr::Str(name.clone()), body.clone()],
+                    )));
+                }
+            }
+        }
+    }
     for item in &prog.items {
         if let parser::ast::Item::Bind(name, body) = item {
             let is_main = match &entry {
@@ -185,7 +235,7 @@ fn lower_function(
     let mut lctx = LowerCtx::new(&mut func, arg_count, globals);
 
     for (i, pname) in fndef.params.iter().enumerate() {
-        lctx.declare_in_scope(pname, Local(i + 1));
+        lctx.declare_param(pname, Local(i + 1));
     }
 
     let last = lower_stmts(&fndef.body, &mut lctx);
@@ -252,6 +302,22 @@ impl<'a> LowerCtx<'a> {
             .last_mut()
             .unwrap()
             .insert(name.to_string());
+    }
+
+    /// Declare a function / closure parameter: the argument slot is copied
+    /// into a fresh mutable local and the name resolves to that local, so a
+    /// `bind name = …` anywhere in the body (same-scope mutation, like any
+    /// other local) and every read of the name -- before it, after it, in a
+    /// loop condition -- agree on one place. The backends treat the argument
+    /// slots themselves as single-assignment: assigning one made `bind dt =
+    /// min(dt, 0.033)` read its own empty result, and mapping the name to a
+    /// fresh local only at the first `bind` left reads lowered earlier (a
+    /// `while` condition) on the slot and reads after a loop that never ran on
+    /// an unassigned local.
+    fn declare_param(&mut self, name: &str, local: Local) {
+        let l = self.alloc_local(Some(name.to_string()), true);
+        self.emit(StatementKind::Assign(l, Rvalue::Use(Operand::Copy(local))));
+        self.declare_in_scope(name, l);
     }
 
     /// Resolve the local a `bind name = …` should target. Re-binding within the
@@ -375,7 +441,7 @@ fn lower_stmt(stmt: &parser::ast::Stmt, ctx: &mut LowerCtx) -> Option<Operand> {
                     let mut closure_ctx =
                         LowerCtx::new(&mut closure_func, total_args, ctx.globals.clone());
                     for (i, pname) in params.iter().enumerate() {
-                        closure_ctx.declare_in_scope(pname, Local(i + 1));
+                        closure_ctx.declare_param(pname, Local(i + 1));
                     }
                     for (ci, fv) in free_vars.iter().enumerate() {
                         closure_ctx
@@ -401,6 +467,41 @@ fn lower_stmt(stmt: &parser::ast::Stmt, ctx: &mut LowerCtx) -> Option<Operand> {
                         Rvalue::Use(Operand::Constant(Constant::Function(closure_name))),
                     ));
                     return None;
+                }
+            }
+            // `bind x = list_push(x, …)` / `bind x = list_set(x, …)` — the linear
+            // accumulator pattern. Lower the call straight into x's own local
+            // (dest == arg0) so codegen's recycle path keeps the mutation in
+            // place. The generic path below routes the result through a temp,
+            // which leaves a second live handle across the call and forces the
+            // shim's `Rc::make_mut` into a full copy-on-write EVERY iteration —
+            // ~14 µs per `list_set` on a 2k list instead of ~10 ns. Mirrors the
+            // tree-walker's own in-place fast path for exactly this shape.
+            if let parser::ast::Expr::Call(callee, cargs) = expr {
+                if let parser::ast::Expr::Ident(fname) = callee.as_ref() {
+                    if ling_codegen::consumes_list_arg0(fname, cargs.len())
+                        && matches!(cargs.first(), Some(parser::ast::Expr::Ident(a0)) if a0 == name)
+                        && ctx.scope_names.last().is_some_and(|s| s.contains(name))
+                        && !ctx.locals.contains_key(fname)
+                        && !ctx.globals.contains(fname)
+                        && !ctx.closure_vars.contains_key(fname)
+                    {
+                        // Same-scope re-bind → bind_local would return this same
+                        // local; using it directly keeps arg0 and dest identical.
+                        let dest = ctx.locals[name];
+                        let mut mir_args = vec![Operand::Copy(dest)];
+                        for a in cargs.iter().skip(1) {
+                            mir_args.push(lower_expr(a, ctx));
+                        }
+                        ctx.emit(StatementKind::Assign(
+                            dest,
+                            Rvalue::Call {
+                                func: Operand::Constant(Constant::Function(fname.clone())),
+                                args: mir_args,
+                            },
+                        ));
+                        return None;
+                    }
                 }
             }
             let val = lower_expr(expr, ctx);
@@ -478,6 +579,19 @@ fn lower_expr(expr: &parser::ast::Expr, ctx: &mut LowerCtx) -> Operand {
             Operand::Copy(local)
         },
         parser::ast::Expr::Call(callee, args) => {
+            // `try(f, args..)` naming a function, in a standalone image: compiled
+            // code there has no exceptions to catch, so it is `ok(f(args..))`.
+            if STANDALONE.with(|s| s.get()) {
+                if let parser::ast::Expr::Ident(t) = callee.as_ref() {
+                    if let (true, Some(parser::ast::Expr::Ident(f))) = (t == "try", args.first()) {
+                        if !ctx.locals.contains_key(f) {
+                            let inner = parser::ast::Expr::Call(Box::new(parser::ast::Expr::Ident(f.clone())), args[1..].to_vec());
+                            let wrapped = parser::ast::Expr::Call(Box::new(parser::ast::Expr::Ident("ok".to_string())), vec![inner]);
+                            return lower_expr(&wrapped, ctx);
+                        }
+                    }
+                }
+            }
             // Detect inline closure call with captures
             if let parser::ast::Expr::Closure(params, body) = callee.as_ref() {
                 let free_vars = collect_free_vars(body, params);
@@ -494,7 +608,7 @@ fn lower_expr(expr: &parser::ast::Expr, ctx: &mut LowerCtx) -> Operand {
                 );
                 for (i, pname) in params.iter().enumerate() {
                     let local = Local(i + 1);
-                    closure_ctx.declare_in_scope(pname, local);
+                    closure_ctx.declare_param(pname, local);
                 }
                 // Map captures to extra params
                 for (ci, fv) in free_vars.iter().enumerate() {
@@ -724,8 +838,21 @@ fn lower_expr(expr: &parser::ast::Expr, ctx: &mut LowerCtx) -> Operand {
                     },
                     parser::ast::Pattern::Constructor(_, _)
                     | parser::ast::Pattern::Variant(_, _) => {
-                        // Constructor / variant patterns are handled by the tree-walker;
-                        // in MIR they fall through to the next arm.
+                        // `ok(v)` / `bad(e)` / `Circle(r)`: every check of the (possibly nested) pattern branches to `next` on a
+                        // miss; the names are bound only once all of them pass
+                        let next = ctx.new_block();
+                        let mut binds: Vec<(String, Local)> = vec![];
+                        lower_pattern_checks(&arm.pattern, scrut_local, ctx, next, &mut binds);
+                        for (name, from) in binds {
+                            let bound = ctx.bind_local(&name);
+                            ctx.emit(StatementKind::Assign(bound, Rvalue::Use(Operand::Copy(from))));
+                        }
+                        let v = lower_expr(&arm.body, ctx);
+                        ctx.emit(StatementKind::Assign(result, Rvalue::Use(v)));
+                        if !ctx.term_is_set() {
+                            ctx.set_term(TerminatorKind::Goto { target: merge });
+                        }
+                        ctx.switch(next);
                     },
                 }
             }
@@ -748,7 +875,7 @@ fn lower_expr(expr: &parser::ast::Expr, ctx: &mut LowerCtx) -> Operand {
             let mut closure_ctx = LowerCtx::new(&mut closure_func, total_args, ctx.globals.clone());
             for (i, pname) in params.iter().enumerate() {
                 let local = Local(i + 1);
-                closure_ctx.declare_in_scope(pname, local);
+                closure_ctx.declare_param(pname, local);
             }
             for (ci, fv) in free_vars.iter().enumerate() {
                 let param_local = Local(arg_count + 1 + ci);
@@ -762,6 +889,71 @@ fn lower_expr(expr: &parser::ast::Expr, ctx: &mut LowerCtx) -> Operand {
         },
 
         parser::ast::Expr::Await(_) => Operand::Constant(Constant::None),
+    }
+}
+
+/// A call to a runtime helper (resolved by the JIT's builtin dispatcher) into a fresh local.
+fn helper_call(name: &str, args: Vec<Operand>, ctx: &mut LowerCtx) -> Local {
+    let local = ctx.alloc_local(None, false);
+    ctx.emit(StatementKind::Assign(
+        local,
+        Rvalue::Call { func: Operand::Constant(Constant::Function(name.to_string())), args },
+    ));
+    local
+}
+
+/// Continue in a new block when `cond` holds, else jump to `fail`.
+fn branch_unless(cond: Operand, fail: BasicBlockId, ctx: &mut LowerCtx) {
+    let cmp = ctx.alloc_local(None, false);
+    ctx.emit(StatementKind::Assign(
+        cmp,
+        Rvalue::BinaryOp(ling_ast::ast::BinOp::Eq, cond, Operand::Constant(Constant::Bool(true))),
+    ));
+    let cont = ctx.new_block();
+    ctx.set_term(TerminatorKind::SwitchInt { discr: Operand::Copy(cmp), targets: vec![(1, cont)], otherwise: fail });
+    ctx.switch(cont);
+}
+
+/// The checks of a match pattern against `val`: constructor (`ok` / `bad`) and variant patterns ask the runtime
+/// (`__ling_pat_test` / `__ling_pat_part`, the interpreter's own matching rules) whether the value has that shape and for
+/// its parts; literals compare; names are collected into `binds` for the caller to bind after every check passed.
+fn lower_pattern_checks(
+    pat: &parser::ast::Pattern,
+    val: Local,
+    ctx: &mut LowerCtx,
+    fail: BasicBlockId,
+    binds: &mut Vec<(String, Local)>,
+) {
+    use parser::ast::Pattern;
+    let s = |x: &str| Operand::Constant(Constant::Str(x.to_string()));
+    match pat {
+        Pattern::Wildcard => {},
+        Pattern::Ident(name) => binds.push((name.clone(), val)),
+        Pattern::Str(_) | Pattern::Number(_) | Pattern::Bool(_) => {
+            let cmp = ctx.alloc_local(None, false);
+            ctx.emit(StatementKind::Assign(
+                cmp,
+                Rvalue::BinaryOp(ling_ast::ast::BinOp::Eq, Operand::Copy(val), pattern_to_operand(pat)),
+            ));
+            branch_unless(Operand::Copy(cmp), fail, ctx);
+        },
+        Pattern::Constructor(name, inner) => {
+            let arity = if inner.is_some() { 1.0 } else { 0.0 };
+            let t = helper_call("__ling_pat_test", vec![Operand::Copy(val), s("c"), s(name), f64_const(arity)], ctx);
+            branch_unless(Operand::Copy(t), fail, ctx);
+            if let Some(p) = inner {
+                let part = helper_call("__ling_pat_part", vec![Operand::Copy(val), s("c"), s(name), f64_const(0.0)], ctx);
+                lower_pattern_checks(p, part, ctx, fail, binds);
+            }
+        },
+        Pattern::Variant(name, subs) => {
+            let t = helper_call("__ling_pat_test", vec![Operand::Copy(val), s("v"), s(name), f64_const(subs.len() as f64)], ctx);
+            branch_unless(Operand::Copy(t), fail, ctx);
+            for (i, p) in subs.iter().enumerate() {
+                let part = helper_call("__ling_pat_part", vec![Operand::Copy(val), s("v"), s(name), f64_const(i as f64)], ctx);
+                lower_pattern_checks(p, part, ctx, fail, binds);
+            }
+        },
     }
 }
 

@@ -431,11 +431,8 @@ fn collect_platforms(args: &[String]) -> Vec<String> {
     if platforms.iter().any(|p| p == "all") {
         return vec!["win".into(), "lin".into(), "mac".into(), "web".into()];
     }
-    if platforms.is_empty() {
-        // Default: current native platform + web
-        platforms.push(native_platform().into());
-        platforms.push("web".into());
-    }
+    // Empty is returned as-is: run_build fills in the manifest's `targets`, or the host
+    // platform plus web when the manifest names none.
     platforms
 }
 
@@ -477,6 +474,16 @@ impl ProjKind {
     }
 }
 
+/// One `[app.<name>]` section of a kernel manifest.
+#[derive(Clone)]
+struct BundleApp {
+    name: String,
+    entry: PathBuf,
+    root: PathBuf,
+    includes: Vec<String>,
+}
+
+#[derive(Clone)]
 struct LingProject {
     name: String,
     version: String,
@@ -486,12 +493,74 @@ struct LingProject {
     build_dir: PathBuf,    // where the temp Rust build project lives
     icon: Option<PathBuf>, // app icon source from the manifest (svg/png/ico)
     includes: Vec<String>, // resource globs from the manifest [includes] block
+    /// `embed_root = "<dir>"` (kernel targets): the directory `includes` globs
+    /// resolve against, and that embedded file names are relative to — e.g. the
+    /// app folder for a kernel that runs an app living elsewhere, so the app's
+    /// own relative paths (`assets/font.ttf`) find its embedded files.
+    embed_root: Option<PathBuf>,
+    /// `kernel_app = "<name>"` (Raspberry Pi kernel targets): instead of running
+    /// the entry program as the whole kernel, boot LingOS (console, USB, setup)
+    /// and offer the program as a built-in app of that name, started from the console.
+    kernel_app: Option<String>,
+    /// `bundle_app = "<name>:<path/to/main.ling>"` (kernel targets): compile a
+    /// second program into the image as a built-in app (its own object, local
+    /// symbols, entry `__ling_app_<name>`) next to the entry program — e.g.
+    /// LingStationX inside the x86 desktop, launched from the Applications menu.
+    bundle_app: Option<(String, PathBuf)>,
+    /// `[app.<name>]` sections (kernel targets): more programs compiled into
+    /// the image as built-in apps, each with its own object, embed root and
+    /// `includes` (embedded as `apps/<name>/<rel>`) -- the studio image that
+    /// bundles LingStationX, LingDev, LingModeler and Horizon together.
+    bundle_apps: Vec<BundleApp>,
     /// `[project] graphics = true` (kernel targets only): request a
     /// Multiboot2 linear framebuffer instead of leaving VGA in text mode
     /// (see `ling-kernel`'s `request_framebuffer` Cargo feature). Off by
     /// default — enabling it for a target with no framebuffer-based
     /// renderer would blank the screen (confirmed the hard way once).
     graphics: bool,
+    /// `entry_os = "<path>"`: the entry used for the LingOS targets (kernel, rpi,
+    /// lingos) instead of `entry` — an app whose desktop entry `use`s the desktop
+    /// platform layer can name its LingOS twin (e.g. `ling/main_os.ling`).
+    entry_os: Option<PathBuf>,
+    /// `portable = "<dir>"`: desktop builds (win / lin / mac) get the portable
+    /// launcher — the exe runs `<dir>/<entry>` on the interpreter from the folder
+    /// next to it (copied there by `includes`), so multi-folder apps whose modules
+    /// `use "sub/..."` keep their layout. Same as setting LING_APP_INTERP=<dir>.
+    portable: Option<String>,
+    /// `includes_os = [...]`: the resources embedded by the LingOS targets instead of
+    /// `includes` (a kernel image should not carry a desktop build's music folder).
+    includes_os: Option<Vec<String>>,
+    /// `pack = true`: embed the entry and every `includes` resource inside the exe, so the
+    /// build is one self-contained file with no loose, editable `.ling` beside it (they are
+    /// unpacked to a temp cache at launch). Same as passing `--pack` on the build command.
+    pack: bool,
+    /// `targets = ["win", "lingos", ...]`: the platforms a bare `ling build` (no `--platform`)
+    /// produces. Empty falls back to the host platform plus web.
+    targets: Vec<String>,
+    /// `ling-features = ["web", ...]`: Cargo features of the `ling` crate to turn on in the
+    /// built native exe (win / lin / mac). Needed when the program uses builtins a feature
+    /// gates — e.g. `web` compiles in the sqlite builtins (`db_open`/`db_exec`/`db_query`),
+    /// without which those calls fail at runtime with "unknown function 'db_open'". Merged
+    /// with the LING_APP_FEATURES env var. Ignored by LingOS/kernel targets.
+    ling_features: Vec<String>,
+    /// `ling-features-<platform> = [...]` (win / lin / mac / macarm / pios): replaces
+    /// `ling-features` for that one platform. `[]` means none. A feature such as `web` drags in
+    /// dozens of extra crates (HTTP, video decode, audio out), which an offline or minimal
+    /// machine may never have downloaded, so a platform that does not use it can opt out.
+    /// Keyed by `NativePlatform::dir_name`.
+    ling_features_per: Vec<(String, Vec<String>)>,
+}
+
+impl LingProject {
+    /// The `ling` crate features to build `p` with: its own override if the manifest has one,
+    /// else the manifest-wide `ling-features`.
+    fn ling_features_for(&self, p: NativePlatform) -> &[String] {
+        self.ling_features_per
+            .iter()
+            .find(|(d, _)| d == p.dir_name())
+            .map(|(_, v)| v.as_slice())
+            .unwrap_or(&self.ling_features)
+    }
 }
 
 fn discover_project(target: &str) -> LingProject {
@@ -512,7 +581,18 @@ fn discover_project(target: &str) -> LingProject {
             build_dir,
             icon: None,
             includes: Vec::new(),
+            embed_root: None,
+            kernel_app: None,
+            bundle_app: None,
+            bundle_apps: Vec::new(),
             graphics: false,
+            entry_os: None,
+            portable: None,
+            includes_os: None,
+            pack: false,
+            targets: Vec::new(),
+            ling_features: Vec::new(),
+            ling_features_per: Vec::new(),
         }
     } else if path.is_dir() {
         // ling-fu project: 灵符.toml or ลิงฟู.toml
@@ -550,7 +630,18 @@ fn discover_project(target: &str) -> LingProject {
             build_dir,
             icon: None,
             includes: Vec::new(),
+            embed_root: None,
+            kernel_app: None,
+            bundle_app: None,
+            bundle_apps: Vec::new(),
             graphics: false,
+            entry_os: None,
+            portable: None,
+            includes_os: None,
+            pack: false,
+            targets: Vec::new(),
+            ling_features: Vec::new(),
+            ling_features_per: Vec::new(),
         }
     } else {
         eprintln!("error: '{}' is not a .ling file or directory", target);
@@ -627,7 +718,18 @@ fn parse_lingfu_toml(toml: &Path, base: &Path) -> LingProject {
         build_dir,
         icon,
         includes,
+        embed_root: None,
+        kernel_app: None,
+        bundle_app: None,
+        bundle_apps: Vec::new(),
         graphics: false,
+        entry_os: None,
+        portable: None,
+        includes_os: None,
+        pack: false,
+        targets: parse_targets(&text),
+        ling_features: parse_ling_features(&text),
+        ling_features_per: parse_ling_features_per(&text),
     }
 }
 
@@ -652,9 +754,23 @@ fn parse_ling_toml(toml: &Path, base: &Path) -> LingProject {
     let mut kind = ProjKind::Bin;
     let mut icon: Option<PathBuf> = None;
     let mut graphics = false;
+    let mut embed_root: Option<PathBuf> = None;
+    let mut kernel_app: Option<String> = None;
+    let mut bundle_app: Option<(String, PathBuf)> = None;
+    let mut entry_os: Option<PathBuf> = None;
+    let mut portable: Option<String> = None;
+    let mut pack = false;
+    let mut in_app = false;
 
     for line in text.lines() {
         let line = line.trim();
+        if line.starts_with('[') {
+            in_app = line.starts_with("[app.");
+            continue;
+        }
+        if in_app {
+            continue;
+        }
         if let Some(v) = toml_kv(line, "name") {
             name = sanitise_name(&v);
         }
@@ -676,6 +792,28 @@ fn parse_ling_toml(toml: &Path, base: &Path) -> LingProject {
         if let Some(v) = toml_kv(line, "graphics") {
             graphics = v == "true";
         }
+        // embed_root = "../app" (kernel targets): where `includes` resolve and
+        // what embedded file names are relative to.
+        if let Some(v) = toml_kv(line, "embed_root") {
+            embed_root = Some(base.join(v));
+        }
+        if let Some(v) = toml_kv(line, "kernel_app") {
+            kernel_app = Some(v.to_string());
+        }
+        if let Some(v) = toml_kv(line, "bundle_app") {
+            if let Some((name, path)) = v.split_once(':') {
+                bundle_app = Some((name.trim().to_string(), base.join(path.trim())));
+            }
+        }
+        if let Some(v) = toml_kv(line, "entry_os") {
+            entry_os = Some(base.join(v));
+        }
+        if let Some(v) = toml_kv(line, "portable") {
+            portable = Some(v.trim_matches('/').to_string());
+        }
+        if let Some(v) = toml_kv(line, "pack") {
+            pack = v == "true";
+        }
     }
 
     let entry = base.join(&entry_name);
@@ -685,6 +823,7 @@ fn parse_ling_toml(toml: &Path, base: &Path) -> LingProject {
     }
     let build_dir = base.join(".ling-build").join(&name);
     let includes = parse_includes(&text);
+    let bundle_apps = parse_bundle_apps(&text, base);
     LingProject {
         name,
         version,
@@ -694,7 +833,18 @@ fn parse_ling_toml(toml: &Path, base: &Path) -> LingProject {
         build_dir,
         icon,
         includes,
+        embed_root,
+        kernel_app,
+        bundle_app,
+        bundle_apps,
         graphics,
+        entry_os,
+        portable,
+        includes_os: parse_includes_os(&text),
+        pack,
+        targets: parse_targets(&text),
+        ling_features: parse_ling_features(&text),
+        ling_features_per: parse_ling_features_per(&text),
     }
 }
 
@@ -794,29 +944,95 @@ fn run_build(
         std::process::exit(1);
     });
 
+    // An explicit --platform wins. Otherwise build the manifest's `targets`, falling back to
+    // the host platform plus web when it declares none.
+    let resolved: Vec<String> = if !platforms.is_empty() {
+        platforms.to_vec()
+    } else if !project.targets.is_empty() {
+        project.targets.clone()
+    } else {
+        vec![native_platform().into(), "web".into()]
+    };
+    if platforms.is_empty() && !project.targets.is_empty() {
+        println!("  targets (from manifest): {}", resolved.join(", "));
+    }
+
     let icon = icon_override.as_deref();
-    for platform in platforms {
+    // Manifest-driven `targets` may declare the project's FULL release set
+    // (win + lin + mac + ...), more than one host can build: OS-native targets
+    // the current host can't produce (and `cross` isn't installed) are skipped
+    // with a note instead of aborting the whole list, so a bare `ling build .`
+    // yields what it can locally and CI builds the rest on its own runners.
+    // An explicit --platform stays strict and still fails loudly.
+    let from_manifest = platforms.is_empty();
+    let skip_foreign = |p: NativePlatform| -> bool {
+        if from_manifest && !p.is_current_host() && !has_cross() {
+            println!(
+                "  [{}] skipped: needs a {} host or `cross` (your CI release workflow builds it)",
+                p.dir_name(),
+                p.dir_name()
+            );
+            true
+        } else {
+            false
+        }
+    };
+    for platform in &resolved {
         match platform.as_str() {
             "web" => build_web(&project, out),
             "win" | "windows" => {
-                build_native(&project, out, NativePlatform::Windows, icon, pack, aot)
+                if !skip_foreign(NativePlatform::Windows) {
+                    build_native(&project, out, NativePlatform::Windows, icon, pack, aot)
+                }
             },
-            "lin" | "linux" => build_native(&project, out, NativePlatform::Linux, icon, pack, aot),
+            "lin" | "linux" => {
+                if !skip_foreign(NativePlatform::Linux) {
+                    build_native(&project, out, NativePlatform::Linux, icon, pack, aot)
+                }
+            },
             "mac" | "macos" | "darwin" => {
-                build_native(&project, out, NativePlatform::Mac, icon, pack, aot)
+                if !skip_foreign(NativePlatform::Mac) {
+                    build_native(&project, out, NativePlatform::Mac, icon, pack, aot)
+                }
             },
+            "macarm" | "mac-arm" | "mac-arm64" | "macos-arm64" | "apple-silicon" => {
+                if !skip_foreign(NativePlatform::MacArm) {
+                    build_native(&project, out, NativePlatform::MacArm, icon, pack, aot)
+                }
+            },
+            // LingOS targets (kernel images and userland apps) are the `os` profile.
+            #[cfg(not(feature = "os"))]
+            "kernel" | "bare" | "rpi" | "raspberrypi" | "lingos" | "app" | "apps" | "lingos-rpi"
+            | "apps-rpi" | "app-rpi" => {
+                eprintln!(
+                    "platform '{platform}' needs the `os` profile, which this build of ling leaves out (reinstall with: cargo install ling-lang --features os, or the default full install)"
+                );
+                std::process::exit(1);
+            },
+            #[cfg(feature = "os")]
             "kernel" | "bare" => {
                 build_native(&project, out, NativePlatform::BareMetal, icon, pack, aot)
             },
+            #[cfg(feature = "os")]
             "rpi" | "raspberrypi" => {
                 build_native(&project, out, NativePlatform::Rpi, icon, pack, aot)
             },
+            "pios" | "pi" | "raspios" | "linux-arm64" | "linarm" | "arm64" => {
+                if !skip_foreign(NativePlatform::PiOs) {
+                    build_native(&project, out, NativePlatform::PiOs, icon, pack, aot)
+                }
+            },
+            #[cfg(feature = "os")]
             "lingos" | "app" | "apps" => {
                 build_native(&project, out, NativePlatform::Lingos, icon, pack, aot)
             },
+            #[cfg(feature = "os")]
+            "lingos-rpi" | "apps-rpi" | "app-rpi" => {
+                build_native(&project, out, NativePlatform::LingosRpi, icon, pack, aot)
+            },
             other => {
                 eprintln!(
-                    "unknown platform '{}' — use web|win|lin|mac|kernel|rpi|lingos|all",
+                    "unknown platform '{}' — use web|win|lin|mac|macarm|pios|kernel|rpi|lingos|all",
                     other
                 );
                 std::process::exit(1);
@@ -980,15 +1196,23 @@ fn open_browser(url: &str) {
 // ── Native build ──────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy)]
+#[cfg_attr(not(feature = "os"), allow(dead_code))] // LingOS variants: `os` profile
 enum NativePlatform {
     Windows,
     Linux,
     Mac,
+    /// macOS on Apple Silicon (aarch64-apple-darwin), always — unlike `Mac`, which is
+    /// x86_64 unless ling itself runs on an Apple Silicon Mac.
+    MacArm,
     BareMetal,
     /// Raspberry Pi (aarch64), bare-metal — see `RPI_LINKER_SCRIPT`.
     Rpi,
     /// LingOS ring-3 userspace ELF process linked against ling-user.
     Lingos,
+    /// The same LingOS userland ELF for the Raspberry Pi kernel (aarch64, EL0).
+    LingosRpi,
+    /// 64-bit Linux on ARM: Raspberry Pi OS (Pi 3 / 4 / 5) and other aarch64 boards.
+    PiOs,
 }
 
 impl NativePlatform {
@@ -997,9 +1221,12 @@ impl NativePlatform {
             Self::Windows => "windows",
             Self::Linux => "linux",
             Self::Mac => "macos",
+            Self::MacArm => "macos-arm64",
             Self::BareMetal => "kernel",
             Self::Rpi => "rpi",
             Self::Lingos => "apps",
+            Self::LingosRpi => "apps-rpi",
+            Self::PiOs => "linux-arm64",
         }
     }
 
@@ -1014,7 +1241,10 @@ impl NativePlatform {
                 }
             },
             Self::Linux => {
-                if cfg!(target_os = "linux") {
+                // on an aarch64 Linux host (a Raspberry Pi) `lin` builds for that host
+                if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+                    "aarch64-unknown-linux-gnu"
+                } else if cfg!(target_os = "linux") {
                     "x86_64-unknown-linux-gnu"
                 } else {
                     "x86_64-unknown-linux-musl"
@@ -1028,17 +1258,19 @@ impl NativePlatform {
                     "x86_64-apple-darwin"
                 }
             },
+            Self::MacArm => "aarch64-apple-darwin",
+            Self::PiOs => "aarch64-unknown-linux-gnu",
             // Custom hardware-SSE target spec (see LINGOS_X86_64_TARGET_JSON);
             // emitted + resolved via RUST_TARGET_PATH in the kernel build below.
             Self::BareMetal | Self::Lingos => LINGOS_X86_64_TARGET,
-            Self::Rpi => "aarch64-unknown-none",
+            Self::Rpi | Self::LingosRpi => "aarch64-unknown-none",
         }
     }
 
     fn exe_suffix(self) -> &'static str {
         match self {
             Self::Windows => ".exe",
-            Self::Lingos => ".elf",
+            Self::Lingos | Self::LingosRpi => ".elf",
             Self::BareMetal | Self::Rpi => "",
             _ => "",
         }
@@ -1049,7 +1281,9 @@ impl NativePlatform {
             Self::Windows => cfg!(target_os = "windows"),
             Self::Linux => cfg!(target_os = "linux"),
             Self::Mac => cfg!(target_os = "macos"),
-            Self::BareMetal | Self::Rpi | Self::Lingos => false,
+            Self::MacArm => cfg!(all(target_os = "macos", target_arch = "aarch64")),
+            Self::PiOs => cfg!(all(target_os = "linux", target_arch = "aarch64")),
+            Self::BareMetal | Self::Rpi | Self::Lingos | Self::LingosRpi => false,
         }
     }
 
@@ -1061,7 +1295,7 @@ impl NativePlatform {
     fn cranelift_arch(self) -> &'static str {
         match self {
             Self::BareMetal | Self::Lingos => "x86_64",
-            Self::Rpi => "aarch64",
+            Self::Rpi | Self::LingosRpi => "aarch64",
             _ => unreachable!("cranelift_arch only used for kernel and lingos targets"),
         }
     }
@@ -1077,8 +1311,33 @@ fn build_native(
 ) {
     let triple = platform.triple();
     let is_kernel = matches!(platform, NativePlatform::BareMetal | NativePlatform::Rpi);
-    let is_lingos = matches!(platform, NativePlatform::Lingos);
+    let is_lingos = matches!(platform, NativePlatform::Lingos | NativePlatform::LingosRpi);
     let is_rpi = matches!(platform, NativePlatform::Rpi);
+    // LingOS targets build the manifest's `entry_os` when it names one
+    let os_project;
+    let project = match (&project.entry_os, is_kernel || is_lingos) {
+        (Some(e), true) => {
+            let mut p = project.clone();
+            println!("  [{}] using entry_os {}", platform.dir_name(), e.display());
+            p.entry = e.clone();
+            if let Some(inc) = &project.includes_os {
+                p.includes = inc.clone();
+            }
+            os_project = p;
+            &os_project
+        },
+        // `includes_os` alone (same entry on every platform) still picks the
+        // resources a LingOS image embeds -- without this a kernel image
+        // swallowed the desktop build's whole `includes` tree (e.g. 70 MB of
+        // SNES/N64 ROMs the image can't use).
+        (None, true) if project.includes_os.is_some() => {
+            let mut p = project.clone();
+            p.includes = project.includes_os.clone().unwrap_or_default();
+            os_project = p;
+            &os_project
+        },
+        _ => project,
+    };
     println!(
         "  [{}] building {} ({triple}){}…",
         platform.dir_name(),
@@ -1101,8 +1360,11 @@ fn build_native(
         std::process::exit(1);
     });
 
-    // Kernel & LingOS app builds always use AOT (compiling the .ling to a .o and linking it)
-    let use_aot = aot || is_kernel || is_lingos;
+    // Kernel & LingOS app builds always use AOT (compiling the .ling to a .o and linking it).
+    // A `portable` desktop app reads its .ling at runtime and runs on the JIT, which is the
+    // opposite of AOT, so an explicit `portable` in the manifest wins over a --aot flag (lingfu
+    // passes --aot by default): we honour the manifest's intent rather than build a broken mix.
+    let use_aot = (aot || is_kernel || is_lingos) && project.portable.is_none();
 
     // Copy sibling .ling modules the entry might `use` — relative to the
     // ENTRY's own directory (matching `use` resolution in runtime/mod.rs's
@@ -1124,14 +1386,20 @@ fn build_native(
         .into_owned();
 
     // Resources declared in the manifest [includes] block (glob-expanded).
-    let resources = expand_includes(project);
-    let do_pack = pack && !resources.is_empty();
+    let mut resources = expand_includes(project);
+    for app in &project.bundle_apps {
+        for (rel, abs) in expand_includes_in(&app.root, &app.includes) {
+            resources.push((format!("apps/{}/{rel}", app.name), abs));
+        }
+    }
+    // Pack when the build command passed --pack, or the manifest declared `pack = true`.
+    let do_pack = (pack || project.pack) && !resources.is_empty();
 
     if is_lingos {
         // ── LingOS userland path: AOT compile + ling-user runtime ───────────
         println!("    AOT-compiling {} for LingOS userspace…", entry_filename);
 
-        let mir = ling::mir::compile_path(&project.entry, ling::core::OptimizationLevel::O3)
+        let mir = ling::mir::compile_path_standalone(&project.entry, ling::core::OptimizationLevel::O3)
             .unwrap_or_else(|e| {
                 eprintln!("    MIR compilation failed: {e}");
                 std::process::exit(1);
@@ -1191,11 +1459,29 @@ fn build_native(
         // ── Kernel path: AOT compile + no_std runtime ──────────────────────
         println!("    AOT-compiling {} for kernel…", entry_filename);
 
-        let mir = ling::mir::compile_path(&project.entry, ling::core::OptimizationLevel::O3)
+        // Debug knobs for kernel AOT bring-up: LING_KERNEL_OPT=0..3 overrides the
+        // MIR optimisation level (isolates optimiser bugs); LING_DUMP_MIR=<fn>
+        // (or `*`) writes that function's MIR to <build_dir>/mir-<fn>.txt.
+        let kernel_opt = match std::env::var("LING_KERNEL_OPT").as_deref() {
+            Ok("0") => ling::core::OptimizationLevel::None,
+            Ok("1") => ling::core::OptimizationLevel::O1,
+            Ok("2") => ling::core::OptimizationLevel::O2,
+            _ => ling::core::OptimizationLevel::O3,
+        };
+        let mir = ling::mir::compile_path_standalone(&project.entry, kernel_opt)
             .unwrap_or_else(|e| {
                 eprintln!("    MIR compilation failed: {e}");
                 std::process::exit(1);
             });
+        if let Ok(want) = std::env::var("LING_DUMP_MIR") {
+            for f in &mir.functions {
+                if want == "*" || f.name == want {
+                    let path = build_dir.join(format!("mir-{}.txt", f.name.replace(['/', '\\'], "_")));
+                    let _ = std::fs::write(&path, format!("{f:#?}"));
+                    println!("    MIR of {} written to {}", f.name, path.display());
+                }
+            }
+        }
 
         let mir_prog = ling_codegen::MirProgram::new(mir, entry_filename.clone());
         println!(
@@ -1219,6 +1505,33 @@ fn build_native(
         });
 
         println!("    AOT object written to {}", obj_path.display());
+
+        // bundle_app / [app.<name>]: more programs, each its own object with
+        // local symbols (app_<name>.o), registered as built-in apps.
+        let mut bundled: Vec<(String, PathBuf)> = project.bundle_app.iter().cloned().collect();
+        for app in &project.bundle_apps {
+            bundled.push((app.name.clone(), app.entry.clone()));
+        }
+        for (app_name, app_entry) in &bundled {
+            let app_obj = build_dir.join(format!("app_{app_name}.o"));
+            let _ = std::fs::remove_file(&app_obj);
+            let app_mir = ling::mir::compile_path_standalone(app_entry, kernel_opt).unwrap_or_else(|e| {
+                eprintln!("    bundled app '{app_name}': MIR compilation failed: {e}");
+                std::process::exit(1);
+            });
+            let app_prog = ling_codegen::MirProgram::new(app_mir, app_entry.to_string_lossy().into_owned());
+            println!(
+                "    bundling app '{app_name}': compiling {} functions…",
+                app_prog.mir.functions.len()
+            );
+            let mut app_backend = ling_codegen::CraneliftBackend::new_for_arch(platform.cranelift_arch())
+                .with_progress(true)
+                .as_app(&format!("__ling_app_{app_name}"));
+            app_backend.emit(&app_prog, &app_obj).unwrap_or_else(|e| {
+                eprintln!("    bundled app '{app_name}': AOT codegen failed: {e}");
+                std::process::exit(1);
+            });
+        }
 
         // Generate kernel-specific Cargo.toml with ling-kernel dependency
         std::fs::write(
@@ -1320,14 +1633,93 @@ fn build_native(
             None
         };
 
-        let main_rs = if is_rpi {
+        let mut main_rs = if is_rpi {
             gen_rpi_kernel_main_rs()
         } else {
             gen_kernel_main_rs(idle_font_mod, unicode_font_mod)
         };
+        // [includes] → files baked into the kernel image, registered with
+        // `ling_kernel::appfs` (after zero_bss, before the program runs) so the
+        // program's file/font builtins find them by their relative names.
+        if !resources.is_empty() {
+            // One static per distinct file content: several bundled apps ship
+            // the same font under their own names, which must not cost the
+            // image four copies.
+            let mut emb = String::from(
+                "// Generated by `ling build`: the project's [includes], baked into the kernel image.\n",
+            );
+            let mut total = 0u64;
+            let mut statics: Vec<(u64, PathBuf)> = Vec::new();
+            let mut names: Vec<(String, usize)> = Vec::new();
+            for (rel, abs) in &resources {
+                let bytes = std::fs::read(abs).unwrap_or_default();
+                let digest = {
+                    use std::hash::{Hash, Hasher};
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    bytes.len().hash(&mut h);
+                    bytes.hash(&mut h);
+                    h.finish()
+                };
+                let idx = match statics.iter().position(|(d, p)| *d == digest && std::fs::read(p).unwrap_or_default() == bytes) {
+                    Some(i) => i,
+                    None => {
+                        total += bytes.len() as u64;
+                        statics.push((digest, abs.clone()));
+                        statics.len() - 1
+                    },
+                };
+                names.push((rel.clone(), idx));
+            }
+            for (i, (_, abs)) in statics.iter().enumerate() {
+                emb.push_str(&format!(
+                    "static F{i}: &[u8] = include_bytes!({:?});\n",
+                    abs.to_string_lossy().replace('\\', "/")
+                ));
+            }
+            emb.push_str("pub fn register() {\n");
+            for (rel, idx) in &names {
+                emb.push_str(&format!("    ling_kernel::appfs::register({rel:?}, F{idx});\n"));
+            }
+            emb.push_str("}\n");
+            std::fs::write(build_dir.join("src/embedded.rs"), emb).expect("write src/embedded.rs");
+            main_rs = main_rs
+                .replacen("extern crate ling_kernel;", "extern crate ling_kernel;\nmod embedded;", 1)
+                .replacen("__main__();", "embedded::register();\n        __main__();", 1);
+            println!(
+                "    embedded {} file(s), {:.1} MB → src/embedded.rs",
+                resources.len(),
+                total as f64 / 1_048_576.0
+            );
+        }
+        // kernel_app = "<name>": LingOS boots as usual and the program becomes
+        // one of its built-in apps (launched from the console / autostarted).
+        if let (true, Some(app)) = (is_rpi, &project.kernel_app) {
+            main_rs = main_rs.replacen(
+                "__main__();",
+                &format!(
+                    "ling_kernel::init();\n        ling_kernel::register_app({app:?}, __main__);\n        ling_kernel::ling_kernel_rpi_idle();"
+                ),
+                1,
+            );
+            println!("    kernel app: LingOS boots, '{app}' is a built-in app");
+        }
+        let mut build_rs = gen_kernel_build_rs();
+        for (app_name, _) in &bundled {
+            let sym = format!("__ling_app_{app_name}");
+            main_rs = main_rs
+                .replacen("fn __main__() -> u64;", &format!("fn __main__() -> u64;\n    fn {sym}() -> u64;"), 1)
+                .replacen("__main__();", &format!("ling_kernel::register_app({app_name:?}, {sym});\n        __main__();"), 1);
+            build_rs = build_rs.replacen(
+                "    println!(\"cargo:rerun-if-changed=entry.o\");",
+                &format!(
+                    "    println!(\"cargo:rerun-if-changed=entry.o\");\n    println!(\"cargo:rustc-link-arg-bins={{}}/app_{app_name}.o\", manifest_dir);\n    println!(\"cargo:rerun-if-changed=app_{app_name}.o\");"
+                ),
+                1,
+            );
+        }
         std::fs::write(build_dir.join("src/main.rs"), main_rs).expect("write src/main.rs");
 
-        std::fs::write(build_dir.join("build.rs"), gen_kernel_build_rs()).expect("write build.rs");
+        std::fs::write(build_dir.join("build.rs"), build_rs).expect("write build.rs");
 
         // Write linker script
         let linker_script = if is_rpi {
@@ -1375,7 +1767,7 @@ fn build_native(
         std::fs::write(build_dir.join("build.rs"), gen_aot_build_rs()).expect("write build.rs");
         std::fs::write(
             build_dir.join("Cargo.toml"),
-            gen_native_cargo_toml(&project.name, &project.version, &ling_root),
+            gen_native_cargo_toml(&project.name, &project.version, &ling_root, project.ling_features_for(platform)),
         )
         .expect("write Cargo.toml");
     } else {
@@ -1387,13 +1779,13 @@ fn build_native(
         .expect("write Cargo.toml");
         std::fs::write(
             build_dir.join("src/main.rs"),
-            gen_main_rs(&entry_filename, do_pack),
+            gen_main_rs(&entry_filename, do_pack, project.portable.as_deref()),
         )
         .expect("write src/main.rs");
         std::fs::write(build_dir.join("build.rs"), gen_build_rs()).expect("write build.rs");
         std::fs::write(
             build_dir.join("Cargo.toml"),
-            gen_native_cargo_toml(&project.name, &project.version, &ling_root),
+            gen_native_cargo_toml(&project.name, &project.version, &ling_root, project.ling_features_for(platform)),
         )
         .expect("write Cargo.toml");
     }
@@ -1414,9 +1806,19 @@ fn build_native(
         match resolve_icon(icon, project, &ling_root) {
             Some(src) => {
                 let out_ico = build_dir.join("app.ico");
+                // ling-icon (SVG/PNG -> .ico) ships with the `web` and `game` profiles.
+                #[cfg(any(feature = "web", feature = "game"))]
                 match ling_icon::write_ico(&src, &out_ico, ling_icon::DEFAULT_SIZES) {
                     Ok(()) => println!("  [windows] icon: {}", src.display()),
                     Err(e) => eprintln!("  [windows] icon skipped: {e}"),
+                }
+                #[cfg(not(any(feature = "web", feature = "game")))]
+                {
+                    let _ = out_ico;
+                    eprintln!(
+                        "  [windows] icon skipped: {} needs the `web` or `game` profile to convert",
+                        src.display()
+                    );
                 }
             },
             None => println!("  [windows] no icon found; building without one"),
@@ -1430,6 +1832,16 @@ fn build_native(
     let build_cmd = choose_build_tool(platform);
 
     let mut cargo_args: Vec<&str> = vec!["build", "--release", "--target", triple];
+
+    // A kernel / LingOS build of the same project shares this build dir and leaves a
+    // build-std .cargo/config.toml behind; a later host build would then link a second
+    // `core` ("duplicate lang item"). Host builds drop that generated config first.
+    if !is_kernel && !is_lingos {
+        let stale = build_dir.join(".cargo").join("config.toml");
+        if std::fs::read_to_string(&stale).map(|t| t.contains("build-std")).unwrap_or(false) {
+            let _ = std::fs::remove_file(&stale);
+        }
+    }
 
     // For no_std targets, we need nightly features
     if is_kernel || is_lingos {
@@ -1516,6 +1928,7 @@ rustflags = ["-C", "relocation-model=static", "-Z", "unstable-options", {extra_f
             });
         if !status.success() {
             eprintln!("  [{}] build failed.", platform.dir_name());
+            offline_tip(build_dir);
             eprintln!("  Tip: ensure nightly Rust is installed: rustup toolchain install nightly");
             eprintln!("  Then install: rustup target add x86_64-unknown-none --toolchain nightly");
             eprintln!("  And: rustup component add rust-src --toolchain nightly");
@@ -1535,6 +1948,7 @@ rustflags = ["-C", "relocation-model=static", "-Z", "unstable-options", {extra_f
             });
         if !status.success() {
             eprintln!("  [{}] build failed.", platform.dir_name());
+            offline_tip(build_dir);
             if !platform.is_current_host() && build_cmd == "cargo" && !has_cross() {
                 eprintln!("  Tip: install `cross` for cross-compilation (needs Docker):");
                 eprintln!("       cargo install cross");
@@ -1598,7 +2012,10 @@ rustflags = ["-C", "relocation-model=static", "-Z", "unstable-options", {extra_f
     // since the compiled binary ends up in `target/<triple>/release/`, not
     // next to the sources copy_ling_sources placed in build_dir itself.
     // Harmless for single-file projects (nothing to copy beyond the exe).
-    if !is_kernel && !is_lingos {
+    // Portable builds skip this: their launcher runs the entry from the include tree (copied next
+    // to the exe below, or packed inside it), which keeps the modules' folder layout.
+    let portable_build = project.portable.is_some() || std::env::var("LING_APP_INTERP").is_ok();
+    if !is_kernel && !is_lingos && !portable_build {
         copy_ling_sources(module_root, &platform_dir);
     }
 
@@ -1975,6 +2392,13 @@ fn main() {
 /// Cargo.toml writes ends up being final on disk.
 fn gen_app_cargo_toml(name: &str, version: &str, ling_root: &Path) -> String {
     let root_str = ling_root.display().to_string().replace('\\', "/");
+    // LING_APP_FEATURES="llm,web" turns on features of the ling crate inside the built app (default: none)
+    let feats = std::env::var("LING_APP_FEATURES")
+        .ok()
+        .map(|f| f.split(',').map(|x| x.trim()).filter(|x| !x.is_empty()).map(|x| format!("\"{x}\"")).collect::<Vec<_>>().join(", "))
+        .filter(|f| !f.is_empty())
+        .map(|f| format!(", features = [{f}]"))
+        .unwrap_or_default();
     format!(
         r#"[workspace]
 [package]
@@ -1988,7 +2412,7 @@ name = "{name}"
 path = "src/main.rs"
 
 [dependencies]
-ling = {{ path = "{root_str}", package = "ling-lang" }}
+ling = {{ path = "{root_str}", package = "ling-lang"{feats} }}
 
 [build-dependencies]
 winresource = "0.1"
@@ -2006,6 +2430,13 @@ strip = true
 /// Generate Cargo.toml for LingOS userspace (no_std, links to ling-user).
 fn gen_user_cargo_toml(name: &str, version: &str, ling_root: &Path) -> String {
     let root_str = ling_root.display().to_string().replace('\\', "/");
+    // LING_APP_FEATURES="llm,web" turns on features of the ling crate inside the built app (default: none)
+    let feats = std::env::var("LING_APP_FEATURES")
+        .ok()
+        .map(|f| f.split(',').map(|x| x.trim()).filter(|x| !x.is_empty()).map(|x| format!("\"{x}\"")).collect::<Vec<_>>().join(", "))
+        .filter(|f| !f.is_empty())
+        .map(|f| format!(", features = [{f}]"))
+        .unwrap_or_default();
     format!(
         r#"[workspace]
 [package]
@@ -2095,6 +2526,33 @@ strip = true
     )
 }
 
+/// Build the `, features = [...]` clause for the `ling` dependency of a native
+/// build. Features come from the manifest's `ling-features` and the
+/// LING_APP_FEATURES env var ("web,llm"), unioned (manifest first, de-duplicated,
+/// order preserved). Returns an empty string when there are none.
+fn cargo_feature_clause(manifest_features: &[String]) -> String {
+    let mut feats: Vec<String> = Vec::new();
+    let mut add = |f: &str| {
+        let f = f.trim();
+        if !f.is_empty() && !feats.iter().any(|e| e == f) {
+            feats.push(f.to_string());
+        }
+    };
+    for f in manifest_features {
+        add(f);
+    }
+    if let Ok(env) = std::env::var("LING_APP_FEATURES") {
+        for f in env.split(',') {
+            add(f);
+        }
+    }
+    if feats.is_empty() {
+        return String::new();
+    }
+    let list = feats.iter().map(|f| format!("\"{f}\"")).collect::<Vec<_>>().join(", ");
+    format!(", features = [{list}]")
+}
+
 /// Generate Cargo.toml for the standard (embedded-interpreter) and `--aot`
 /// native build paths — win/lin/mac, as opposed to `gen_kernel_cargo_toml`'s
 /// no_std kernel targets. Both generated `src/main.rs` variants (`gen_main_rs`,
@@ -2107,8 +2565,9 @@ strip = true
 /// as `ling`, but the dependency's own TOML key doesn't have to agree with
 /// that without this, so this makes it explicit rather than relying on the
 /// default matching by coincidence.
-fn gen_native_cargo_toml(name: &str, version: &str, ling_root: &Path) -> String {
+fn gen_native_cargo_toml(name: &str, version: &str, ling_root: &Path, manifest_features: &[String]) -> String {
     let root_str = ling_root.display().to_string().replace('\\', "/");
+    let feats = cargo_feature_clause(manifest_features);
     format!(
         r#"[workspace]
 [package]
@@ -2122,14 +2581,20 @@ name = "{name}"
 path = "src/main.rs"
 
 [dependencies]
-ling = {{ path = "{root_str}", package = "ling-lang" }}
+ling = {{ path = "{root_str}", package = "ling-lang"{feats} }}
 
 [build-dependencies]
 winresource = "0.1"
 
 [profile.release]
-lto = "fat"
-codegen-units = 1
+# Keep these in sync with ling's own [profile.release] (see this crate's Cargo.toml):
+# fat LTO -- or codegen-units = 1, which forces effectively the same single-unit
+# shape -- miscompiles the Cranelift JIT this exe embeds (JIT-compiling functions
+# with 14-16 parameters segfaults during codegen). Dropping LTO removes the
+# miscompilation trigger; it is the safe fix, not a workaround. opt-level = 3 and
+# strip keep the packed exe fast and small.
+lto = false
+codegen-units = 16
 opt-level = 3
 strip = true
 "#
@@ -2283,8 +2748,8 @@ extern "C" {
 }
 
 #[panic_handler]
-fn panic(_: &core::panic::PanicInfo) -> ! {
-    loop {}
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    ling_kernel::panic_report(info)
 }
 
 #[no_mangle]
@@ -2306,7 +2771,11 @@ const KERNEL_LINKER_SCRIPT: &str = r#"OUTPUT_FORMAT(elf64-x86-64)
 ENTRY(_start)
 
 SECTIONS {
-    . = 1M;
+    /* 16 MiB, not 1 MiB: UEFI firmware keeps memory of its own in the low
+       16 MiB (OVMF's ACPI NVS sits at 8 MiB, inside a kernel linked at 1 MiB),
+       and the kernel must load where nothing lives. GRUB / lingboot.efi load
+       by the ELF's addresses; the BIOS disk boot reads it from its header. */
+    . = 16M;
 
     .multiboot : ALIGN(8) {
         KEEP(*(.ling_multiboot))
@@ -2379,7 +2848,9 @@ SECTIONS {
     }
 
     . = ALIGN(16);
-    . += 0x4000; /* 16KB boot stack */
+    . += 0x100000; /* 1MB boot stack: it sits right above .bss (heap/frame
+                      free lists), so an overflow silently corrupts the
+                      allocator -- fontdue's font parse needed far more than 16KB */
     _stack_top = .;
 
     . = ALIGN(4096);
@@ -2410,11 +2881,61 @@ fn resolve_icon(cli: Option<&Path>, project: &LingProject, ling_root: &Path) -> 
             candidate.display()
         );
     }
-    let default = ling_root.join("ling-lang.org/images/logo.svg");
-    default.exists().then_some(default)
+    // Repo-bundled logo first; the website checkout (now a sibling of the repo,
+    // formerly nested inside it) is a fallback for older trees.
+    [
+        ling_root.join("assets/ling-logo.svg"),
+        ling_root.join("../ling-lang.org/images/logo.svg"),
+        ling_root.join("ling-lang.org/images/logo.svg"),
+    ]
+    .into_iter()
+    .find(|p| p.exists())
 }
 
-fn gen_main_rs(entry_file: &str, packed: bool) -> String {
+fn gen_main_rs(entry_file: &str, packed: bool, portable: Option<&str>) -> String {
+    // LING_APP_INTERP=<dir>: a portable launcher. The app runs on the Cranelift JIT (run_jit, which falls back to the tree-walker for
+    // programs it cannot compile) from `<dir>/<entry>` next to the exe (the folder is
+    // assembled by the caller), with the exe's folder as the working directory so assets, settings and projects live beside it.
+    // Startup errors go to lingstation.log because the windows build has no console.
+    // The manifest's `portable = "<dir>"` does the same as the environment variable.
+    // With --pack as well, the exe carries every include and the entry inside it: it unpacks them
+    // (ling::unpack_resources, which also makes that folder the working directory) and runs the
+    // interpreter there, so one self-contained file behaves exactly like `ling run --interp`.
+    let portable_dir = std::env::var("LING_APP_INTERP").ok().or_else(|| portable.map(str::to_string));
+    if let Some(dir) = portable_dir {
+        let (res_mod, unpack) = if packed {
+            ("mod resources;
+", "    ling::unpack_resources(env!(\"CARGO_PKG_NAME\"), resources::RESOURCES);
+")
+        } else {
+            ("", "")
+        };
+        return format!(
+            r#"// Built by ling build (portable launcher) — no console window on Windows.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+{res_mod}
+fn main() {{
+    if let Some(d) = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.to_path_buf())) {{
+        let _ = std::env::set_current_dir(d);
+    }}
+{unpack}    let entry = "{dir}/{entry_file}";
+    let fail = |msg: String| -> ! {{
+        let _ = std::fs::write("lingstation.log", &msg);
+        eprintln!("{{msg}}");
+        std::process::exit(1);
+    }};
+    let source = match std::fs::read_to_string(entry) {{
+        Ok(s) => s,
+        Err(e) => fail(format!("cannot read {{entry}}: {{e}} (keep the exe next to its ling, assets and instruments folders)")),
+    }};
+    std::env::set_var("RUST_BACKTRACE", "1");
+    if let Err(e) = ling::run_jit(&source, Some(std::path::PathBuf::from("{dir}")), Some(entry)) {{
+        fail(e);
+    }}
+}}
+"#
+        );
+    }
     // When packing, pull in the generated resource table and self-extract it
     // before running so every path-based asset loader finds its files on disk.
     let res_mod = if packed { "mod resources;\n" } else { "" };
@@ -2504,9 +3025,66 @@ fn main() {
 ///   "/music/*.wav",
 ///   "/font/*.otf",
 /// Patterns are returned verbatim (leading `/`/`./` stripped later).
+/// `includes_os = ["a", "b"]` (one line) — None when the manifest has no such key.
+fn parse_includes_os(text: &str) -> Option<Vec<String>> {
+    for raw in text.lines() {
+        let line = raw.trim();
+        if let Some(rest) = line.strip_prefix("includes_os").and_then(|r| r.trim_start().strip_prefix('=')) {
+            let mut out = Vec::new();
+            collect_quoted(rest, &mut out);
+            return Some(out);
+        }
+    }
+    None
+}
+
+/// `[app.<name>]` sections: entry (required), root (default: the entry's
+/// folder's parent, i.e. `<app>/ling/main.ling` -> `<app>`), includes.
+fn parse_bundle_apps(text: &str, base: &Path) -> Vec<BundleApp> {
+    let mut apps: Vec<BundleApp> = Vec::new();
+    let mut cur: Option<(String, Option<PathBuf>, Option<PathBuf>, Vec<String>)> = None;
+    let flush = |cur: &mut Option<(String, Option<PathBuf>, Option<PathBuf>, Vec<String>)>, apps: &mut Vec<BundleApp>| {
+        if let Some((name, entry, root, includes)) = cur.take() {
+            let Some(entry) = entry else {
+                eprintln!("error: [app.{name}] needs an entry = \"<path/to/main.ling>\"");
+                std::process::exit(1);
+            };
+            let root = root.unwrap_or_else(|| {
+                let dir = entry.parent().unwrap_or(Path::new("."));
+                dir.parent().unwrap_or(dir).to_path_buf()
+            });
+            apps.push(BundleApp { name, entry, root, includes });
+        }
+    };
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') {
+            flush(&mut cur, &mut apps);
+            if let Some(name) = line.strip_prefix("[app.").and_then(|r| r.strip_suffix(']')) {
+                cur = Some((sanitise_name(name.trim()), None, None, Vec::new()));
+            }
+            continue;
+        }
+        let Some(app) = cur.as_mut() else { continue };
+        if let Some(v) = toml_kv(line, "entry") {
+            app.1 = Some(base.join(v));
+        } else if let Some(v) = toml_kv(line, "root") {
+            app.2 = Some(base.join(v));
+        } else if let Some(rest) = line.strip_prefix("includes").and_then(|r| r.trim_start().strip_prefix('=')) {
+            collect_quoted(rest, &mut app.3);
+        }
+    }
+    flush(&mut cur, &mut apps);
+    apps
+}
+
 fn parse_includes(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut in_section = false;
+    let mut in_app = false;
     for raw in text.lines() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -2515,6 +3093,10 @@ fn parse_includes(text: &str) -> Vec<String> {
         if line.starts_with('[') {
             // [includes] (English) or [包含] (Chinese)
             in_section = line == "[includes]" || line == "[包含]";
+            in_app = line.starts_with("[app.");
+            continue;
+        }
+        if in_app {
             continue;
         }
         // Inline array form: includes = ["a", "b"]  /  包含 = [...]
@@ -2529,6 +3111,96 @@ fn parse_includes(text: &str) -> Vec<String> {
         if in_section {
             collect_quoted(line, &mut out);
         }
+    }
+    out
+}
+
+/// Parse `targets = ["win", "lingos", "lingos-rpi", ...]`: the platforms `ling build` builds
+/// when the command line gives no `--platform`. Empty when the manifest names none, and the
+/// caller then falls back to the host platform plus web.
+fn parse_targets(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut in_app = false;
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.starts_with('[') {
+            in_app = line.starts_with("[app.");
+            continue;
+        }
+        if in_app || line.starts_with('#') {
+            continue;
+        }
+        if let Some(rest) = line
+            .strip_prefix("targets")
+            .and_then(|r| r.trim_start().strip_prefix('='))
+        {
+            collect_quoted(rest, &mut out);
+        }
+    }
+    out.iter().map(|s| s.to_lowercase()).collect()
+}
+
+/// Parse `ling-features = ["web", ...]` from a manifest's top level: the `ling`
+/// crate features to enable in the built native exe. Feature names are
+/// case-sensitive, so (unlike `parse_targets`) they are kept verbatim.
+fn parse_ling_features(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut in_app = false;
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.starts_with('[') {
+            in_app = line.starts_with("[app.");
+            continue;
+        }
+        if in_app || line.starts_with('#') {
+            continue;
+        }
+        if let Some(rest) = line
+            .strip_prefix("ling-features")
+            .and_then(|r| r.trim_start().strip_prefix('='))
+        {
+            collect_quoted(rest, &mut out);
+        }
+    }
+    out
+}
+
+/// The `NativePlatform::dir_name` a platform name or alias stands for (the same aliases
+/// `--platform` and `targets` take), for the OS-native desktop platforms.
+fn native_dir_for_alias(a: &str) -> Option<&'static str> {
+    match a {
+        "win" | "windows" => Some("windows"),
+        "lin" | "linux" => Some("linux"),
+        "mac" | "macos" | "darwin" => Some("macos"),
+        "macarm" | "mac-arm" | "mac-arm64" | "macos-arm64" | "apple-silicon" => Some("macos-arm64"),
+        "pios" | "pi" | "raspios" | "linux-arm64" | "linarm" | "arm64" => Some("linux-arm64"),
+        _ => None,
+    }
+}
+
+/// Parse every top-level `ling-features-<platform> = [...]` line: the per-platform overrides of
+/// `ling-features`. Each is `(dir_name, features)`; an empty list is a real answer (no features
+/// for that platform). Unknown platform names are ignored, as is the whole line for an older
+/// `ling`, which only knows the global key.
+fn parse_ling_features_per(text: &str) -> Vec<(String, Vec<String>)> {
+    let mut out: Vec<(String, Vec<String>)> = Vec::new();
+    let mut in_app = false;
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.starts_with('[') {
+            in_app = line.starts_with("[app.");
+            continue;
+        }
+        if in_app || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, rest)) = line.split_once('=') else { continue };
+        let Some(plat) = key.trim().strip_prefix("ling-features-") else { continue };
+        let Some(dir) = native_dir_for_alias(plat.trim()) else { continue };
+        let mut v = Vec::new();
+        collect_quoted(rest, &mut v);
+        out.retain(|(d, _)| d != dir);
+        out.push((dir.to_string(), v));
     }
     out
 }
@@ -2595,15 +3267,28 @@ fn is_ignored(pats: &[String], rel: &str) -> bool {
 /// `(relative-path-with-forward-slashes, absolute-path)` files. Files matching
 /// `ling.ignore` are excluded.
 fn expand_includes(project: &LingProject) -> Vec<(String, PathBuf)> {
-    let root = &project.source_dir;
+    let root = project.embed_root.as_ref().unwrap_or(&project.source_dir);
+    expand_includes_in(root, &project.includes)
+}
+
+/// `includes` globs resolved under `root`: `(relative name, absolute path)`.
+fn expand_includes_in(root: &Path, includes: &[String]) -> Vec<(String, PathBuf)> {
     let mut all: Vec<(String, PathBuf)> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let files = walk_files(root); // (rel, abs) for the whole tree, once
     let ignore = load_ignore_patterns(root);
     let mut skipped = 0usize;
 
-    for pat in &project.includes {
-        let pat = pat.trim().trim_start_matches("./").trim_start_matches('/');
+    for pat in includes {
+        // A leading `!` makes a glob / directory an explicit request too: its
+        // matches are embedded even where the app's ling.ignore excludes them
+        // (LingDev keeps projects/ out of publishing, but a LingOS image wants
+        // the sample projects' scenes on board).
+        let (pat, force) = match pat.trim().strip_prefix('!') {
+            Some(rest) => (rest, true),
+            None => (pat.trim(), false),
+        };
+        let pat = pat.trim_start_matches("./").trim_start_matches('/');
         if pat.is_empty() {
             continue;
         }
@@ -2615,7 +3300,7 @@ fn expand_includes(project: &LingProject) -> Vec<(String, PathBuf)> {
                 let prefix = format!("{}/", pat.replace('\\', "/"));
                 for (rel, abs) in &files {
                     if rel.starts_with(&prefix) {
-                        if is_ignored(&ignore, rel) {
+                        if !force && is_ignored(&ignore, rel) {
                             skipped += 1;
                             continue;
                         }
@@ -2625,10 +3310,11 @@ fn expand_includes(project: &LingProject) -> Vec<(String, PathBuf)> {
                     }
                 }
             } else if abs.is_file() {
+                // An exact file path is an explicit request: it's embedded even
+                // when an ignore file excludes it (e.g. a project folder kept
+                // out of git), unlike glob and directory matches.
                 let rel = pat.replace('\\', "/");
-                if is_ignored(&ignore, &rel) {
-                    skipped += 1;
-                } else if seen.insert(rel.clone()) {
+                if seen.insert(rel.clone()) {
                     all.push((rel, abs));
                 }
             } else {
@@ -2639,7 +3325,7 @@ fn expand_includes(project: &LingProject) -> Vec<(String, PathBuf)> {
         let mut matched = false;
         for (rel, abs) in &files {
             if glob_match(pat, rel) {
-                if is_ignored(&ignore, rel) {
+                if !force && is_ignored(&ignore, rel) {
                     skipped += 1;
                     matched = true; // pattern did match; the file is just excluded
                     continue;
@@ -2842,6 +3528,64 @@ fn choose_build_tool(platform: NativePlatform) -> &'static str {
 
 fn has_cross() -> bool {
     Command::new("cross").arg("--version").output().is_ok()
+}
+
+/// Is Cargo in offline mode for a build in `dir`? Either `CARGO_NET_OFFLINE` is set, or a
+/// cargo config that applies (`$CARGO_HOME`, or a `.cargo/` in `dir` or any parent) has
+/// `offline = true` under `[net]`. Offline Cargo can still resolve a dependency graph from its
+/// cached index, so a build prints "Locking N packages" and then dies on the first crate it never
+/// downloaded ("attempting to make an HTTP request, but --offline was specified"): the message
+/// names a flag nobody passed, so say where it comes from.
+fn cargo_offline_configured(dir: &Path) -> bool {
+    if let Ok(v) = std::env::var("CARGO_NET_OFFLINE") {
+        if matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes") {
+            return true;
+        }
+    }
+    let mut files: Vec<PathBuf> = Vec::new();
+    let home = std::env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")).map(|h| PathBuf::from(h).join(".cargo")));
+    if let Some(h) = home {
+        files.push(h.join("config.toml"));
+        files.push(h.join("config"));
+    }
+    let mut d = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    loop {
+        files.push(d.join(".cargo").join("config.toml"));
+        files.push(d.join(".cargo").join("config"));
+        if !d.pop() {
+            break;
+        }
+    }
+    files.iter().any(|f| {
+        let Ok(text) = std::fs::read_to_string(f) else { return false };
+        let mut in_net = false;
+        for raw in text.lines() {
+            let line = raw.trim();
+            if line.starts_with('[') {
+                in_net = line == "[net]";
+                continue;
+            }
+            if in_net {
+                if let Some(v) = line.strip_prefix("offline").and_then(|r| r.trim_start().strip_prefix('=')) {
+                    return v.trim().starts_with("true");
+                }
+            }
+        }
+        false
+    })
+}
+
+/// After a failed cargo build: if offline mode is the likely cause, say so and how to fix it.
+fn offline_tip(dir: &Path) {
+    if cargo_offline_configured(dir) {
+        eprintln!("  Tip: Cargo is in OFFLINE mode here (CARGO_NET_OFFLINE, or `net.offline = true` in a cargo config),");
+        eprintln!("       so it cannot download crates it has not cached before; the \"--offline was specified\" in its");
+        eprintln!("       message is that setting, not a flag `ling build` passed. Turn offline mode off for this build");
+        eprintln!("       (unset CARGO_NET_OFFLINE / set net.offline = false), or run it once while online: Cargo caches");
+        eprintln!("       what it downloads, and later offline builds then work.");
+    }
 }
 
 /// Return the path to a sibling binary in the same directory as this executable.
