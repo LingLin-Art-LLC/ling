@@ -141,7 +141,7 @@ description = "${description.replace(/"/g, '\\"')}"
 license = "${license}"
 repository = "${repository}"
 homepage = "https://ling-lang.org"
-authors = ["Ling Lin <taellinglin@gmail.com>", "Sanny Lin <SannyLing53@gmail.com>"]
+authors = ["Ling Lin <taellinglin@gmail.com>", "Sanny Lin"]
 `;
   fs.writeFileSync(path.join(dir, "Ling.toml"), lingToml);
 

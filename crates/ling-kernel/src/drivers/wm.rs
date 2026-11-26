@@ -374,7 +374,8 @@ const DNS_PRESETS: [(&str, [u8; 4], &str); 6] = [
     ("Quad9 9.9.9.9", [9, 9, 9, 9], ""),
     ("AdGuard 94.140.14.14", [94, 140, 14, 14], ""),
     ("Ling dns.linglin.art", [0, 0, 0, 0], "dns.linglin.art"),
-    ("LAN 192.168.0.2", [192, 168, 0, 2], ""),
+    // [0; 4] with no hostname = the LAN router (the DHCP gateway), resolved at apply time
+    ("LAN router", [0, 0, 0, 0], ""),
     ("NAT 10.0.2.3", [10, 0, 2, 3], ""),
 ];
 static mut DNS_PRESET: usize = 0;
@@ -386,6 +387,11 @@ fn apply_dns_preset() {
     // fall back to the NAT resolver rather than setting 0.0.0.0.
     let primary = if !host.is_empty() {
         netstack::dns_resolve(host).unwrap_or(netstack::NAT_RESOLVER)
+    } else if ip == [0; 4] {
+        // the router preset: most home routers run a DNS forwarder; with no
+        // gateway yet (no lease), use the public default instead of 0.0.0.0
+        let gw = netstack::gateway_ip();
+        if gw == [0; 4] { netstack::PRIMARY_DNS } else { gw }
     } else {
         ip
     };
@@ -1990,7 +1996,7 @@ static mut SEED_DONE: bool = false;
 
 /// Read lingfs `/dns` (two dotted-quad lines: primary, secondary) and
 /// apply it, so DNS is configurable without a rebuild. Absent/garbled =
-/// keep the compiled defaults (192.168.0.2 -> Cloudflare 1.1.1.1).
+/// keep the defaults (the DHCP lease's DNS, else Cloudflare 1.1.1.1).
 fn load_dns_config() {
     let mut buf = [0u8; crate::fs::lingfs::BLOCK_SIZE];
     let Ok(Some(len)) = lingfs::read_file("dns", &mut buf) else { return };

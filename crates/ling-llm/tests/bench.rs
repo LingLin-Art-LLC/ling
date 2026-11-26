@@ -95,7 +95,7 @@ fn par(n: usize, ctx: *const (), f: unsafe fn(*const (), usize)) {
 #[test]
 #[ignore]
 fn tokens_per_second() {
-    let path = std::env::var("LING_MODEL").unwrap_or_else(|_| r"C:\Users\User\Programs\LingStationX\assets\models\Qwen3-0.6B-Q8_0.gguf".into());
+    let path = std::env::var("LING_MODEL").unwrap_or_else(|_| "models/Qwen3-0.6B-Q8_0.gguf".into());
     let Ok(f) = File::open(&path) else { return println!("no model at {path}: skipped") };
     let src = FileSrc { len: f.metadata().unwrap().len(), f };
     ling_llm::quant::set_parallel(par);

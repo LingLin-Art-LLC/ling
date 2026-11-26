@@ -31,20 +31,25 @@ fn lanes(d: &mut Daw) -> Vec<(usize, String)> {
     out
 }
 
-const AURORA: &str = "C:/Users/User/Music/Aurora/Aurora.flp";
+/// A real FL Studio project with SubSynth automation clips, named by LING_TEST_FLP.
+const AURORA_ENV: &str = "LING_TEST_FLP";
 
 #[test]
 fn automation_is_mapped_kept_or_skipped() {
-    if std::fs::metadata(AURORA).is_err() {
+    let Ok(aurora) = std::env::var(AURORA_ENV) else {
+        println!("{AURORA_ENV} not set: skipped");
+        return;
+    };
+    if std::fs::metadata(&aurora).is_err() {
         return;
     }
     let mut d = Daw::new();
-    let list = strs(&call(&mut d, "daw_midi_autos", &[s(AURORA)]));
+    let list = strs(&call(&mut d, "daw_midi_autos", &[s(&aurora)]));
     assert!(list.len() >= 12, "the three SubSynth clips: {list:?}");
     assert!(list.chunks(4).any(|c| c[0] == "SubSynth - Filter Cutoff" && c[1] != "-1"), "the cutoff clip knows its part: {list:?}");
 
     // map (default): the cutoff clip lands on a cutoff parameter of the SubSynth track
-    let made = call(&mut d, "daw_midi_import", &[s(AURORA), n(0.0)]);
+    let made = call(&mut d, "daw_midi_import", &[s(&aurora), n(0.0)]);
     assert!(matches!(made, Val::Num(x) if x > 0.5));
     let l = lanes(&mut d);
     assert!(l.iter().any(|(_, p)| p.contains("cutoff")), "a mapped cutoff lane: {l:?}");
@@ -56,7 +61,7 @@ fn automation_is_mapped_kept_or_skipped() {
 
     // lanes: everything waits for a parameter, and can be pointed at one later
     let mut d = Daw::new();
-    call(&mut d, "daw_midi_import", &[s(AURORA), n(0.0), Val::List(vec![]), s("lanes")]);
+    call(&mut d, "daw_midi_import", &[s(&aurora), n(0.0), Val::List(vec![]), s("lanes")]);
     let l = lanes(&mut d);
     let fl: Vec<&(usize, String)> = l.iter().filter(|(_, p)| p.starts_with("fl:")).collect();
     assert!(fl.len() >= 3, "{l:?}");
@@ -68,6 +73,6 @@ fn automation_is_mapped_kept_or_skipped() {
 
     // skip: no automation at all
     let mut d = Daw::new();
-    call(&mut d, "daw_midi_import", &[s(AURORA), n(0.0), Val::List(vec![]), s("skip")]);
+    call(&mut d, "daw_midi_import", &[s(&aurora), n(0.0), Val::List(vec![]), s("skip")]);
     assert!(lanes(&mut d).iter().all(|(_, p)| !p.starts_with("fl:") && !p.contains("cutoff")), "{:?}", lanes(&mut d));
 }

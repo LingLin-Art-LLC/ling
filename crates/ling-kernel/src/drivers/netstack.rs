@@ -2282,11 +2282,10 @@ pub fn arp_resolve(ip: [u8; 4]) -> Option<[u8; 6]> {
     found
 }
 
-/// DNS servers, tried in order with failover. Primary is a LAN resolver
-/// (the requested 192.168.0.2); secondary is Cloudflare 1.1.1.1 -- a
-/// cutting-edge, privacy-first public resolver (not Google/Microsoft/
-/// Yahoo), reachable through QEMU *and* VirtualBox NAT, so names resolve
-/// even when the LAN resolver is absent. Both overridable at runtime via
+/// DNS servers, tried in order with failover. Primary is the resolver the
+/// DHCP lease hands out (else Cloudflare 1.1.1.1 -- a privacy-first public
+/// resolver reachable through QEMU *and* VirtualBox NAT), so names resolve
+/// even when no LAN resolver is present. Both overridable at runtime via
 /// `set_dns` (the desktop reads lingfs `/dns` at boot: two ip lines).
 /// Insert or refresh an `ip -> mac` mapping in the ARP cache.
 fn arp_cache_put(ip: [u8; 4], mac: [u8; 6]) {
@@ -2350,8 +2349,9 @@ fn handle_arp(buf: &[u8]) {
 }
 
 // Public resolvers reachable from real hardware AND QEMU/VBox NAT (SLIRP
-// forwards them). The old default primary was a LAN guess (192.168.0.2) that
-// isn't reachable anywhere but that one network, so every first lookup ate a
+// forwards them). A DHCP lease's DNS server replaces the primary. The old
+// default primary was a hard-coded LAN address that isn't reachable anywhere
+// but that one network, so every first lookup ate a
 // 1.5s timeout before failing over -- and it failed outright on real metal.
 pub const PRIMARY_DNS: [u8; 4] = [1, 1, 1, 1]; // Cloudflare
 pub const SECONDARY_DNS: [u8; 4] = [8, 8, 8, 8]; // Google
@@ -2370,7 +2370,7 @@ pub fn dns_servers() -> ([u8; 4], [u8; 4]) {
 }
 
 /// A short budget per DNS server so failover is snappy on VirtualBox,
-/// where the LAN primary (192.168.0.2) isn't on the NAT and would
+/// where a LAN primary isn't on the NAT and would
 /// otherwise stall every lookup before Cloudflare answers.
 const DNS_BUDGET_US: u64 = 1_500_000;
 
@@ -2445,7 +2445,7 @@ fn dns_query(server: [u8; 4], host: &str) -> Option<[u8; 4]> {
 
 /// The NAT built-in resolver (QEMU SLIRP *and* VirtualBox NAT both expose
 /// their DNS proxy here). Used as a guaranteed last-resort fallback: a LAN
-/// resolver like 192.168.0.2 or an external one like 1.1.1.1 isn't always
+/// resolver from the DHCP lease or an external one like 1.1.1.1 isn't always
 /// reachable from inside a NAT, but 10.0.2.3 always is -- so resolution
 /// works out of the box on both hypervisors while still honoring the
 /// configured servers first on real hardware/LANs.

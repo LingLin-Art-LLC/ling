@@ -144,11 +144,11 @@ fn setup() {
 }
 
 fn ckpt() -> String {
-    std::env::var("SD_CKPT").unwrap_or_else(|_| "E:/MoonAI-Backup/Programs/SannyChat/imagination/models/Stable-diffusion/A.I. Love You.safetensors".into())
+    std::env::var("SD_CKPT").unwrap_or_default()
 }
 
 fn clip_dir() -> String {
-    std::env::var("SD_CLIP").unwrap_or_else(|_| "C:/Users/User/Programs/LingDiffusion/models/clip".into())
+    std::env::var("SD_CLIP").unwrap_or_else(|_| "models/clip".into())
 }
 
 fn diff(name: &str, got: &[f32], want: &[f32]) -> f64 {
@@ -288,6 +288,10 @@ fn same_seed_same_picture() {
             return;
         },
     };
+    if !std::path::Path::new(&path).exists() {
+        println!("no checkpoint at {path:?} (set SD_CKPT): skipped");
+        return;
+    }
     setup();
     ling_sd::ops::set_gelu_tanh(true);
     let f = std::fs::File::open(&path).unwrap();

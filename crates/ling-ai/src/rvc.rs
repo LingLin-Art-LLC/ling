@@ -692,10 +692,10 @@ mod tests {
     #[test]
     #[ignore]
     fn loads_the_users_models() {
-        // E:/SannyChat/talk (the RVC install on the dev machine): RVC_HUBERT / RVC_MODEL override
-        let hub = std::env::var("RVC_HUBERT").unwrap_or("E:/SannyChat/talk/hubert_base.pt".into());
-        let model = std::env::var("RVC_MODEL").unwrap_or("E:/SannyChat/talk/weights/LingLin.pth".into());
-        if !Path::new(&hub).exists() {
+        // an RVC WebUI install's files, named by RVC_HUBERT / RVC_MODEL (skipped when unset)
+        let hub = std::env::var("RVC_HUBERT").unwrap_or_default();
+        let model = std::env::var("RVC_MODEL").unwrap_or_default();
+        if hub.is_empty() || !Path::new(&hub).exists() {
             return;
         }
         let r = Rvc::load(Path::new(&hub), Path::new(&model), -1).unwrap();
@@ -727,10 +727,10 @@ mod tests {
         let mono: Vec<f32> = s.chunks_exact(ch).map(|c| c.iter().sum::<f32>() / ch as f32).collect();
         let a16 = crate::whisper::resample_to_16k(&mono, rate);
         let f0: Vec<f32> = std::fs::read_to_string(d.join("f0.csv")).unwrap().lines().filter_map(|l| l.trim().parse().ok()).collect();
-        let hub = "E:/SannyChat/talk/hubert_base.pt";
-        let model = "E:/SannyChat/talk/weights/LingLin.pth";
+        let hub = std::env::var("RVC_HUBERT").expect("RVC_HUBERT: the RVC install's hubert_base.pt");
+        let model = std::env::var("RVC_MODEL").expect("RVC_MODEL: the voice's .pth");
         let t0 = std::time::Instant::now();
-        let r = Rvc::load(Path::new(hub), Path::new(model), 0).unwrap();
+        let r = Rvc::load(Path::new(&hub), Path::new(&model), 0).unwrap();
         let t1 = std::time::Instant::now();
         let out = r.convert(&a16, &f0, &Options { rms_mix: 1.0, ..Options::default() }, &mut |_| {}).unwrap();
         eprintln!("loaded in {:.1} s, converted {:.2} s of audio in {:.2} s on {:?}; {} samples at {}", (t1 - t0).as_secs_f64(), a16.len() as f64 / 16000.0, t1.elapsed().as_secs_f64(), r.dev, out.len(), r.voice.sr);

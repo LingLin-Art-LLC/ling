@@ -32,10 +32,10 @@ impl Source for FileSrc {
 }
 
 fn model_path() -> String {
-    std::env::var("LING_MODEL").unwrap_or_else(|_| r"C:\Users\User\Programs\LingStationX\assets\models\Qwen3-0.6B-Q8_0.gguf".into())
+    std::env::var("LING_MODEL").unwrap_or_else(|_| "models/Qwen3-0.6B-Q8_0.gguf".into())
 }
 fn tokenizer_path() -> String {
-    std::env::var("LING_TOKENIZER").unwrap_or_else(|_| r"C:\Users\User\Programs\LingStationX\assets\models\tokenizer.json".into())
+    std::env::var("LING_TOKENIZER").unwrap_or_else(|_| "models/tokenizer.json".into())
 }
 
 #[test]

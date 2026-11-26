@@ -158,7 +158,7 @@ SSH 内置函数包括一个真正的 SSH-2 客户端和一个小型 SSH 服务�
 
 ```ling-gui
 令 始 = 执 {
-    令 结果 = ssh_connect("192.168.1.20", 22, "deploy", env_get("DEPLOY_PASSWORD", ""))
+    令 结果 = ssh_connect("192.0.2.10", 22, "deploy", env_get("DEPLOY_PASSWORD", ""))
     若 结果 == 1 {
         打印(ssh_exec("uname -a"))
         打印(ssh_exit_code())

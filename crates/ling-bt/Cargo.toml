@@ -2,7 +2,7 @@
 name = "ling-bt"
 version = "2030.0.1"
 edition = "2021"
-authors = ["Ling Lin <taellinglin@gmail.com>", "Sanny Lin <SannyLing53@gmail.com>"]
+authors = ["Ling Lin <taellinglin@gmail.com>", "Sanny Lin"]
 description = "Bluetooth host stack for LingOS: HCI, Intel (btintel) firmware download, L2CAP, HID host, link-key store and the SBC encoder, as a sans-IO state machine (no_std + alloc)"
 license = "Apache-2.0 OR MIT"
 repository = "https://github.com/taellinglin/ling"

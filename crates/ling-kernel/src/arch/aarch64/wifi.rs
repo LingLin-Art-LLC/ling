@@ -1876,7 +1876,7 @@ pub fn transmit(frame: &[u8]) -> bool {
     ok
 }
 
-/// "UDP 192.168.0.38:33012 > 1.1.1.1:53 (78 B)" and the like.
+/// "UDP 192.0.2.38:33012 > 1.1.1.1:53 (78 B)" and the like.
 fn frame_summary(f: &[u8], ok: bool) -> String {
     if f.len() < 14 {
         return String::from("short frame");

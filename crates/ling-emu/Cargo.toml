@@ -2,7 +2,7 @@
 name = "ling-emu"
 version = "2030.0.1"
 edition = "2021"
-authors = ["Ling Lin <taellinglin@gmail.com>", "Sanny Lin <SannyLing53@gmail.com>"]
+authors = ["Ling Lin <taellinglin@gmail.com>", "Sanny Lin"]
 description = "Native console-emulation host for Ling (emu_* builtins) — SNES and N64 cores"
 license = "Apache-2.0 OR MIT"
 readme = "README.md"

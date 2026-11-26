@@ -164,7 +164,7 @@ UTF-8 หนึ่งบรรทัด ซ็อกเก็ตทำงาน�
 
 ```ling-gui
 ผูก เริ่ม = ทำ {
-    ผูก ผล = ssh_connect("192.168.1.20", 22, "deploy", env_get("DEPLOY_PASSWORD", ""))
+    ผูก ผล = ssh_connect("192.0.2.10", 22, "deploy", env_get("DEPLOY_PASSWORD", ""))
     ถ้า ผล == 1 {
         พิมพ์(ssh_exec("uname -a"))
         พิมพ์(ssh_exit_code())

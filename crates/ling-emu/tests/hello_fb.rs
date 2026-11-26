@@ -2,17 +2,19 @@
 //! N64 homebrew: CPU writes straight into the VI framebuffer — no RSP/RDP),
 //! run a few frames, dump a PNG, and assert pixels actually landed.
 //!
-//! The ROM lives in the arcade repo: tools/emu-ref-roms/helloworld_cpu.n64
+//! The ROM lives in the ling-arcade repo: tools/emu-ref-roms/helloworld_cpu.n64.
+//! Point LING_EMU_REF_ROMS at that tools/emu-ref-roms folder to run it.
 
 use ling_emu::n64::N64;
 use ling_emu::Core;
 
-const ROM: &str =
-    "C:/Users/User/Programs/LingApps/ling-arcade/tools/emu-ref-roms/helloworld_cpu.n64";
-
 #[test]
 fn hello_world_cpu_renders() {
-    let Ok(bytes) = std::fs::read(ROM) else {
+    let Ok(dir) = std::env::var("LING_EMU_REF_ROMS") else {
+        eprintln!("LING_EMU_REF_ROMS not set — skipping");
+        return;
+    };
+    let Ok(bytes) = std::fs::read(format!("{dir}/helloworld_cpu.n64")) else {
         eprintln!("test ROM not present — skipping");
         return;
     };

@@ -115,7 +115,7 @@ Each entry has complete translations for:
 
 ```
 cargo build --release
-   Compiling ling-lang v2030.1.9 (C:\Users\User\Programs\ling)
+   Compiling ling-lang v2030.1.9 (C:\path\to\ling)
     Finished `release` profile [optimized] target(s) in 17.10s
 ```
 

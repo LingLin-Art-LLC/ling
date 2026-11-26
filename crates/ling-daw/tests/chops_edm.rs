@@ -335,7 +335,7 @@ fn production_edits_are_planned_reported_and_can_be_turned_off() {
 #[test]
 #[ignore]
 fn render_chops_demo() {
-    let dir = std::env::var("CHOPS_DEMO_DIR").unwrap_or_else(|_| "C:/Users/User/Programs/LingStationX/renders/chops_demo".into());
+    let dir = std::env::var("CHOPS_DEMO_DIR").unwrap_or_else(|_| "renders/chops_demo".into());
     std::fs::create_dir_all(&dir).unwrap();
     let mut d = song();
     // the song before the chops, for comparison

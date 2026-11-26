@@ -1,4 +1,4 @@
-//! Voice skins through the RVC install on this machine (E:/SannyChat/talk, its LingLin model); skipped where it is not installed.
+//! Voice skins through an RVC WebUI install (folder in RVC_DIR, with a voice model named LingLin); skipped where it is not set.
 use ling_daw::{Daw, Val};
 
 fn n(x: f64) -> Val {
@@ -23,16 +23,19 @@ fn st(v: &Val) -> String {
     if let Val::Str(x) = v { x.clone() } else { String::new() }
 }
 
-const RVC: &str = "E:/SannyChat/talk";
-
 #[test]
 fn skin_an_audio_clip_and_restore_it() {
-    let info = list(&call(&mut Daw::new(), "daw_rvc_info", &[s(RVC)]));
+    let Ok(rvc_dir) = std::env::var("RVC_DIR") else {
+        println!("RVC_DIR not set: skipped");
+        return;
+    };
+    let rvc = rvc_dir.as_str();
+    let info = list(&call(&mut Daw::new(), "daw_rvc_info", &[s(rvc)]));
     if st(&info[0]).is_empty() {
         return;
     }
     let mut d = Daw::new();
-    let models = list(&call(&mut d, "daw_rvc_models", &[s(&format!("{RVC}/weights"))]));
+    let models = list(&call(&mut d, "daw_rvc_models", &[s(&format!("{rvc}/weights"))]));
     let k = models.chunks(3).position(|m| st(&m[0]) == "LingLin").expect("LingLin among the models");
     let (pth, idx) = (st(&models[k * 3 + 1]), st(&models[k * 3 + 2]));
     assert!(idx.contains("added_") && idx.ends_with(".index"), "the index from logs/LingLin: {idx}");
@@ -54,7 +57,7 @@ fn skin_an_audio_clip_and_restore_it() {
     let c = num(&call(&mut d, "daw_clip_add_audio", &[n(t), s(&path), n(0.0)]));
     let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../LingStationX/tools/rvc_skin.py");
     assert!(std::path::Path::new(script).is_file(), "{script}");
-    let started = call(&mut d, "daw_rvc_start", &[n(t), n(c), s(RVC), s(script), s(&pth), s(&idx), n(0.0), s("rmvpe"), n(0.66), n(0.33), n(0.25), n(0.0)]);
+    let started = call(&mut d, "daw_rvc_start", &[n(t), n(c), s(rvc), s(script), s(&pth), s(&idx), n(0.0), s("rmvpe"), n(0.66), n(0.33), n(0.25), n(0.0)]);
     assert!(matches!(started, Val::Num(x) if x > 0.5), "{:?}", call(&mut d, "daw_status", &[]));
     let mut last = vec![];
     for _ in 0..600 {

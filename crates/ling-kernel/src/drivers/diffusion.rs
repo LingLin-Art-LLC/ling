@@ -1275,7 +1275,7 @@ fn run(r: Req) {
     let mut out: Result<Pic, String> = Err(String::new());
     if try_remote {
         if addr.is_empty() {
-            return fail("no GPU server set: enter its address in Settings (e.g. 192.168.1.20:7860), or pick the CPU".to_string());
+            return fail("no GPU server set: enter its address in Settings (e.g. 192.0.2.10:7860), or pick the CPU".to_string());
         }
         out = run_remote(&r, &addr);
         if let Err(e) = &out {

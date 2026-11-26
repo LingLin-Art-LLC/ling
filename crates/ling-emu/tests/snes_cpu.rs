@@ -6,14 +6,18 @@
 use ling_emu::snes::Snes;
 use ling_emu::Core;
 
-const DIR: &str = "C:/Users/User/Programs/LingApps/ling-arcade/tools/emu-ref-roms/snes";
+/// The ROMs live in the ling-arcade repo: point LING_EMU_REF_ROMS at its
+/// tools/emu-ref-roms folder (the SNES ones are in its snes/ subfolder).
+fn rom_dir() -> String {
+    std::env::var("LING_EMU_REF_ROMS").map(|d| format!("{d}/snes")).unwrap_or_default()
+}
 const TESTS: [&str; 23] = [
     "ADC", "AND", "ASL", "BIT", "BRA", "CMP", "DEC", "EOR", "INC", "JMP", "LDR", "LSR", "MOV",
     "MSC", "ORA", "PHL", "PSR", "RET", "ROL", "ROR", "SBC", "STR", "TRN",
 ];
 
 fn run(name: &str, frames: u32) -> (u32, u32, Vec<String>) {
-    let path = format!("{DIR}/CPU{name}.sfc");
+    let path = format!("{}/CPU{name}.sfc", rom_dir());
     let Ok(bytes) = std::fs::read(&path) else {
         return (0, 0, vec![format!("{name}: ROM missing")]);
     };
@@ -48,6 +52,10 @@ fn run(name: &str, frames: u32) -> (u32, u32, Vec<String>) {
 
 #[test]
 fn all_cpu_tests_pass() {
+    if std::env::var("LING_EMU_REF_ROMS").is_err() {
+        println!("LING_EMU_REF_ROMS not set: skipped");
+        return;
+    }
     let mut total_fail = 0;
     let mut report = String::new();
     for t in TESTS {

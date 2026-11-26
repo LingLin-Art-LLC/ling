@@ -261,7 +261,7 @@ pub fn configure(on: bool, addr: &str, port: u16, key: &str) -> Result<(), Strin
     }
     let addr = addr.trim();
     if addr.contains(char::is_whitespace) || addr.contains('/') || addr.contains('@') {
-        return Err(format!("\"{addr}\" is not an address: an IP (127.0.0.1, 0.0.0.0, 192.168.1.20) or a name"));
+        return Err(format!("\"{addr}\" is not an address: an IP (127.0.0.1, 0.0.0.0, 192.0.2.10) or a name"));
     }
     if key.contains(char::is_whitespace) || key.contains(':') {
         return Err("the access key cannot contain spaces or \":\"".to_string());
@@ -1247,7 +1247,7 @@ fn status_page() -> String {
 
 // ── what the app and the console see ───────────────────────────────────────────
 
-/// Where to reach it: "http://192.168.1.20:7860, http://127.0.0.1:7860".
+/// Where to reach it: "http://192.0.2.10:7860, http://127.0.0.1:7860".
 fn urls() -> String {
     let s = h();
     if s.bound_port == 0 {

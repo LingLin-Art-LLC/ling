@@ -169,7 +169,7 @@ OpenSSH clients. None of them has a localized alias.
 
 ```ling-gui
 bind start = do {
-    bind r = ssh_connect("192.168.1.20", 22, "deploy", env_get("DEPLOY_PASSWORD", ""))
+    bind r = ssh_connect("192.0.2.10", 22, "deploy", env_get("DEPLOY_PASSWORD", ""))
     if r == 1 {
         print(ssh_exec("uname -a"))
         print(ssh_exit_code())

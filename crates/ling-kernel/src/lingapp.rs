@@ -2005,7 +2005,7 @@ fn net_set(mode: &str, ip: &str, mask: &str, gw: &str, dns: &str) -> String {
     use crate::drivers::netstack as ns;
     if mode == "static" {
         let (Some(ip), Some(mask), Some(gw)) = (parse_ip(ip), parse_ip(mask), parse_ip(gw)) else {
-            return String::from("address, netmask and gateway must be four numbers 0-255 (like 192.168.1.20)");
+            return String::from("address, netmask and gateway must be four numbers 0-255 (like 192.0.2.10)");
         };
         let dns = parse_ip(dns).unwrap_or(gw);
         ns::set_static(Some((ip, mask, gw, dns)));

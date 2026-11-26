@@ -26,7 +26,7 @@ fn projects(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
 #[test]
 #[ignore]
 fn soak_projects() {
-    let dir = std::env::var("SOAK_DIR").unwrap_or_else(|_| r"C:\Users\User\Programs\LingStationX\projects".into());
+    let dir = std::env::var("SOAK_DIR").unwrap_or_else(|_| "projects".into());
     let minutes: f64 = std::env::var("SOAK_MINUTES").ok().and_then(|s| s.parse().ok()).unwrap_or(6.0);
     let only = std::env::var("SOAK_ONLY").unwrap_or_default();
     let mut bad = vec![];

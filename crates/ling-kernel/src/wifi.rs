@@ -197,7 +197,7 @@ pub fn scan() -> Result<Vec<Network>, String> {
 fn scan_radio() -> Result<Vec<Network>, String> {
     if demo() {
         return Ok(alloc::vec![
-            Network { ssid: String::from("LingCountry"), rssi: -41, secure: 3, channel: 6 },
+            Network { ssid: String::from("MyNetwork"), rssi: -41, secure: 3, channel: 6 },
             Network { ssid: String::from("Moon Palace 5G"), rssi: -58, secure: 3, channel: 36 },
             Network { ssid: String::from("cafe-open"), rssi: -70, secure: 0, channel: 11 },
             Network { ssid: String::from("old-router"), rssi: -82, secure: 1, channel: 1 },

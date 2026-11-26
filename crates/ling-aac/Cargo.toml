@@ -2,7 +2,7 @@
 name = "ling-aac"
 version = "2030.0.1"
 edition = "2021"
-authors = ["Ling Lin <taellinglin@gmail.com>", "Sanny Lin <SannyLing53@gmail.com>"]
+authors = ["Ling Lin <taellinglin@gmail.com>", "Sanny Lin"]
 description = "AAC-LC / HE-AAC (SBR) decoder for LingOS, freestanding (no_std + alloc + libm); core ported from symphonia-codec-aac"
 license = "MPL-2.0"
 repository = "https://github.com/taellinglin/ling"

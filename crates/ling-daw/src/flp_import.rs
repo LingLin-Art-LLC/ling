@@ -952,9 +952,9 @@ mod auto_tests {
 
     #[test]
     fn automation_clips_of_real_projects() {
-        // the user's projects (skipped where they are not on this machine)
-        let p = "C:/Users/User/Music/Aurora/Aurora.flp";
-        let Ok(d) = std::fs::read(p) else { return };
+        // a real FL Studio project, named by LING_TEST_FLP (skipped when unset)
+        let Ok(p) = std::env::var("LING_TEST_FLP") else { return };
+        let Ok(d) = std::fs::read(&p) else { return };
         let a = automation(&d);
         let cut = a.iter().find(|x| x.name == "SubSynth - Filter Cutoff").expect("the cutoff clip");
         assert_eq!(cut.target, "SubSynth");

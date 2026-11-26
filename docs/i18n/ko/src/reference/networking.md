@@ -167,7 +167,7 @@ SSH 내장 함수는 실제 SSH-2 클라이언트와 작은 SSH 서버입니다.
 
 ```ling-gui
 바인드 시작 = 실행 {
-    바인드 결과 = ssh_connect("192.168.1.20", 22, "deploy", env_get("DEPLOY_PASSWORD", ""))
+    바인드 결과 = ssh_connect("192.0.2.10", 22, "deploy", env_get("DEPLOY_PASSWORD", ""))
     만약 결과 == 1 {
         출력(ssh_exec("uname -a"))
         출력(ssh_exit_code())

@@ -2,7 +2,7 @@
 name = "ling-game"
 version = "2030.1.9"
 edition = "2021"
-authors = ["Ling Lin <taellinglin@gmail.com>", "Sanny Lin <SannyLing53@gmail.com>"]
+authors = ["Ling Lin <taellinglin@gmail.com>", "Sanny Lin"]
 description = "Ling game engine — ECS, physics, and scene management"
 license = "Apache-2.0 OR MIT"
 readme = "README.md"

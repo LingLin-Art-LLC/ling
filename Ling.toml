@@ -5,5 +5,5 @@ description = "Ling - The Omniglot Systems Language"
 license = "LicenseRef-Ling-Harmony-1.0"
 repository = "https://github.com/LingLin-Art-LLC/ling"
 homepage = "https://ling-lang.org"
-authors = ["Ling Lin <taellinglin@gmail.com>", "Sanny Lin <SannyLing53@gmail.com>"]
+authors = ["Ling Lin <taellinglin@gmail.com>", "Sanny Lin"]
 icon = "images/icon.svg"

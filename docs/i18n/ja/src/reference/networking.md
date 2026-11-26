@@ -170,7 +170,7 @@ OpenSSH サーバーとも動きます。サーバーを使うと、Ling プロ�
 
 ```ling-gui
 束縛 開始 = 実行 {
-    束縛 結果 = ssh_connect("192.168.1.20", 22, "deploy", env_get("DEPLOY_PASSWORD", ""))
+    束縛 結果 = ssh_connect("192.0.2.10", 22, "deploy", env_get("DEPLOY_PASSWORD", ""))
     もし 結果 == 1 {
         印刷(ssh_exec("uname -a"))
         印刷(ssh_exit_code())
